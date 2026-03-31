@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>USC Berlin Venue Explorer</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+    <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+    <div id="app">
+        <aside id="sidebar">
+            <header id="sidebar-header">
+                <h1>USC Berlin</h1>
+                <p id="stats"></p>
+            </header>
+
+            <div id="filters">
+                <div class="filter-group">
+                    <label class="filter-label">Membership Tier</label>
+                    <div id="tier-filter" class="radio-group">
+                        <label><input type="radio" name="tier" value="all" checked> All venues</label>
+                        <label class="highlight-upgrade"><input type="radio" name="tier" value="upgrade"> L Pro only (upgrade)</label>
+                        <label><input type="radio" name="tier" value="classic"> Available on M Pro</label>
+                        <label><input type="radio" name="tier" value="max-only"> XL Pro only</label>
+                    </div>
+                </div>
+
+                <div class="filter-group">
+                    <label class="filter-label" for="district-filter">District</label>
+                    <select id="district-filter">
+                        <option value="">All districts</option>
+                    </select>
+                </div>
+
+                <div class="filter-group">
+                    <label class="filter-label" for="activity-filter">Activity</label>
+                    <select id="activity-filter">
+                        <option value="">All activities</option>
+                    </select>
+                </div>
+
+                <div class="filter-group">
+                    <label class="filter-label">
+                        <input type="checkbox" id="plus-filter"> PLUS venues only
+                    </label>
+                </div>
+
+                <div class="filter-group">
+                    <label class="filter-label">
+                        <input type="checkbox" id="coords-filter"> Map venues only
+                    </label>
+                </div>
+
+                <div class="filter-group">
+                    <input type="text" id="search-filter" placeholder="Search venue name...">
+                </div>
+            </div>
+
+            <div id="venue-list"></div>
+        </aside>
+
+        <main id="map-container">
+            <div id="map"></div>
+        </main>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
