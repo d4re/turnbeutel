@@ -19,12 +19,30 @@
 
             <div id="filters">
                 <div class="filter-group">
-                    <label class="filter-label">Membership Tier</label>
-                    <div id="tier-filter" class="radio-group">
-                        <label><input type="radio" name="tier" value="all" checked> All venues</label>
-                        <label class="highlight-upgrade"><input type="radio" name="tier" value="upgrade"> L Pro only (upgrade)</label>
-                        <label><input type="radio" name="tier" value="classic"> Available on M Pro</label>
-                        <label><input type="radio" name="tier" value="max-only"> XL Pro only</label>
+                    <label class="filter-label">Membership Type</label>
+                    <div class="toggle-group" id="membership-toggle">
+                        <label class="toggle-option">
+                            <input type="radio" name="membership" value="corporate" checked>
+                            <span>Corporate</span>
+                        </label>
+                        <label class="toggle-option">
+                            <input type="radio" name="membership" value="private">
+                            <span>Private</span>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="filter-group">
+                    <label class="filter-label">Tier Range</label>
+                    <div id="tier-slider">
+                        <div class="slider-track-container">
+                            <div class="slider-track"></div>
+                            <div class="slider-fill" id="slider-fill"></div>
+                            <input type="range" id="slider-min" min="0" max="3" value="0" step="1">
+                            <input type="range" id="slider-max" min="0" max="3" value="3" step="1">
+                        </div>
+                        <div class="slider-labels" id="slider-labels"></div>
+                        <div class="slider-description" id="slider-description"></div>
                     </div>
                 </div>
 
@@ -42,15 +60,12 @@
                     </select>
                 </div>
 
-                <div class="filter-group">
-                    <label class="filter-label">
-                        <input type="checkbox" id="plus-filter"> PLUS venues only
+                <div class="filter-group inline-filters">
+                    <label>
+                        <input type="checkbox" id="plus-filter"> PLUS only
                     </label>
-                </div>
-
-                <div class="filter-group">
-                    <label class="filter-label">
-                        <input type="checkbox" id="coords-filter"> Map venues only
+                    <label>
+                        <input type="checkbox" id="coords-filter"> Map only
                     </label>
                 </div>
 

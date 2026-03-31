@@ -1,31 +1,47 @@
-// Mapping from private tier names (in scraped data) to corporate display names
-const PRIVATE_TO_CORPORATE = {
-  Essential: "S",
-  Classic: "M Pro",
-  Premium: "L Pro",
-  Max: "XL Pro",
-};
+let tierConfig = {};
+let map, markerCluster, allVenues, filteredVenues;
 
-const TIER_COLORS = {
-  Essential: "#27ae60",
-  Classic: "#2980b9",
-  Premium: "#e67e22",
-  Max: "#c0392b",
-};
-
-const TIER_ORDER_PRIVATE = ["Essential", "Classic", "Premium", "Max"];
-
-function corpName(privateTier) {
-  return PRIVATE_TO_CORPORATE[privateTier] || privateTier;
+// Current state
+function getMembershipType() {
+  return document.querySelector('#membership-toggle input:checked').value;
 }
 
-let map, markerCluster, allVenues, filteredVenues;
+function getTierOrder() {
+  const type = getMembershipType();
+  return tierConfig[type]?.order || [];
+}
+
+function getTierColors() {
+  const type = getMembershipType();
+  return tierConfig[type]?.colors || {};
+}
+
+function getTierDisplay(tierName) {
+  const type = getMembershipType();
+  const display = tierConfig[type]?.display;
+  return display ? (display[tierName] || tierName) : tierName;
+}
+
+function getVenueTiers(venue) {
+  const type = getMembershipType();
+  return type === "corporate" ? venue.tiers_corporate : venue.tiers_private;
+}
+
+function getVenueMinTier(venue) {
+  const type = getMembershipType();
+  return type === "corporate" ? venue.min_tier_corporate : venue.min_tier_private;
+}
+
+function getTierIndex(tierName) {
+  return getTierOrder().indexOf(tierName);
+}
+
+// ── Init ──
 
 async function init() {
   document.getElementById("venue-list").innerHTML =
     '<div class="loading">Loading venue data...</div>';
 
-  // Init map centered on Berlin
   map = L.map("map").setView([52.52, 13.405], 11);
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
     attribution: "&copy; OpenStreetMap contributors",
@@ -39,26 +55,26 @@ async function init() {
   });
   map.addLayer(markerCluster);
 
-  // Load data
   try {
     const resp = await fetch("../data/venues_final.json");
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
     allVenues = data.venues;
+    tierConfig = data.tier_config;
     populateFilters(allVenues);
+    updateSliderLabels();
+    updateSliderFill();
     applyFilters();
-    updateStats(data);
   } catch (err) {
     document.getElementById("venue-list").innerHTML =
       `<div class="loading">Error loading data: ${err.message}<br>Run the scrapers first.</div>`;
   }
 }
 
+// ── Filters ──
+
 function populateFilters(venues) {
-  // Districts
-  const districts = [
-    ...new Set(venues.map((v) => v.district).filter(Boolean)),
-  ].sort();
+  const districts = [...new Set(venues.map((v) => v.district).filter(Boolean))].sort();
   const distSelect = document.getElementById("district-filter");
   for (const d of districts) {
     const opt = document.createElement("option");
@@ -67,10 +83,7 @@ function populateFilters(venues) {
     distSelect.appendChild(opt);
   }
 
-  // Activities
-  const activities = [
-    ...new Set(venues.flatMap((v) => v.activities).filter(Boolean)),
-  ].sort();
+  const activities = [...new Set(venues.flatMap((v) => v.activities).filter(Boolean))].sort();
   const actSelect = document.getElementById("activity-filter");
   for (const a of activities) {
     const opt = document.createElement("option");
@@ -79,43 +92,98 @@ function populateFilters(venues) {
     actSelect.appendChild(opt);
   }
 
-  // Bind filter events
-  document
-    .querySelectorAll('#tier-filter input[name="tier"]')
-    .forEach((r) => r.addEventListener("change", applyFilters));
+  // Bind events
+  document.querySelectorAll('#membership-toggle input').forEach((r) =>
+    r.addEventListener("change", () => {
+      updateSliderLabels();
+      updateSliderFill();
+      applyFilters();
+    })
+  );
+  document.getElementById("slider-min").addEventListener("input", onSliderChange);
+  document.getElementById("slider-max").addEventListener("input", onSliderChange);
   distSelect.addEventListener("change", applyFilters);
   actSelect.addEventListener("change", applyFilters);
-  document
-    .getElementById("plus-filter")
-    .addEventListener("change", applyFilters);
-  document
-    .getElementById("coords-filter")
-    .addEventListener("change", applyFilters);
-  document
-    .getElementById("search-filter")
-    .addEventListener("input", applyFilters);
+  document.getElementById("plus-filter").addEventListener("change", applyFilters);
+  document.getElementById("coords-filter").addEventListener("change", applyFilters);
+  document.getElementById("search-filter").addEventListener("input", applyFilters);
+}
+
+// ── Slider ──
+
+function onSliderChange() {
+  const minSlider = document.getElementById("slider-min");
+  const maxSlider = document.getElementById("slider-max");
+  let minVal = parseInt(minSlider.value);
+  let maxVal = parseInt(maxSlider.value);
+
+  // Prevent crossing
+  if (minVal > maxVal) {
+    if (this === minSlider) {
+      maxSlider.value = minVal;
+    } else {
+      minSlider.value = maxVal;
+    }
+  }
+
+  updateSliderFill();
+  updateSliderLabels();
+  applyFilters();
+}
+
+function updateSliderLabels() {
+  const order = getTierOrder();
+  const container = document.getElementById("slider-labels");
+  const minVal = parseInt(document.getElementById("slider-min").value);
+  const maxVal = parseInt(document.getElementById("slider-max").value);
+
+  container.innerHTML = order
+    .map((t, i) => {
+      const inRange = i >= minVal && i <= maxVal;
+      return `<span class="slider-label${inRange ? " in-range" : ""}">${getTierDisplay(t)}</span>`;
+    })
+    .join("");
+
+  // Description
+  const descEl = document.getElementById("slider-description");
+  const minName = getTierDisplay(order[minVal]);
+  const maxName = getTierDisplay(order[maxVal]);
+  if (minVal === 0 && maxVal === order.length - 1) {
+    descEl.textContent = "Showing all venues";
+  } else if (minVal === maxVal) {
+    descEl.textContent = `Only ${minName}-exclusive venues`;
+  } else if (minVal === 0) {
+    descEl.textContent = `Everything available up to ${maxName}`;
+  } else {
+    descEl.textContent = `${minName} through ${maxName} (excluding lower tiers)`;
+  }
+}
+
+function updateSliderFill() {
+  const minVal = parseInt(document.getElementById("slider-min").value);
+  const maxVal = parseInt(document.getElementById("slider-max").value);
+  const fill = document.getElementById("slider-fill");
+  const pctMin = (minVal / 3) * 100;
+  const pctMax = (maxVal / 3) * 100;
+  fill.style.left = pctMin + "%";
+  fill.style.width = (pctMax - pctMin) + "%";
 }
 
 function applyFilters() {
-  const tierValue = document.querySelector(
-    '#tier-filter input[name="tier"]:checked'
-  ).value;
+  const minVal = parseInt(document.getElementById("slider-min").value);
+  const maxVal = parseInt(document.getElementById("slider-max").value);
   const district = document.getElementById("district-filter").value;
   const activity = document.getElementById("activity-filter").value;
   const plusOnly = document.getElementById("plus-filter").checked;
   const coordsOnly = document.getElementById("coords-filter").checked;
   const search = document.getElementById("search-filter").value.toLowerCase();
+  const order = getTierOrder();
 
   filteredVenues = allVenues.filter((v) => {
-    // Tier filter (data uses private names internally)
-    if (tierValue === "upgrade") {
-      if (v.tiers.includes("Classic") || !v.tiers.includes("Premium"))
-        return false;
-    } else if (tierValue === "classic") {
-      if (!v.tiers.includes("Classic")) return false;
-    } else if (tierValue === "max-only") {
-      if (v.tiers.length !== 1 || v.tiers[0] !== "Max") return false;
-    }
+    const mt = getVenueMinTier(v);
+    if (!mt) return false;
+    const tierIdx = order.indexOf(mt);
+    if (tierIdx < minVal || tierIdx > maxVal) return false;
 
     if (district && v.district !== district) return false;
     if (activity && !v.activities.includes(activity)) return false;
@@ -128,63 +196,66 @@ function applyFilters() {
 
   renderList(filteredVenues);
   renderMap(filteredVenues);
-  updateFilterStats(filteredVenues);
+  updateStats();
 }
 
-function updateStats(data) {
-  const upgrade = allVenues.filter(
-    (v) => v.tiers.includes("Premium") && !v.tiers.includes("Classic")
-  );
-  document.getElementById("stats").textContent =
-    `${data.total_venues} venues | ${data.venues_with_coords} on map | ${upgrade.length} L Pro exclusive`;
-}
-
-function updateFilterStats(venues) {
-  const withCoords = venues.filter((v) => v.has_coordinates).length;
-  const total = venues.length;
+function updateStats() {
+  const total = filteredVenues.length;
+  const withCoords = filteredVenues.filter((v) => v.has_coordinates).length;
   const statsEl = document.getElementById("stats");
-  const baseStats = `${allVenues.length} total venues`;
   if (total === allVenues.length) {
-    statsEl.textContent = `${baseStats} | ${withCoords} on map`;
+    statsEl.textContent = `${total} venues | ${withCoords} on map`;
   } else {
     statsEl.textContent = `Showing ${total} of ${allVenues.length} | ${withCoords} on map`;
   }
 }
 
-function tierBadgeHtml(privateTier) {
-  const display = corpName(privateTier);
-  return `<span class="tier-badge tier-${privateTier.toLowerCase()}">${display}</span>`;
+// ── Rendering ──
+
+function tierBadgeHtml(tierName) {
+  const idx = getTierIndex(tierName);
+  const display = getTierDisplay(tierName);
+  return `<span class="tier-badge tier-${idx >= 0 ? idx : 0}">${esc(display)}</span>`;
 }
 
 function renderList(venues) {
   const container = document.getElementById("venue-list");
   container.innerHTML = "";
+  const type = getMembershipType();
 
   for (const venue of venues) {
     const item = document.createElement("div");
     item.className = "venue-item";
     item.dataset.slug = venue.slug;
 
+    const tiers = getVenueTiers(venue);
     let ratingHtml = "";
     if (venue.rating) {
-      ratingHtml = `<span class="venue-rating">${"★".repeat(Math.round(venue.rating))} ${venue.rating}</span>`;
+      ratingHtml = `<span class="venue-rating">${"\u2605".repeat(Math.round(venue.rating))} ${venue.rating}</span>`;
     }
-
     let plusHtml = venue.is_plus ? '<span class="plus-badge">PLUS</span>' : "";
+
+    // Show visit limit for min tier
+    let visitHtml = "";
+    if (venue.visit_limits) {
+      const limits = venue.visit_limits[type] || {};
+      const minT = getVenueMinTier(venue);
+      if (minT && limits[minT] != null) {
+        visitHtml = `<div class="venue-visits">${getTierDisplay(minT)}: ${limits[minT]}x / month</div>`;
+      }
+    }
 
     item.innerHTML = `
       <div class="venue-name">${esc(venue.name)}${plusHtml}</div>
-      <div class="venue-meta">${esc(venue.district)}${venue.street ? " · " + esc(venue.street) : ""} ${ratingHtml}</div>
-      <div class="venue-tiers">${venue.tiers.map((t) => tierBadgeHtml(t)).join("")}</div>
-      <div class="venue-activities">${esc(venue.activities.join(" · "))}</div>
+      <div class="venue-meta">${esc(venue.district)}${venue.street ? " \u00b7 " + esc(venue.street) : ""} ${ratingHtml}</div>
+      <div class="venue-tiers">${tiers.map((t) => tierBadgeHtml(t)).join("")}</div>
+      ${visitHtml}
+      <div class="venue-activities">${esc(venue.activities.join(" \u00b7 "))}</div>
     `;
 
     item.addEventListener("click", () => {
-      container
-        .querySelectorAll(".venue-item.active")
-        .forEach((el) => el.classList.remove("active"));
+      container.querySelectorAll(".venue-item.active").forEach((el) => el.classList.remove("active"));
       item.classList.add("active");
-
       if (venue.has_coordinates && venue._marker) {
         map.setView([venue.lat, venue.lng], 15);
         venue._marker.openPopup();
@@ -197,12 +268,15 @@ function renderList(venues) {
 
 function renderMap(venues) {
   markerCluster.clearLayers();
+  const colors = getTierColors();
+  const order = getTierOrder();
 
   for (const venue of venues) {
     venue._marker = null;
     if (!venue.has_coordinates) continue;
 
-    const color = TIER_COLORS[venue.min_tier] || "#999";
+    const mt = getVenueMinTier(venue);
+    const color = colors[mt] || "#999";
     const marker = L.circleMarker([venue.lat, venue.lng], {
       radius: 7,
       fillColor: color,
@@ -214,13 +288,9 @@ function renderMap(venues) {
 
     marker.bindPopup(() => buildPopup(venue));
     marker.on("click", () => {
-      const listItem = document.querySelector(
-        `.venue-item[data-slug="${venue.slug}"]`
-      );
+      const listItem = document.querySelector(`.venue-item[data-slug="${venue.slug}"]`);
       if (listItem) {
-        document
-          .querySelectorAll(".venue-item.active")
-          .forEach((el) => el.classList.remove("active"));
+        document.querySelectorAll(".venue-item.active").forEach((el) => el.classList.remove("active"));
         listItem.classList.add("active");
         listItem.scrollIntoView({ behavior: "smooth", block: "nearest" });
       }
@@ -232,49 +302,29 @@ function renderMap(venues) {
 }
 
 function buildPopup(venue) {
-  let tiersHtml = venue.tiers.map((t) => tierBadgeHtml(t)).join(" ");
+  const type = getMembershipType();
+  const tiers = getVenueTiers(venue);
+  let tiersHtml = tiers.map((t) => tierBadgeHtml(t)).join(" ");
 
-  // Build visit limits table — prefer corporate data if available
+  // Visit limits table
   let visitsHtml = "";
   if (venue.visit_limits) {
-    const corpLimits = venue.visit_limits.corporate;
-    const privLimits = venue.visit_limits.private || venue.visit_limits;
-
-    if (corpLimits && Object.keys(corpLimits).length > 0) {
-      // Show corporate visit limits (M, L, XL)
-      const corpOrder = ["S", "M", "L", "XL"];
-      const corpDisplay = { S: "S", M: "M Pro", L: "L Pro", XL: "XL Pro" };
-      const rows = corpOrder
-        .map((t) => {
-          const val = corpLimits[t];
-          if (val === undefined) return "";
-          const display =
-            val === null
-              ? '<span style="color:#ccc">Not included</span>'
-              : `${val} / month`;
-          return `<tr><td>${corpDisplay[t]}</td><td>${display}</td></tr>`;
-        })
-        .filter(Boolean)
-        .join("");
-      if (rows) {
-        visitsHtml = `<div class="popup-visits"><strong>Visit limits (Corporate)</strong><table>${rows}</table></div>`;
-      }
-    } else {
-      // Fallback to private limits with corporate names
-      const rows = TIER_ORDER_PRIVATE.map((t) => {
-        const val = privLimits[t];
+    const limits = venue.visit_limits[type] || {};
+    const order = getTierOrder();
+    const rows = order
+      .map((t) => {
+        const val = limits[t];
         if (val === undefined) return "";
-        const display =
-          val === null
-            ? '<span style="color:#ccc">Not included</span>'
-            : `${val} / month`;
-        return `<tr><td>${corpName(t)}</td><td>${display}</td></tr>`;
+        const display = val === null
+          ? '<span style="color:#ccc">Not included</span>'
+          : `${val} / month`;
+        return `<tr><td>${esc(getTierDisplay(t))}</td><td>${display}</td></tr>`;
       })
-        .filter(Boolean)
-        .join("");
-      if (rows) {
-        visitsHtml = `<div class="popup-visits"><strong>Visit limits</strong><table>${rows}</table></div>`;
-      }
+      .filter(Boolean)
+      .join("");
+    if (rows) {
+      const label = type === "corporate" ? "Corporate" : "Private";
+      visitsHtml = `<div class="popup-visits"><strong>Visit limits (${label})</strong><table>${rows}</table></div>`;
     }
   }
 
@@ -292,7 +342,7 @@ function buildPopup(venue) {
     <div class="popup-address">${esc(addressText)}</div>
     <div class="popup-tiers">${tiersHtml}</div>
     ${visitsHtml}
-    <div class="popup-activities">${esc(venue.activities.join(" · "))}</div>
+    <div class="popup-activities">${esc(venue.activities.join(" \u00b7 "))}</div>
   `;
 }
 
