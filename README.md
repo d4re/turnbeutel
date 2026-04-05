@@ -4,35 +4,28 @@ An interactive map app that shows all Urban Sports Club venues in Berlin, filter
 
 ## Quick Start
 
-### 1. Set up the environment
+### 1. Install uv (if not already installed)
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate        # Linux/Mac
-source .venv/Scripts/activate    # Windows (Git Bash)
-pip install -r scraper/requirements.txt
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-### 2. Scrape venue data
+### 2. Start the backend
 
 ```bash
-# Step 1: Scrape all venue listings (~2 min)
-python scraper/scrape_listings.py
-
-# Step 2: Scrape individual venue pages for coordinates + visit limits (~30 min)
-python scraper/scrape_details.py --all
-
-# Step 3: Merge into final JSON
-python scraper/merge_data.py
+cd backend
+uv run uvicorn server:app --reload --port 8000
 ```
 
-### 3. Run the frontend
+`uv` automatically creates a virtual environment and installs dependencies on first run.
 
-```bash
-python -m http.server 8080
-```
+The backend proxies the USC API, transforms the data, and caches it to disk. On first run it fetches all ~2,600 Berlin venues (~5 seconds), then enriches each with visit limit details in the background.
 
-Open `http://localhost:8080/frontend/index.html` in your browser.
+### 3. Open the frontend
+
+Open `http://localhost:8080/frontend/index.html` in your browser (or serve with any static file server).
+
+The frontend fetches live data from the backend at `localhost:8000`. If the backend is unavailable, it falls back to the static `data/venues_final.json` file.
 
 ## How to Use
 
@@ -40,28 +33,33 @@ Open `http://localhost:8080/frontend/index.html` in your browser.
 - **Tier range slider** — has two handles. Drag both to the same tier to see only that tier's exclusive venues. Example: both handles on "L Pro" shows the ~340 venues you'd gain by upgrading from M Pro.
 - **District / Activity / Search** — narrow down further.
 - **Map markers** are color-coded by minimum required tier (green → red).
-- **Click a venue** on the map or in the list to see visit limits per tier.
+- **Click a venue** on the map or in the list to see visit limits per tier (loaded on demand from the API).
 
 ## Project Structure
 
 ```
-scraper/
-  scrape_listings.py    # Paginate through listing pages, extract venue cards
-  scrape_details.py     # Fetch individual venue pages for coords + visit limits
-  merge_data.py         # Combine listing + detail data into venues_final.json
-  requirements.txt      # Python dependencies
+backend/
+  server.py             # FastAPI proxy — fetches from USC API, transforms, caches
+  pyproject.toml        # Python dependencies (managed by uv)
+  cache/                # Persistent JSON cache (gitignored)
 
 frontend/
   index.html            # Single-page app
   app.js                # Map, filters, rendering logic
   style.css             # Styling
 
-data/                   # Generated (gitignored)
-  venues_listing.json   # Raw listing scrape output
-  venues_details.json   # Raw detail scrape output
-  venues_final.json     # Merged final dataset used by the frontend
+data/                   # Static fallback data (gitignored)
+  venues_final.json     # Pre-scraped dataset, used when backend is down
 ```
 
-## Re-scraping
+## API Endpoints
 
-Venue data changes over time. To refresh, re-run the three scraper steps. The detail scrape supports incremental runs (without `--all` it only scrapes non-Classic venues, ~3-4 min), but for full accuracy use `--all`.
+The backend exposes:
+
+- `GET /api/venues` — All Berlin venues in the frontend's expected format (cached 24h)
+- `GET /api/venues/{id}` — Single venue detail with parsed visit limits (cached 7 days)
+- `GET /api/categories` — Activity categories (cached 7 days)
+
+## Cache
+
+Venue data is cached to `backend/cache/` as JSON files. The cache survives server restarts. To force a refresh, delete the cache files and restart the backend.

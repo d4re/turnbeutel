@@ -1,3 +1,5 @@
+const API_BASE = window.location.port === "8000" ? "" : "http://localhost:8000";
+
 let tierConfig = {};
 let map, markerCluster, allVenues, filteredVenues;
 
@@ -56,8 +58,15 @@ async function init() {
   map.addLayer(markerCluster);
 
   try {
-    const resp = await fetch("../data/venues_final.json");
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    let resp;
+    try {
+      resp = await fetch(`${API_BASE}/api/venues`);
+      if (!resp.ok) throw new Error(`API ${resp.status}`);
+    } catch {
+      // Fallback to static JSON if backend is unavailable
+      resp = await fetch("../data/venues_final.json");
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    }
     const data = await resp.json();
     allVenues = data.venues;
     tierConfig = data.tier_config;
@@ -67,7 +76,7 @@ async function init() {
     applyFilters();
   } catch (err) {
     document.getElementById("venue-list").innerHTML =
-      `<div class="loading">Error loading data: ${err.message}<br>Run the scrapers first.</div>`;
+      `<div class="loading">Error loading data: ${err.message}<br>Start the backend server or check the static data file.</div>`;
   }
 }
 
@@ -306,6 +315,27 @@ function buildPopup(venue) {
   const tiers = getVenueTiers(venue);
   let tiersHtml = tiers.map((t) => tierBadgeHtml(t)).join(" ");
 
+  // Lazy-load visit limits from API if not yet available
+  if (venue.visit_limits === undefined || venue.visit_limits === null) {
+    if (!venue._detailLoading) {
+      venue._detailLoading = true;
+      fetch(`${API_BASE}/api/venues/${venue.address_id}`)
+        .then((r) => r.ok ? r.json() : null)
+        .then((detail) => {
+          if (detail) {
+            venue.visit_limits = detail.visit_limits;
+            venue.bookingLimitsText = detail.bookingLimitsText;
+          }
+          venue._detailLoading = false;
+          // Re-render popup if still open
+          if (venue._marker && venue._marker.isPopupOpen()) {
+            venue._marker.setPopupContent(buildPopup(venue));
+          }
+        })
+        .catch(() => { venue._detailLoading = false; });
+    }
+  }
+
   // Visit limits table
   let visitsHtml = "";
   if (venue.visit_limits) {
@@ -326,6 +356,8 @@ function buildPopup(venue) {
       const label = type === "corporate" ? "Corporate" : "Private";
       visitsHtml = `<div class="popup-visits"><strong>Visit limits (${label})</strong><table>${rows}</table></div>`;
     }
+  } else if (venue._detailLoading) {
+    visitsHtml = '<div class="popup-visits" style="color:#999">Loading visit limits...</div>';
   }
 
   let addressText = "";
