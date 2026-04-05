@@ -5,3 +5,4 @@ __pycache__/
 .claude/
 backend/cache/
 backend/.venv/
+frontend/node_modules/

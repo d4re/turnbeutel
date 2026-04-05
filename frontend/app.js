@@ -123,8 +123,8 @@ function populateFilters(venues) {
 function onSliderChange() {
   const minSlider = document.getElementById("slider-min");
   const maxSlider = document.getElementById("slider-max");
-  let minVal = parseInt(minSlider.value);
-  let maxVal = parseInt(maxSlider.value);
+  const minVal = parseInt(minSlider.value);
+  const maxVal = parseInt(maxSlider.value);
 
   // Prevent crossing
   if (minVal > maxVal) {
@@ -242,7 +242,7 @@ function renderList(venues) {
     if (venue.rating) {
       ratingHtml = `<span class="venue-rating">${"\u2605".repeat(Math.round(venue.rating))} ${venue.rating}</span>`;
     }
-    let plusHtml = venue.is_plus ? '<span class="plus-badge">PLUS</span>' : "";
+    const plusHtml = venue.is_plus ? '<span class="plus-badge">PLUS</span>' : "";
 
     // Show visit limit for min tier
     let visitHtml = "";
@@ -278,8 +278,6 @@ function renderList(venues) {
 function renderMap(venues) {
   markerCluster.clearLayers();
   const colors = getTierColors();
-  const order = getTierOrder();
-
   for (const venue of venues) {
     venue._marker = null;
     if (!venue.has_coordinates) continue;
@@ -313,7 +311,7 @@ function renderMap(venues) {
 function buildPopup(venue) {
   const type = getMembershipType();
   const tiers = getVenueTiers(venue);
-  let tiersHtml = tiers.map((t) => tierBadgeHtml(t)).join(" ");
+  const tiersHtml = tiers.map((t) => tierBadgeHtml(t)).join(" ");
 
   // Lazy-load visit limits from API if not yet available
   if (venue.visit_limits === undefined || venue.visit_limits === null) {
@@ -367,7 +365,7 @@ function buildPopup(venue) {
     addressText = `${venue.district}, ${venue.street}`;
   }
 
-  let plusHtml = venue.is_plus ? ' <span class="plus-badge">PLUS</span>' : "";
+  const plusHtml = venue.is_plus ? ' <span class="plus-badge">PLUS</span>' : "";
 
   return `
     <div class="popup-name"><a href="${esc(venue.url)}" target="_blank">${esc(venue.name)}</a>${plusHtml}</div>

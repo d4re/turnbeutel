@@ -8,10 +8,10 @@ import asyncio
 import json
 import re
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
-from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -85,6 +85,7 @@ _enrichment_running = False
 
 # ── Cache helpers ──
 
+
 def read_cache(path: Path, max_age_hours: float) -> dict | None:
     if not path.exists():
         return None
@@ -144,6 +145,7 @@ def parse_visit_limits(text: str | None) -> dict | None:
 
 
 # ── Venue transformation ──
+
 
 def min_tier(tiers: list[str], order: list[str]) -> str | None:
     for t in order:
@@ -212,6 +214,7 @@ def transform_venue(raw: dict, detail: dict | None = None) -> dict:
 
 # ── API fetching ──
 
+
 async def fetch_all_venue_pages() -> list[dict]:
     """Fetch all venue pages from the USC API concurrently."""
     async with httpx.AsyncClient(headers=USC_HEADERS, timeout=30) as client:
@@ -256,6 +259,7 @@ async def fetch_venue_detail(venue_id: int) -> dict:
 
 
 # ── Background enrichment ──
+
 
 async def enrich_venue_details() -> None:
     """Background task: fetch details for all venues that lack cached detail data."""
@@ -322,6 +326,7 @@ def _merge_details_into_venues() -> None:
 
 
 # ── Endpoints ──
+
 
 @app.get("/api/venues")
 async def get_venues():
@@ -401,4 +406,5 @@ async def get_categories():
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
