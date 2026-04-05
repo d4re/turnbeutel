@@ -1,5 +1,5 @@
 {
-  "name": "Claude Code Sandbox",
+  "name": "usc_scraper",
   "build": {
     "dockerfile": "Dockerfile",
     "args": {
@@ -12,10 +12,7 @@
   "features": {
     "ghcr.io/devcontainers/features/docker-in-docker:2": {}
   },
-  "runArgs": [
-    "--cap-add=NET_ADMIN",
-    "--cap-add=NET_RAW"
-  ],
+  "runArgs": ["--cap-add=NET_ADMIN", "--cap-add=NET_RAW"],
   "customizations": {
     "vscode": {
       "extensions": [
