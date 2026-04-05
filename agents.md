@@ -103,11 +103,30 @@ Each venue (as returned by `GET /api/venues`) has:
 }
 ```
 
+## Before Every Commit
+
+Run these steps before committing any changes:
+
+1. **Run tests and linting** — `make test && make lint` (or rely on the pre-commit hook which does this automatically).
+2. **Update README.md** — If your change adds, removes, or modifies any of the following, update the README to match:
+   - API endpoints
+   - Make targets or CLI commands
+   - Project structure (new top-level files or directories)
+   - Quick start / deployment instructions
+   - Environment requirements
+3. **Update agents.md** — If your change affects architecture, design decisions, data schema, or development workflows, update the relevant section in `agents.md` so future contributors have accurate context.
+4. **Check documentation consistency** — Ensure the README, agents.md, and any inline code comments agree with each other and with the actual code.
+
 ## Common Tasks
 
-### Start the backend
+### Start the app locally
 ```bash
-cd backend && uv run uvicorn server:app --reload --port 8000
+make serve
+```
+
+### Run via Docker
+```bash
+docker compose up --build
 ```
 
 ### Add a new filter to the frontend

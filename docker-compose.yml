@@ -1,0 +1,11 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - venue-cache:/app/backend/cache
+    restart: unless-stopped
+
+volumes:
+  venue-cache:

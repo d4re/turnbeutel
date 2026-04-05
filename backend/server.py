@@ -14,6 +14,7 @@ from pathlib import Path
 import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 
 @asynccontextmanager
@@ -402,6 +403,17 @@ async def get_categories():
 
     write_cache(CATEGORIES_CACHE_FILE, data)
     return data
+
+
+@app.get("/api/health")
+async def health():
+    return {"status": "ok"}
+
+
+# Serve frontend static files — must be last (catch-all mount)
+_frontend_dir = Path(__file__).resolve().parent.parent / "frontend"
+if _frontend_dir.exists():
+    app.mount("/", StaticFiles(directory=str(_frontend_dir), html=True), name="frontend")
 
 
 if __name__ == "__main__":

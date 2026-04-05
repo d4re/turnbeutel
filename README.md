@@ -4,28 +4,43 @@ An interactive map app that shows all Urban Sports Club venues in Berlin, filter
 
 ## Quick Start
 
-### 1. Install uv (if not already installed)
+The simplest way to run locally (requires `make` and `curl`):
 
 ```bash
+make serve
+```
+
+This installs [uv](https://docs.astral.sh/uv/) if needed, syncs dependencies, and starts the app at **http://localhost:8000**.
+
+### Other make targets
+
+| Command      | Description                              |
+|--------------|------------------------------------------|
+| `make serve` | Start the app locally (port 8000)        |
+| `make test`  | Run backend tests                        |
+| `make lint`  | Run ruff (Python) and ESLint (JS)        |
+| `make clean` | Remove caches and virtual environment    |
+
+### Docker
+
+Build and run as a container:
+
+```bash
+docker compose up --build
+```
+
+The app is available at **http://localhost:8000**. Venue cache is persisted in a Docker volume across restarts.
+
+### Manual start (without make)
+
+```bash
+# Install uv if needed
 curl -LsSf https://astral.sh/uv/install.sh | sh
-```
 
-### 2. Start the backend
-
-```bash
+# Start the backend (serves both API and frontend)
 cd backend
-uv run uvicorn server:app --reload --port 8000
+uv run uvicorn server:app --reload --host 0.0.0.0 --port 8000
 ```
-
-`uv` automatically creates a virtual environment and installs dependencies on first run.
-
-The backend proxies the USC API, transforms the data, and caches it to disk. On first run it fetches all ~2,600 Berlin venues (~5 seconds), then enriches each with visit limit details in the background.
-
-### 3. Open the frontend
-
-Open `http://localhost:8080/frontend/index.html` in your browser (or serve with any static file server).
-
-The frontend fetches live data from the backend at `localhost:8000`. If the backend is unavailable, it falls back to the static `data/venues_final.json` file.
 
 ## How to Use
 
@@ -39,8 +54,9 @@ The frontend fetches live data from the backend at `localhost:8000`. If the back
 
 ```
 backend/
-  server.py             # FastAPI proxy — fetches from USC API, transforms, caches
+  server.py             # FastAPI app — proxies USC API, transforms, caches, serves frontend
   pyproject.toml        # Python dependencies (managed by uv)
+  test_server.py        # Backend tests (pytest)
   cache/                # Persistent JSON cache (gitignored)
 
 frontend/
@@ -50,6 +66,10 @@ frontend/
 
 data/                   # Static fallback data (gitignored)
   venues_final.json     # Pre-scraped dataset, used when backend is down
+
+Dockerfile              # Production container image
+docker-compose.yml      # Single-command container deployment
+Makefile                # Local dev shortcuts (serve, test, lint, clean)
 ```
 
 ## API Endpoints
@@ -59,7 +79,10 @@ The backend exposes:
 - `GET /api/venues` — All Berlin venues in the frontend's expected format (cached 24h)
 - `GET /api/venues/{id}` — Single venue detail with parsed visit limits (cached 7 days)
 - `GET /api/categories` — Activity categories (cached 7 days)
+- `GET /api/health` — Health check (used by Docker HEALTHCHECK and load balancers)
 
 ## Cache
 
 Venue data is cached to `backend/cache/` as JSON files. The cache survives server restarts. To force a refresh, delete the cache files and restart the backend.
+
+When running via Docker, the cache is stored in a named volume (`venue-cache`) and persists across container rebuilds.

@@ -1,0 +1,14 @@
+.devcontainer/
+.git/
+.gitignore
+.claude/
+data/
+backend/__pycache__/
+backend/cache/
+backend/.venv/
+frontend/node_modules/
+frontend/package.json
+frontend/package-lock.json
+frontend/eslint.config.js
+*.md
+*.pyc
