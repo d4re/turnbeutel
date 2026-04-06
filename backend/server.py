@@ -6,15 +6,19 @@ the frontend's expected format, and caches results to disk.
 
 import asyncio
 import json
+import logging
 import re
 import time
 from contextlib import asynccontextmanager
+from datetime import date, timedelta
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -30,6 +34,15 @@ async def lifespan(app: FastAPI):
     if cached_venues:
         _venues_data = cached_venues
         _merge_details_into_venues()
+
+    # Clean up stale course cache files (older than 3 days)
+    cutoff = time.time() - 3 * 24 * 3600
+    for f in CACHE_DIR.glob("courses_*.json"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+        except OSError:
+            pass
 
     yield
 
@@ -58,6 +71,7 @@ CATEGORIES_CACHE_FILE = CACHE_DIR / "categories.json"
 VENUES_TTL_HOURS = 24
 DETAILS_TTL_HOURS = 7 * 24  # 7 days
 CATEGORIES_TTL_HOURS = 7 * 24
+COURSES_TTL_HOURS = 48  # 2 days
 
 # ── Tier mappings (from merge_data.py) ──
 
@@ -259,6 +273,92 @@ async def fetch_venue_detail(venue_id: int) -> dict:
         return resp.json().get("data", {})
 
 
+# ── Course transformation and fetching ──
+
+
+def transform_course(raw: dict) -> dict:
+    """Transform a USC API course object into the frontend format."""
+    venue = raw.get("venue") or {}
+    loc = venue.get("location") or {}
+    district = (loc.get("district") or {}).get("name", "")
+    category = raw.get("category") or {}
+    start_time = raw.get("startTime") or ""
+    end_time = raw.get("endTime") or ""
+    return {
+        "id": raw.get("id"),
+        "date": raw.get("date", ""),
+        "title": raw.get("title", ""),
+        "start_time": start_time[:5],
+        "end_time": end_time[:5],
+        "venue_id": str(venue.get("id", "")),
+        "venue_name": venue.get("name", ""),
+        "lat": loc.get("latitude"),
+        "lng": loc.get("longitude"),
+        "district": district,
+        "category": category.get("name", ""),
+        "category_id": category.get("id"),
+        "teacher": raw.get("teacherName", "") or "",
+        "free_spots": raw.get("freeSpots"),
+        "max_spots": raw.get("maximumNumber"),
+        "is_online": raw.get("isOnline", 0) == 1,
+        "is_plus": raw.get("isPlusCheckin", 0) == 1,
+    }
+
+
+_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _course_cache_path(date_str: str) -> Path:
+    # Caller must pass a validated YYYY-MM-DD string. This guard prevents path
+    # traversal if an unvalidated input ever reaches this function.
+    if not _DATE_RE.fullmatch(date_str):
+        raise ValueError(f"Invalid date_str for cache path: {date_str!r}")
+    return CACHE_DIR / f"courses_{date_str}.json"
+
+
+async def fetch_courses_for_date(
+    date_str: str,
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+) -> list[dict]:
+    """Fetch all courses for a single date. Uses per-day disk cache with 2-day TTL."""
+    cache_path = _course_cache_path(date_str)
+    cached = read_cache(cache_path, COURSES_TTL_HOURS)
+    if cached is not None:
+        return cached.get("courses", [])
+
+    all_raw: list[dict] = []
+    page = 1
+    while True:
+        async with semaphore:
+            resp = await client.get(
+                f"{USC_API}/courses",
+                params={
+                    "cityId": CITY_ID,
+                    "startDate": date_str,
+                    "forDurationOfDays": 1,
+                    "pageSize": PAGE_SIZE,
+                    "page": page,
+                },
+            )
+        resp.raise_for_status()
+        data = resp.json().get("data") or {}
+        classes = data.get("classes") or []
+        if not classes:
+            break
+        all_raw.extend(classes)
+        if len(classes) < PAGE_SIZE:
+            break
+        page += 1
+        if page > 50:  # safety bound
+            break
+
+    courses = [transform_course(c) for c in all_raw]
+    courses.sort(key=lambda c: (c["date"], c["start_time"]))
+    write_cache(cache_path, {"courses": courses})
+    return courses
+
+
 # ── Background enrichment ──
 
 
@@ -403,6 +503,54 @@ async def get_categories():
 
     write_cache(CATEGORIES_CACHE_FILE, data)
     return data
+
+
+@app.get("/api/courses")
+async def get_courses(start_date: str, days: int = 1):
+    """Get all courses across Berlin for a date or date range.
+
+    Params:
+      start_date: start date, YYYY-MM-DD (query param name: `start_date`)
+      days: number of days starting from `start_date` (1-13, default 1)
+
+    Filtering by category/time/text is done client-side. Each day is cached
+    independently with a 2-day TTL so repeated/overlapping queries are cheap.
+    """
+    try:
+        start = date.fromisoformat(start_date)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid start_date, expected YYYY-MM-DD",
+        ) from e
+
+    days = max(1, min(days, 13))
+    date_list = [(start + timedelta(days=i)).isoformat() for i in range(days)]
+
+    semaphore = asyncio.Semaphore(5)
+    errors: list[dict] = []
+    async with httpx.AsyncClient(headers=USC_HEADERS, timeout=30) as client:
+        results = await asyncio.gather(
+            *[fetch_courses_for_date(d, client, semaphore) for d in date_list],
+            return_exceptions=True,
+        )
+
+    merged: list[dict] = []
+    for d, r in zip(date_list, results, strict=True):
+        if isinstance(r, Exception):
+            logger.warning("Failed to fetch courses for %s: %r", d, r)
+            errors.append({"date": d, "reason": str(r)})
+            continue
+        merged.extend(r)
+    merged.sort(key=lambda c: (c["date"], c["start_time"]))
+
+    return {
+        "courses": merged,
+        "date_from": date_list[0],
+        "date_to": date_list[-1],
+        "total": len(merged),
+        "errors": errors,
+    }
 
 
 @app.get("/api/health")

@@ -14,6 +14,10 @@
         <aside id="sidebar">
             <header id="sidebar-header">
                 <h1>USC Berlin</h1>
+                <div class="view-tabs" id="view-tabs">
+                    <button class="view-tab active" data-view="venues">Venues</button>
+                    <button class="view-tab" data-view="courses">Courses</button>
+                </div>
                 <p id="stats"></p>
             </header>
 
@@ -74,7 +78,58 @@
                 </div>
             </div>
 
+            <div id="courses-filters" style="display:none">
+                <div class="filter-group">
+                    <label class="filter-label">Date Range</label>
+                    <div class="date-picker-row">
+                        <input type="date" id="course-date-start">
+                        <span>to</span>
+                        <input type="date" id="course-date-end">
+                    </div>
+                </div>
+
+                <div class="filter-group">
+                    <label class="filter-label">Time of Day</label>
+                    <div class="toggle-group time-toggle" id="time-toggle">
+                        <label class="toggle-option">
+                            <input type="checkbox" value="morning" checked>
+                            <span>Morning</span>
+                        </label>
+                        <label class="toggle-option">
+                            <input type="checkbox" value="afternoon" checked>
+                            <span>Afternoon</span>
+                        </label>
+                        <label class="toggle-option">
+                            <input type="checkbox" value="evening" checked>
+                            <span>Evening</span>
+                        </label>
+                    </div>
+                    <div class="slider-description">Morning &lt;12, Afternoon 12–17, Evening ≥17</div>
+                </div>
+
+                <div class="filter-group">
+                    <label class="filter-label" for="category-filter">Category</label>
+                    <select id="category-filter">
+                        <option value="">All categories</option>
+                    </select>
+                </div>
+
+                <div class="filter-group inline-filters">
+                    <label>
+                        <input type="checkbox" id="course-spots-filter"> Has free spots
+                    </label>
+                    <label>
+                        <input type="checkbox" id="course-plus-filter"> PLUS only
+                    </label>
+                </div>
+
+                <div class="filter-group">
+                    <input type="text" id="course-search-filter" placeholder="Search course or venue...">
+                </div>
+            </div>
+
             <div id="venue-list"></div>
+            <div id="course-list" style="display:none"></div>
         </aside>
 
         <main id="map-container">

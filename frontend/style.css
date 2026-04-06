@@ -376,8 +376,171 @@ select:focus, input[type="text"]:focus {
 }
 
 /* Loading state */
-#venue-list .loading {
+#venue-list .loading,
+#course-list .loading {
     padding: 40px 16px;
     text-align: center;
     color: #999;
+}
+
+/* View tabs */
+.view-tabs {
+    display: flex;
+    gap: 0;
+    margin-top: 10px;
+    border-radius: 6px;
+    overflow: hidden;
+    border: 1px solid rgba(255,255,255,0.2);
+}
+
+.view-tab {
+    flex: 1;
+    padding: 6px 12px;
+    background: transparent;
+    color: rgba(255,255,255,0.6);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    border: none;
+    transition: all 0.15s;
+    font-family: inherit;
+}
+
+.view-tab.active {
+    background: rgba(255,255,255,0.15);
+    color: white;
+}
+
+/* Courses filters panel */
+#courses-filters {
+    padding: 12px 16px;
+    border-bottom: 1px solid #ddd;
+    background: white;
+}
+
+.date-picker-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.date-picker-row span {
+    font-size: 12px;
+    color: #888;
+}
+
+.date-picker-row input[type="date"] {
+    flex: 1;
+    padding: 6px 8px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-size: 13px;
+    font-family: inherit;
+}
+
+/* Time-of-day toggle (checkbox-based multi-select) */
+.time-toggle .toggle-option input:checked + span {
+    background: #1a1a2e;
+    color: white;
+}
+
+/* Course list */
+#course-list {
+    flex: 1;
+    overflow-y: auto;
+}
+
+.course-date-header {
+    padding: 8px 16px;
+    background: #eef3fb;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #2471a3;
+    border-bottom: 1px solid #ddd;
+    position: sticky;
+    top: 0;
+    z-index: 1;
+}
+
+.course-item {
+    padding: 10px 16px;
+    border-bottom: 1px solid #eee;
+    cursor: pointer;
+    transition: background 0.15s;
+}
+
+.course-item:hover {
+    background: #eef3fb;
+}
+
+.course-item.active {
+    background: #dbe8f7;
+}
+
+.course-time {
+    font-size: 12px;
+    font-weight: 700;
+    color: #4a90d9;
+    margin-bottom: 2px;
+}
+
+.course-title {
+    font-weight: 600;
+    font-size: 14px;
+    margin-bottom: 2px;
+}
+
+.course-venue {
+    font-size: 12px;
+    color: #666;
+    margin-bottom: 2px;
+}
+
+.course-meta {
+    font-size: 11px;
+    color: #888;
+    margin-top: 3px;
+}
+
+.course-spots.available {
+    color: #27ae60;
+    font-weight: 600;
+}
+
+.course-spots.full {
+    color: #c0392b;
+    font-weight: 600;
+}
+
+/* Course popup list */
+.popup-course-list {
+    max-height: 240px;
+    overflow-y: auto;
+    margin-top: 6px;
+}
+
+.popup-course {
+    padding: 4px 0;
+    border-bottom: 1px solid #eee;
+    font-size: 12px;
+}
+
+.popup-course:last-child {
+    border-bottom: none;
+}
+
+.popup-course-time {
+    font-weight: 700;
+    color: #4a90d9;
+}
+
+.popup-course-title {
+    color: #1a1a1a;
+}
+
+.popup-course-meta {
+    font-size: 11px;
+    color: #888;
 }

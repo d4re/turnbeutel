@@ -49,6 +49,7 @@ uv run uvicorn server:app --reload --host 0.0.0.0 --port 8000
 - **District / Activity / Search** — narrow down further.
 - **Map markers** are color-coded by minimum required tier (green → red).
 - **Click a venue** on the map or in the list to see visit limits per tier (loaded on demand from the API).
+- **Courses tab** — switch to browse classes/courses across Berlin for a specific day or range. Filter by time of day, category, free text, free-spots-only, and PLUS-only. The sidebar shows courses sorted by time; the map shows a marker per venue hosting matching courses, with the full schedule in each popup.
 
 ## Project Structure
 
@@ -79,6 +80,7 @@ The backend exposes:
 - `GET /api/venues` — All Berlin venues in the frontend's expected format (cached 24h)
 - `GET /api/venues/{id}` — Single venue detail with parsed visit limits (cached 7 days)
 - `GET /api/categories` — Activity categories (cached 7 days)
+- `GET /api/courses?date=YYYY-MM-DD&days=N` — Courses for a date or range (1–13 days). Cached per-day with a 2-day TTL so overlapping queries hit the cache.
 - `GET /api/health` — Health check (used by Docker HEALTHCHECK and load balancers)
 
 ## Cache

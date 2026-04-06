@@ -5,6 +5,7 @@ from server import (
     PRIVATE_TIER_ORDER,
     min_tier,
     parse_visit_limits,
+    transform_course,
     transform_venue,
 )
 
@@ -171,3 +172,82 @@ def test_transform_venue_activities():
 def test_transform_venue_empty_slug():
     result = transform_venue(_make_raw(urlSlug=""))
     assert result["url"] == ""
+
+
+# ── transform_course ──
+
+
+def _make_raw_course(**overrides):
+    raw = {
+        "id": 99051489,
+        "date": "2026-04-05",
+        "title": "Kundalini with Paula",
+        "startTime": "12:15:00",
+        "endTime": "13:30:00",
+        "venue": {
+            "id": 4926,
+            "name": "Yellow Yoga - Studio Sonne",
+            "location": {
+                "latitude": 52.48444,
+                "longitude": 13.43498,
+                "district": {"name": "Neukölln"},
+            },
+        },
+        "category": {"id": 6, "name": "Yoga"},
+        "teacherName": "Paula",
+        "freeSpots": 32,
+        "maximumNumber": 40,
+        "isOnline": 0,
+        "isPlusCheckin": 0,
+    }
+    raw.update(overrides)
+    return raw
+
+
+def test_transform_course_basic():
+    result = transform_course(_make_raw_course())
+    assert result["id"] == 99051489
+    assert result["date"] == "2026-04-05"
+    assert result["title"] == "Kundalini with Paula"
+    assert result["start_time"] == "12:15"
+    assert result["end_time"] == "13:30"
+    assert result["venue_id"] == "4926"
+    assert result["venue_name"] == "Yellow Yoga - Studio Sonne"
+    assert result["lat"] == 52.48444
+    assert result["lng"] == 13.43498
+    assert result["district"] == "Neukölln"
+    assert result["category"] == "Yoga"
+    assert result["category_id"] == 6
+    assert result["teacher"] == "Paula"
+    assert result["free_spots"] == 32
+    assert result["max_spots"] == 40
+    assert result["is_online"] is False
+    assert result["is_plus"] is False
+
+
+def test_transform_course_time_truncation():
+    result = transform_course(_make_raw_course(startTime="09:00:00", endTime="10:00:00"))
+    assert result["start_time"] == "09:00"
+    assert result["end_time"] == "10:00"
+
+
+def test_transform_course_missing_optional_fields():
+    raw = _make_raw_course(teacherName=None, freeSpots=None)
+    result = transform_course(raw)
+    assert result["teacher"] == ""
+    assert result["free_spots"] is None
+
+
+def test_transform_course_missing_venue_location():
+    raw = _make_raw_course(venue={"id": 1, "name": "Nowhere", "location": {}})
+    result = transform_course(raw)
+    assert result["lat"] is None
+    assert result["lng"] is None
+    assert result["district"] == ""
+
+
+def test_transform_course_plus_and_online_flags():
+    raw = _make_raw_course(isOnline=1, isPlusCheckin=1)
+    result = transform_course(raw)
+    assert result["is_online"] is True
+    assert result["is_plus"] is True

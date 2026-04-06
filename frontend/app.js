@@ -3,6 +3,13 @@ const API_BASE = window.location.port === "8000" ? "" : "http://localhost:8000";
 let tierConfig = {};
 let map, markerCluster, allVenues, filteredVenues;
 
+// Courses view state
+let currentView = "venues";
+let allCourses = [];
+let filteredCourses = [];
+let coursesLoadToken = 0;
+let courseMarkers = new Map();
+
 // Current state
 function getMembershipType() {
   return document.querySelector('#membership-toggle input:checked').value;
@@ -78,6 +85,289 @@ async function init() {
     document.getElementById("venue-list").innerHTML =
       `<div class="loading">Error loading data: ${err.message}<br>Start the backend server or check the static data file.</div>`;
   }
+
+  // Courses view is independent from the venues fetch — always wire it up.
+  initCoursesView();
+}
+
+// ── Courses view ──
+
+function initCoursesView() {
+  // Default date = today
+  const today = new Date().toISOString().slice(0, 10);
+  const startEl = document.getElementById("course-date-start");
+  const endEl = document.getElementById("course-date-end");
+  startEl.value = today;
+  endEl.value = today;
+
+  // Bind view tabs
+  document.querySelectorAll(".view-tab").forEach((btn) =>
+    btn.addEventListener("click", () => switchView(btn.dataset.view))
+  );
+
+  // Bind filters that require re-fetching
+  startEl.addEventListener("change", fetchCourses);
+  endEl.addEventListener("change", fetchCourses);
+
+  // Bind client-side filter events
+  document.getElementById("category-filter").addEventListener("change", applyCourseFilters);
+  document.getElementById("course-spots-filter").addEventListener("change", applyCourseFilters);
+  document.getElementById("course-plus-filter").addEventListener("change", applyCourseFilters);
+  document.getElementById("course-search-filter").addEventListener("input", applyCourseFilters);
+  document.querySelectorAll("#time-toggle input").forEach((cb) =>
+    cb.addEventListener("change", applyCourseFilters)
+  );
+}
+
+function switchView(view) {
+  if (view === currentView) return;
+  currentView = view;
+
+  document.querySelectorAll(".view-tab").forEach((t) =>
+    t.classList.toggle("active", t.dataset.view === view)
+  );
+  document.getElementById("filters").style.display = view === "venues" ? "" : "none";
+  document.getElementById("courses-filters").style.display = view === "courses" ? "" : "none";
+  document.getElementById("venue-list").style.display = view === "venues" ? "" : "none";
+  document.getElementById("course-list").style.display = view === "courses" ? "" : "none";
+
+  if (view === "venues") {
+    applyFilters();
+  } else {
+    if (allCourses.length === 0) {
+      fetchCourses();
+    } else {
+      applyCourseFilters();
+    }
+  }
+}
+
+function daysBetween(start, end) {
+  const s = new Date(start);
+  const e = new Date(end);
+  return Math.round((e - s) / 86400000);
+}
+
+async function fetchCourses() {
+  const startDate = document.getElementById("course-date-start").value;
+  let endDate = document.getElementById("course-date-end").value;
+  if (!startDate) return;
+  if (!endDate || endDate < startDate) {
+    endDate = startDate;
+    document.getElementById("course-date-end").value = startDate;
+  }
+
+  const days = Math.min(13, Math.max(1, daysBetween(startDate, endDate) + 1));
+
+  const listEl = document.getElementById("course-list");
+  listEl.innerHTML = '<div class="loading">Loading courses...</div>';
+
+  const token = ++coursesLoadToken;
+  try {
+    const resp = await fetch(
+      `${API_BASE}/api/courses?start_date=${startDate}&days=${days}`
+    );
+    const data = await resp.json().catch(() => ({}));
+    if (token !== coursesLoadToken) return; // stale response
+    if (!resp.ok) {
+      throw new Error(data.detail || data.error || `API ${resp.status}`);
+    }
+    allCourses = data.courses || [];
+    if (data.errors && data.errors.length > 0) {
+      console.warn("Some days failed to load:", data.errors);
+    }
+    populateCategoryFilter(allCourses);
+    applyCourseFilters();
+  } catch (err) {
+    listEl.innerHTML = `<div class="loading">Error loading courses: ${esc(err.message)}</div>`;
+  }
+}
+
+function populateCategoryFilter(courses) {
+  const sel = document.getElementById("category-filter");
+  const current = sel.value;
+  const cats = [...new Set(courses.map((c) => c.category).filter(Boolean))].sort();
+  while (sel.firstChild) sel.removeChild(sel.firstChild);
+  const allOpt = document.createElement("option");
+  allOpt.value = "";
+  allOpt.textContent = "All categories";
+  sel.appendChild(allOpt);
+  for (const c of cats) {
+    const opt = document.createElement("option");
+    opt.value = c;
+    opt.textContent = c;
+    sel.appendChild(opt);
+  }
+  if (cats.includes(current)) sel.value = current;
+}
+
+function getSelectedTimeSlots() {
+  return [...document.querySelectorAll("#time-toggle input:checked")].map((cb) => cb.value);
+}
+
+function courseTimeSlot(startTime) {
+  const hour = parseInt(startTime.split(":")[0], 10);
+  if (isNaN(hour)) return null;
+  if (hour < 12) return "morning";
+  if (hour < 17) return "afternoon";
+  return "evening";
+}
+
+function applyCourseFilters() {
+  const timeSlots = getSelectedTimeSlots();
+  const category = document.getElementById("category-filter").value;
+  const spotsOnly = document.getElementById("course-spots-filter").checked;
+  const plusOnly = document.getElementById("course-plus-filter").checked;
+  const search = document.getElementById("course-search-filter").value.toLowerCase();
+
+  filteredCourses = allCourses.filter((c) => {
+    const slot = courseTimeSlot(c.start_time);
+    if (!slot || !timeSlots.includes(slot)) return false;
+    if (category && c.category !== category) return false;
+    if (spotsOnly && !(c.free_spots && c.free_spots > 0)) return false;
+    if (plusOnly && !c.is_plus) return false;
+    if (search) {
+      const hay = (c.title + " " + c.venue_name + " " + (c.teacher || "")).toLowerCase();
+      if (!hay.includes(search)) return false;
+    }
+    return true;
+  });
+
+  renderCourseList(filteredCourses);
+  renderCourseMap(filteredCourses);
+  updateCourseStats();
+}
+
+function updateCourseStats() {
+  const statsEl = document.getElementById("stats");
+  const venueCount = new Set(filteredCourses.map((c) => c.venue_id)).size;
+  statsEl.textContent = `${filteredCourses.length} courses | ${venueCount} venues`;
+}
+
+function formatDateHeader(dateStr) {
+  const d = new Date(dateStr + "T00:00:00");
+  return d.toLocaleDateString(undefined, {
+    weekday: "long",
+    month: "short",
+    day: "numeric",
+  });
+}
+
+function renderCourseList(courses) {
+  const container = document.getElementById("course-list");
+  container.innerHTML = "";
+  if (courses.length === 0) {
+    container.innerHTML = '<div class="loading">No courses match your filters.</div>';
+    return;
+  }
+
+  let currentDate = "";
+  for (const course of courses) {
+    if (course.date !== currentDate) {
+      currentDate = course.date;
+      const header = document.createElement("div");
+      header.className = "course-date-header";
+      header.textContent = formatDateHeader(course.date);
+      container.appendChild(header);
+    }
+
+    const item = document.createElement("div");
+    item.className = "course-item";
+    item.dataset.courseId = course.id;
+    item.dataset.venueId = course.venue_id;
+
+    let spotsHtml = "";
+    if (course.free_spots != null && course.max_spots != null) {
+      const available = course.free_spots > 0;
+      const cls = available ? "available" : "full";
+      const text = available ? `${course.free_spots} / ${course.max_spots} spots` : "Full";
+      spotsHtml = `<span class="course-spots ${cls}">${text}</span>`;
+    }
+
+    const plusHtml = course.is_plus ? ' <span class="plus-badge">PLUS</span>' : "";
+    const teacherHtml = course.teacher ? ` \u00b7 ${esc(course.teacher)}` : "";
+
+    item.innerHTML = `
+      <div class="course-time">${esc(course.start_time)} – ${esc(course.end_time)}</div>
+      <div class="course-title">${esc(course.title)}${plusHtml}</div>
+      <div class="course-venue">${esc(course.venue_name)}${course.district ? " \u00b7 " + esc(course.district) : ""}</div>
+      <div class="course-meta">${esc(course.category)}${teacherHtml} ${spotsHtml}</div>
+    `;
+
+    item.addEventListener("click", () => {
+      container.querySelectorAll(".course-item.active").forEach((el) => el.classList.remove("active"));
+      item.classList.add("active");
+      focusCourseVenueOnMap(course);
+    });
+
+    container.appendChild(item);
+  }
+}
+
+function focusCourseVenueOnMap(course) {
+  if (!course.lat || !course.lng) return;
+  map.setView([course.lat, course.lng], 16);
+  const marker = courseMarkers.get(course.venue_id);
+  if (marker) marker.openPopup();
+}
+
+function renderCourseMap(courses) {
+  if (currentView !== "courses") return;
+  markerCluster.clearLayers();
+  courseMarkers = new Map();
+
+  const venueMap = new Map();
+  for (const c of courses) {
+    if (!c.lat || !c.lng) continue;
+    if (!venueMap.has(c.venue_id)) {
+      venueMap.set(c.venue_id, {
+        venue_id: c.venue_id,
+        venue_name: c.venue_name,
+        district: c.district,
+        lat: c.lat,
+        lng: c.lng,
+        courses: [],
+      });
+    }
+    venueMap.get(c.venue_id).courses.push(c);
+  }
+
+  for (const venueData of venueMap.values()) {
+    const marker = L.circleMarker([venueData.lat, venueData.lng], {
+      radius: 7,
+      fillColor: "#4a90d9",
+      color: "#fff",
+      weight: 1.5,
+      opacity: 1,
+      fillOpacity: 0.85,
+    });
+    marker.bindPopup(() => buildCoursePopup(venueData));
+    courseMarkers.set(venueData.venue_id, marker);
+    markerCluster.addLayer(marker);
+  }
+}
+
+function buildCoursePopup(venueData) {
+  const coursesHtml = venueData.courses
+    .map((c) => {
+      const spots =
+        c.free_spots != null
+          ? ` \u00b7 <span class="course-spots ${c.free_spots > 0 ? "available" : "full"}">${c.free_spots > 0 ? c.free_spots + " free" : "full"}</span>`
+          : "";
+      return `
+        <div class="popup-course">
+          <div><span class="popup-course-time">${esc(c.start_time)}</span> <span class="popup-course-title">${esc(c.title)}</span></div>
+          <div class="popup-course-meta">${esc(c.category)}${c.teacher ? " \u00b7 " + esc(c.teacher) : ""}${spots}</div>
+        </div>
+      `;
+    })
+    .join("");
+
+  return `
+    <div class="popup-name">${esc(venueData.venue_name)}</div>
+    <div class="popup-address">${esc(venueData.district || "")}</div>
+    <div class="popup-course-list">${coursesHtml}</div>
+  `;
 }
 
 // ── Filters ──
