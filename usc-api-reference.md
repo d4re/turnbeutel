@@ -29,22 +29,24 @@ List venues with filtering and pagination.
 | `planType` | string | no | Filter by private plan: `S`, `M`, `L`, `XL` |
 | `categoryId` | int | no | Filter by activity category (see `/categories`) |
 
-**Response** (truncated):
+**Response** (truncated, real sample from `/venues?cityId=1&page=1&pageSize=3`):
 ```json
 {
   "success": "true",
   "data": [
     {
-      "id": 4926,
-      "name": "Yellow Yoga - Studio Sonne",
+      "id": 27355,
+      "name": "Brooklyn Fitboxing Potsdamer-Str",
+      "urlSlug": "brooklyn-fitboxing-potsdamer-str",
       "location": {
-        "displayAddress": "Berlin - Neukölln",
+        "displayAddress": "Berlin - Schöneberg",
         "city": { "id": 1, "name": "Berlin" },
-        "district": { "id": 88, "name": "Neukölln", "area": "Berlin" },
-        "latitude": 52.48444,
-        "longitude": 13.43498,
-        "postalCode": "12045",
-        "address": "Sonnenallee 67",
+        "district": { "id": 87, "name": "Schöneberg", "area": "Berlin" },
+        "latitude": 52.4985601,
+        "longitude": 13.3626739,
+        "postalCode": "10783",
+        "address": "Potsdamer Straße 125",
+        "additionalInformation": "",
         "country": { "code": "DE" }
       },
       "planTypes": ["M", "L", "XL"],
@@ -53,44 +55,77 @@ List venues with filtering and pagination.
       "appointmentTypes": ["onsite"],
       "isOnline": 0,
       "isPlusCheckin": 0,
+      "isMyClubs": false,
+      "isFavorited": 0,
+      "highlight": 1,
       "deleted": 0,
-      "covers": [ { "cover150": "https://...", "cover1024": "https://..." } ],
-      "categories": [
+      "policy": { "type": null },
+      "covers": [
         {
-          "id": 6,
-          "name": "Yoga",
-          "allowed_plan_types": [1, 3, 6],
-          "allowed_plan_types_b2b": [1, 3, 6],
-          "category_group_id": 2,
-          "translations": { "en_GB": "Yoga", "de_DE": "Yoga" }
+          "id": 12345,
+          "sortOrder": 0,
+          "title": "",
+          "cover150": "https://...",
+          "cover311": "https://...",
+          "cover720": "https://...",
+          "cover1024": "https://..."
         }
       ],
-      "urlSlug": "yellow-yoga-studio-sonne",
-      "ratings": { "averageScore": 4.9, "totalRatings": 9777 }
+      "categories": [
+        {
+          "id": 1,
+          "key": "40001",
+          "name": "Fitness",
+          "icon": "https://...",
+          "category_group_id": 2,
+          "allowed_plan_types": [2, 3, 6],
+          "allowed_plan_types_b2b": [2, 3, 6],
+          "translations": {
+            "en_GB": "Fitness", "de_DE": "Fitness", "fr_FR": "Fitness",
+            "es_ES": "Fitness", "pt_PT": "Fitness", "nl_NL": "Fitness"
+          }
+        }
+      ],
+      "ratings": { "averageScore": 4.9, "totalRatings": 7134 }
     }
   ]
 }
 ```
 
 **Notes:**
-- Berlin returns 2,639 venues across 27 pages (at pageSize=100). This is more than the 1,931 from the website — likely includes online/partner venues.
-- `planTypes` = private tiers, `planTypesB2B` = corporate tiers. These can differ per venue.
-- Each category within a venue has its own `allowed_plan_types` and `allowed_plan_types_b2b`, meaning tier access can vary by activity at the same venue.
+- Berlin returns ~2,600 venues across ~27 pages (at pageSize=100). More than the ~1,931 from the website — includes online/partner venues.
+- `planTypes` = private/B2C tiers, `planTypesB2B` = corporate/B2B tiers. These can differ per venue. Pure online venues sometimes have an empty `planTypes` and only `planTypesB2B`.
+- Each category within a venue has its own `allowed_plan_types` and `allowed_plan_types_b2b` (integer IDs — see [Plan Type ID Mapping](#plan-type-id-mapping)). The venue-level `planTypes` arrays are the union across categories. Tier access can vary by activity at the same venue.
+- `appointmentTypes` is one of `["onsite"]`, `["online"]`, or both — describes whether check-in is in person or via the app/web.
+- `allowedBusinessTypes` declares which membership families the venue accepts (`"b2c"`, `"b2b"`).
+- `covers` is a sorted list with multiple resolutions per image (`cover150`, `cover311`, `cover720`, `cover1024`) plus `id`, `sortOrder`, `title`.
+- `highlight` (0/1) and `isMyClubs` are personalization flags; `isFavorited` only varies when authenticated.
+- `policy.type` is usually `null` in the listing endpoint.
 - The `id` field matches the `data-address-id` attribute in the website HTML.
 - Pagination returns an empty `data` array when past the last page.
 
 ### GET /venues/{id}
 
-Single venue detail. Returns the same structure as a single item from `/venues`, plus additional fields:
+Single venue detail. Returns the same structure as a single item from `/venues`, plus several enrichment fields:
 
 ```
-GET /venues/4926
+GET /venues/30881
 ```
 
-Extra fields include:
-- `bookingLimitsText` — human-readable visit limits per tier (e.g., "M-Mitglieder können 4x pro Monat...")
-- `importantInfo` — venue-specific notes
-- `phone`, `website`, `openingHoursText`
+Extra fields observed in detail responses (not present in listings):
+
+| Field | Type | Description |
+|---|---|---|
+| `bookingLimitsText` | string | Free-text German visit-limit description per tier. Common forms: `"M-Mitglieder können 4x pro Monat..."`, `"L- & XL-Mitglieder können 8 Mal pro Monat..."`, `"M, L und XL-Mitglieder können 1 Mal pro Tag..."`. May reference `pro Tag` (per day) or `pro Monat` (per month) — there's no separate structured limits field. |
+| `importantInfo` | string | Venue-specific booking instructions (e.g., "Buche deinen Kurs direkt über die Urban Sports Club App!..."). |
+| `description` | string | Marketing description of the venue/activity. |
+| `openingHoursText` | string | Free-text opening hours — not structured. |
+| `phone` | string | Contact phone (sometimes `"_"` as a placeholder). |
+| `website` | string | External URL. |
+
+The `categories[].allowed_plan_types{,_b2b}` arrays are populated for active venues (e.g. `[2, 3, 6]` for an M/L/XL venue, `[1, 2, 3, 6]` for an S/M/L/XL one).
+
+**Note:** USC's `bookingLimitsText` is the *only* place visit-limit data is exposed in the API — there is no structured equivalent. Parsing it requires handling several variants (grouped tier prefixes, `x`/`Mal`, `pro Monat`/`im Monat`/`/Monat`, `pro Tag`, non-breaking spaces, etc.). See `backend/server.py:parse_visit_limits` for a working parser.
 
 ### GET /courses
 
@@ -117,32 +152,53 @@ List classes/courses with filtering. Supports city-wide search (not just per-ven
   "data": {
     "classes": [
       {
-        "id": 99051489,
-        "date": "2026-04-05",
-        "title": "Kundalini IN STUDIO SONNE with Paula (all levels/english)",
-        "startTime": "12:15:00",
-        "startDateTimeUTC": "2026-04-05T12:15:00+02:00",
-        "endTime": "13:30:00",
-        "endDateTimeUTC": "2026-04-05T13:30:00+02:00",
+        "id": 99087547,
+        "date": "2026-04-07",
+        "title": "Sakralchakra-Meditation",
+        "startTime": "22:30:00",
+        "endTime": "22:50:00",
+        "startDateTimeUTC": "2026-04-07T22:30:00+02:00",
+        "endDateTimeUTC": "2026-04-07T22:50:00+02:00",
         "venue": {
-          "id": 4926,
-          "name": "Yellow Yoga - Studio Sonne",
-          "location": { "displayAddress": "Berlin - Neukölln", "latitude": 52.48444, "longitude": 13.43498, ... },
-          "bookingLimitsText": "M-Mitglieder können 4x pro Monat...",
-          "importantInfo": "..."
+          "id": 15029,
+          "name": "Online - Saccidananda Yoga",
+          "phone": "_",
+          "website": "www.saccidananda-yoga.de",
+          "allowedBusinessTypes": ["b2c", "b2b"],
+          "openingHoursText": "Bitte informiere dich ...",
+          "additionalInformation": "",
+          "bookingLimitsText": "S-Mitglieder können bis zu 4 Mal pro Monat ...",
+          "importantInfo": "Buche deinen Kurs direkt ...",
+          "location": {
+            "displayAddress": "Berlin - Friedrichshain",
+            "city": { "id": 1, "name": "Berlin" },
+            "district": { "id": 13, "name": "Friedrichshain", "area": "Berlin" },
+            "latitude": 52.5119121,
+            "longitude": 13.466102,
+            "postalCode": "10247",
+            "address": "Jungstraße 14",
+            "country": { "code": "DE" },
+            "policy": { "type": null }
+          }
         },
-        "category": { "id": 6, "name": "Yoga" },
-        "teacherName": "Paula",
+        "category": { "id": 13, "name": "Meditation", "icon": "https://..." },
+        "teacherName": "Tobias S.",
         "bookable": 1,
-        "freeSpots": 32,
-        "maximumNumber": 40,
-        "minimumNumber": 0,
-        "planTypes": [],
-        "planTypesB2B": [],
-        "serviceType": "classes",
-        "bookingType": "instant",
-        "isOnline": 0,
+        "freeSpots": 93,
+        "maximumNumber": 99,
+        "minimumNumber": -1,
+        "planTypes": ["S", "M", "L", "XL"],
+        "planTypesB2B": ["S", "M", "L", "XL"],
+        "types": ["live"],
+        "serviceType": "event",
+        "bookingType": "confirmation_required",
+        "covers": [{ "cover150": "...", "cover311": "...", "cover720": "...", "cover1024": "..." }],
+        "isOnline": 1,
         "isPlusCheckin": 0,
+        "isMyClubs": false,
+        "highlight": 0,
+        "external": true,
+        "extraPriceDescriptionText": "",
         "deleted": 0,
         "booking": null
       }
@@ -153,9 +209,12 @@ List classes/courses with filtering. Supports city-wide search (not just per-ven
 
 **Notes:**
 - City-wide search is the killer feature: `cityId=1&categoryId=7` returns all Dance classes in Berlin in a single paginated request.
-- `planTypes` and `planTypesB2B` at the class level are populated for some classes but empty for others. Venue-level tier info is the more reliable and consistent source.
-- `venue` is embedded in each class object, so you get full location data without a separate lookup.
-- `freeSpots` shows real-time availability.
+- `planTypes` and `planTypesB2B` at the class level *are* populated in current responses (contrary to older observations), and may differ from venue-level tiers when an individual class is restricted.
+- `venue` is embedded in each class with the same enrichment fields as `/venues/{id}` (`bookingLimitsText`, `importantInfo`, `phone`, `website`, `openingHoursText`, `allowedBusinessTypes`, `additionalInformation`) — so a city-wide course query also gets you full venue context without an extra round-trip.
+- `freeSpots` / `maximumNumber` show real-time availability. `minimumNumber` can be `-1` for events without a minimum.
+- `serviceType` is one of `"classes"` or `"event"`. `bookingType` is `"instant"` or `"confirmation_required"`.
+- `types` is a list of class characteristics (e.g. `["live"]` for live-online, `["onsite"]` for in-person).
+- `external` is `true` when the booking is handled by the venue's own system.
 - `booking` is `null` when not authenticated. When logged in, shows booking status.
 - The `startDate` parameter limits how far ahead you can search — max observed is ~13 days out.
 
@@ -163,47 +222,70 @@ List classes/courses with filtering. Supports city-wide search (not just per-ven
 
 Full list of activity categories with sub-categories.
 
-**Response:**
+**Response** (real sample, ~72 top-level categories):
 ```json
 {
   "success": "true",
   "data": [
     {
-      "id": 7,
-      "name": "Dance",
-      "icon": "https://...",
+      "id": 92,
+      "name": "Aerial",
+      "icon": "",
       "sub-categories": [
-        { "id": 345, "name": "African Dance" },
-        { "id": 101, "name": "Ballett" },
-        { "id": 330, "name": "Hip Hop" },
-        { "id": 102, "name": "Pole Dance" },
-        { "id": 100, "name": "Salsa" }
+        { "id": 345, "name": "Aerial Hoop", "icon": "", "sub-categories": [] }
+      ]
+    },
+    {
+      "id": 17,
+      "name": "Aqua",
+      "icon": "",
+      "sub-categories": [
+        { "id": 352, "name": "Aqua biking", "icon": "", "sub-categories": [] },
+        { "id": 351, "name": "Aqua Gym", "icon": "", "sub-categories": [] }
       ]
     }
   ]
 }
 ```
 
-Selected category IDs:
-- 1 = Fitness, 4 = Pilates, 6 = Yoga, 7 = Dance, 9 = Massage
-- 17 = Aqua, 135 = Pole Dance, 173 = Sauna, 174 = Spa
+Notes:
+- Sub-categories use the same recursive `{id, name, icon, sub-categories}` shape but typically nest only one level deep.
+- The `icon` field is often an empty string in the categories endpoint (icons used elsewhere come from the venue category objects).
+
+Selected category IDs (verified against `/categories` and venue samples):
+- 1 = Fitness, 4 = Pilates, 6 = Yoga, 7 = Dance, 9 = Massage, 13 = Meditation
+- 17 = Aqua, 92 = Aerial, 135 = Pole Dance, 173 = Sauna, 174 = Spa
 - 232 = Bouldering, 233 = Functional Training, 253 = MMA
-- 262 = Padel, 271 = Swimming, 286 = Cryotherapy
+- 262 = Padel, 271 = Swimming, 277 = Archery, 286 = Cryotherapy
 
 ### GET /cities
 
-All cities where USC operates.
+All cities where USC operates (~218 entries, all countries).
 
-**Response:**
+**Response** (real sample):
 ```json
 {
   "success": "true",
   "data": [
-    { "id": 1, "defaultName": "Berlin", "lat": 52.52, "lon": 13.405, "countryCode": "DE" },
-    { "id": 2, "defaultName": "München", "lat": 48.137, "lon": 11.575, "countryCode": "DE" }
+    {
+      "id": 93,
+      "defaultName": "Aachen",
+      "lat": 50.780658,
+      "lon": 6.083815,
+      "countryCode": "DE",
+      "venueAddressCount": 122,
+      "supportEmail": "",
+      "supportPhone": ""
+    }
   ]
 }
 ```
+
+Fields:
+- `id`, `defaultName`, `countryCode` — primary identifiers.
+- `lat`, `lon` — geographic centroid (useful for default map zoom).
+- `venueAddressCount` — total number of venue addresses USC has in that city. Useful for sorting/filtering inactive cities.
+- `supportEmail`, `supportPhone` — frequently empty strings.
 
 ### GET /districts
 
@@ -275,16 +357,18 @@ Authorization: Bearer <token>
 
 ## Plan Type ID Mapping
 
-Plan types in the API are represented as integers in category-level `allowed_plan_types`:
+Plan types in the API are represented as integers in category-level `allowed_plan_types` and `allowed_plan_types_b2b`:
 
-| ID | Private Name | Corporate Name |
-|----|-------------|----------------|
-| 0  | Essential   | S              |
-| 1  | Classic     | M              |
-| 3  | Premium     | L              |
-| 6  | Max         | XL             |
+| ID | Corporate (B2B) | Private (B2C) |
+|----|-----------------|---------------|
+| 1  | S               | Essential     |
+| 2  | M               | Classic       |
+| 3  | L               | Premium       |
+| 6  | XL              | Max           |
 
-At the venue level, `planTypes` and `planTypesB2B` use string names ("S", "M", "L", "XL") instead of IDs.
+Verified against live samples — e.g. a venue with `planTypesB2B: ["S","M","L","XL"]` has `allowed_plan_types_b2b: [1, 2, 3, 6]`, and an `["L","XL"]`-only venue has `[3, 6]`. The IDs `0`, `4`, `5` do not appear in current responses.
+
+At the venue level, `planTypes` and `planTypesB2B` use the string names (`"S"`, `"M"`, `"L"`, `"XL"`) instead of IDs. The string letters are the same for both private and corporate, even though they map to different display names — the distinction is purely which array (`planTypes` vs `planTypesB2B`) the value lives in.
 
 ## Comparison: API vs HTML Scraping
 

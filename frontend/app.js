@@ -603,25 +603,29 @@ function buildPopup(venue) {
   const tiers = getVenueTiers(venue);
   const tiersHtml = tiers.map((t) => tierBadgeHtml(t)).join(" ");
 
-  // Lazy-load visit limits from API if not yet available
-  if (venue.visit_limits === undefined || venue.visit_limits === null) {
-    if (!venue._detailLoading) {
-      venue._detailLoading = true;
-      fetch(`${API_BASE}/api/venues/${venue.address_id}`)
-        .then((r) => r.ok ? r.json() : null)
-        .then((detail) => {
-          if (detail) {
-            venue.visit_limits = detail.visit_limits;
-            venue.bookingLimitsText = detail.bookingLimitsText;
-          }
-          venue._detailLoading = false;
-          // Re-render popup if still open
-          if (venue._marker && venue._marker.isPopupOpen()) {
-            venue._marker.setPopupContent(buildPopup(venue));
-          }
-        })
-        .catch(() => { venue._detailLoading = false; });
-    }
+  // Lazy-load visit limits from API once per venue. We track _detailLoaded
+  // separately from visit_limits because a venue may legitimately have no
+  // parseable limits (visit_limits === null), and we must not refetch in a loop.
+  if (!venue._detailLoaded && !venue._detailLoading) {
+    venue._detailLoading = true;
+    fetch(`${API_BASE}/api/venues/${venue.address_id}`)
+      .then((r) => r.ok ? r.json() : null)
+      .then((detail) => {
+        if (detail) {
+          venue.visit_limits = detail.visit_limits;
+          venue.bookingLimitsText = detail.bookingLimitsText;
+        }
+        venue._detailLoaded = true;
+        venue._detailLoading = false;
+        // Re-render popup if still open
+        if (venue._marker && venue._marker.isPopupOpen()) {
+          venue._marker.setPopupContent(buildPopup(venue));
+        }
+      })
+      .catch(() => {
+        venue._detailLoaded = true;
+        venue._detailLoading = false;
+      });
   }
 
   // Visit limits table
