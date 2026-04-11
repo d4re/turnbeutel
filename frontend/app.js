@@ -1,12 +1,22 @@
-const API_BASE = window.location.port === "8000" ? "" : "http://localhost:8000";
+// FastAPI mounts the frontend itself, so the page is always same-origin with
+// the API. Relative URLs work for both `make serve` (dev) and the production
+// container. Set this to a full URL only if you ever serve the frontend from
+// a different origin during development.
+const API_BASE = "";
 
 let tierConfig = {};
 let map, markerCluster, allVenues, filteredVenues;
+
+// Per-venue UI state, kept off the venue objects so the data layer stays pure.
+const venueMarkers = new WeakMap();        // venue -> Leaflet marker
+const venueDetailFetched = new Set();      // address_id whose detail has been fetched
+const venueDetailInFlight = new Set();     // address_id currently being fetched
 
 // Courses view state
 let currentView = "venues";
 let allCourses = [];
 let filteredCourses = [];
+let coursesLoaded = false;
 let coursesLoadToken = 0;
 let courseMarkers = new Map();
 
@@ -133,12 +143,10 @@ function switchView(view) {
 
   if (view === "venues") {
     applyFilters();
+  } else if (!coursesLoaded) {
+    fetchCourses();
   } else {
-    if (allCourses.length === 0) {
-      fetchCourses();
-    } else {
-      applyCourseFilters();
-    }
+    applyCourseFilters();
   }
 }
 
@@ -173,12 +181,15 @@ async function fetchCourses() {
       throw new Error(data.detail || data.error || `API ${resp.status}`);
     }
     allCourses = data.courses || [];
+    coursesLoaded = true;
     if (data.errors && data.errors.length > 0) {
       console.warn("Some days failed to load:", data.errors);
     }
     populateCategoryFilter(allCourses);
     applyCourseFilters();
   } catch (err) {
+    if (token !== coursesLoadToken) return;
+    coursesLoaded = true;
     listEl.innerHTML = `<div class="loading">Error loading courses: ${esc(err.message)}</div>`;
   }
 }
@@ -462,8 +473,9 @@ function updateSliderFill() {
   const minVal = parseInt(document.getElementById("slider-min").value);
   const maxVal = parseInt(document.getElementById("slider-max").value);
   const fill = document.getElementById("slider-fill");
-  const pctMin = (minVal / 3) * 100;
-  const pctMax = (maxVal / 3) * 100;
+  const lastIdx = Math.max(1, getTierOrder().length - 1);
+  const pctMin = (minVal / lastIdx) * 100;
+  const pctMax = (maxVal / lastIdx) * 100;
   fill.style.left = pctMin + "%";
   fill.style.width = (pctMax - pctMin) + "%";
 }
@@ -555,9 +567,10 @@ function renderList(venues) {
     item.addEventListener("click", () => {
       container.querySelectorAll(".venue-item.active").forEach((el) => el.classList.remove("active"));
       item.classList.add("active");
-      if (venue.has_coordinates && venue._marker) {
+      const marker = venueMarkers.get(venue);
+      if (venue.has_coordinates && marker) {
         map.setView([venue.lat, venue.lng], 15);
-        venue._marker.openPopup();
+        marker.openPopup();
       }
     });
 
@@ -569,7 +582,6 @@ function renderMap(venues) {
   markerCluster.clearLayers();
   const colors = getTierColors();
   for (const venue of venues) {
-    venue._marker = null;
     if (!venue.has_coordinates) continue;
 
     const mt = getVenueMinTier(venue);
@@ -593,7 +605,7 @@ function renderMap(venues) {
       }
     });
 
-    venue._marker = marker;
+    venueMarkers.set(venue, marker);
     markerCluster.addLayer(marker);
   }
 }
@@ -603,28 +615,29 @@ function buildPopup(venue) {
   const tiers = getVenueTiers(venue);
   const tiersHtml = tiers.map((t) => tierBadgeHtml(t)).join(" ");
 
-  // Lazy-load visit limits from API once per venue. We track _detailLoaded
+  // Lazy-load visit limits from API once per venue. We track "fetched"
   // separately from visit_limits because a venue may legitimately have no
   // parseable limits (visit_limits === null), and we must not refetch in a loop.
-  if (!venue._detailLoaded && !venue._detailLoading) {
-    venue._detailLoading = true;
-    fetch(`${API_BASE}/api/venues/${venue.address_id}`)
+  const vid = venue.address_id;
+  if (!venueDetailFetched.has(vid) && !venueDetailInFlight.has(vid)) {
+    venueDetailInFlight.add(vid);
+    fetch(`${API_BASE}/api/venues/${vid}`)
       .then((r) => r.ok ? r.json() : null)
       .then((detail) => {
         if (detail) {
           venue.visit_limits = detail.visit_limits;
           venue.bookingLimitsText = detail.bookingLimitsText;
         }
-        venue._detailLoaded = true;
-        venue._detailLoading = false;
-        // Re-render popup if still open
-        if (venue._marker && venue._marker.isPopupOpen()) {
-          venue._marker.setPopupContent(buildPopup(venue));
+        venueDetailFetched.add(vid);
+        venueDetailInFlight.delete(vid);
+        const marker = venueMarkers.get(venue);
+        if (marker && marker.isPopupOpen()) {
+          marker.setPopupContent(buildPopup(venue));
         }
       })
       .catch(() => {
-        venue._detailLoaded = true;
-        venue._detailLoading = false;
+        venueDetailFetched.add(vid);
+        venueDetailInFlight.delete(vid);
       });
   }
 
@@ -648,7 +661,7 @@ function buildPopup(venue) {
       const label = type === "corporate" ? "Corporate" : "Private";
       visitsHtml = `<div class="popup-visits"><strong>Visit limits (${label})</strong><table>${rows}</table></div>`;
     }
-  } else if (venue._detailLoading) {
+  } else if (venueDetailInFlight.has(vid)) {
     visitsHtml = '<div class="popup-visits" style="color:#999">Loading visit limits...</div>';
   }
 
@@ -660,14 +673,22 @@ function buildPopup(venue) {
   }
 
   const plusHtml = venue.is_plus ? ' <span class="plus-badge">PLUS</span>' : "";
+  const safeHref = isHttpUrl(venue.url) ? venue.url : null;
+  const nameHtml = safeHref
+    ? `<a href="${esc(safeHref)}" target="_blank" rel="noopener noreferrer">${esc(venue.name)}</a>`
+    : esc(venue.name);
 
   return `
-    <div class="popup-name"><a href="${esc(venue.url)}" target="_blank">${esc(venue.name)}</a>${plusHtml}</div>
+    <div class="popup-name">${nameHtml}${plusHtml}</div>
     <div class="popup-address">${esc(addressText)}</div>
     <div class="popup-tiers">${tiersHtml}</div>
     ${visitsHtml}
     <div class="popup-activities">${esc(venue.activities.join(" \u00b7 "))}</div>
   `;
+}
+
+function isHttpUrl(str) {
+  return typeof str === "string" && /^https?:\/\//i.test(str);
 }
 
 function esc(str) {
