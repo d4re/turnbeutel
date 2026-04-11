@@ -1,11 +1,12 @@
 """
 FastAPI backend proxy for USC API.
-Fetches venue data from api.urbansportsclub.com, transforms it to match
-the frontend's expected format, and caches results to disk.
+
+Fetches venue, course, and category data from api.urbansportsclub.com,
+transforms it to the frontend's expected format, and caches results in a
+single SQLite database (see storage.py).
 """
 
 import asyncio
-import json
 import logging
 import re
 import time
@@ -15,40 +16,26 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+import storage
+from models import (
+    City,
+    Course,
+    CourseFetchError,
+    CoursesResponse,
+    TierConfig,
+    Venue,
+    VenueAddress,
+    VenueDetail,
+    VenuesPayload,
+    VisitLimits,
+)
+
 logger = logging.getLogger(__name__)
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Load caches from disk on startup."""
-    global _venues_data, _details_data
-
-    cached_details = read_cache(DETAILS_CACHE_FILE, DETAILS_TTL_HOURS)
-    if cached_details:
-        _details_data = {k: v for k, v in cached_details.items() if k != "_cached_at"}
-
-    cached_venues = read_cache(VENUES_CACHE_FILE, VENUES_TTL_HOURS)
-    if cached_venues:
-        _venues_data = cached_venues
-        _merge_details_into_venues()
-
-    # Clean up stale course cache files (older than 3 days)
-    cutoff = time.time() - 3 * 24 * 3600
-    for f in CACHE_DIR.glob("courses_*.json"):
-        try:
-            if f.stat().st_mtime < cutoff:
-                f.unlink()
-        except OSError:
-            pass
-
-    yield
-
-
-app = FastAPI(title="USC Venue Explorer API", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ── Config ──
 
@@ -58,105 +45,180 @@ USC_HEADERS = {
     "Accept-Encoding": "gzip, deflate",
     "Accept-Language": "en-US;q=1.0",
 }
-CITY_ID = 1  # Berlin
+BERLIN_CITY_ID = 1
 PAGE_SIZE = 100
 
 CACHE_DIR = Path(__file__).parent / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
+DB_PATH = CACHE_DIR / "usc.db"
 
-VENUES_CACHE_FILE = CACHE_DIR / "venues.json"
-DETAILS_CACHE_FILE = CACHE_DIR / "venue_details.json"
-CATEGORIES_CACHE_FILE = CACHE_DIR / "categories.json"
+VENUES_TTL = 24 * 3600
+DETAILS_TTL = 7 * 24 * 3600
+CATEGORIES_TTL = 7 * 24 * 3600
+COURSES_TTL = 48 * 3600
+COURSES_STALE = 3 * 24 * 3600
+CITIES_TTL = 30 * 24 * 3600
 
-VENUES_TTL_HOURS = 24
-DETAILS_TTL_HOURS = 7 * 24  # 7 days
-CATEGORIES_TTL_HOURS = 7 * 24
-COURSES_TTL_HOURS = 48  # 2 days
-
-# ── Tier mappings (from merge_data.py) ──
+# ── Tier mappings ──
 
 PRIVATE_TIER_ORDER = ["Essential", "Classic", "Premium", "Max"]
 CORPORATE_TIER_ORDER = ["S", "M", "L", "XL"]
 CORP_TO_PRIVATE = {"S": "Essential", "M": "Classic", "L": "Premium", "XL": "Max"}
 
-TIER_CONFIG = {
-    "private": {
+TIER_CONFIG = TierConfig(
+    private={
         "order": PRIVATE_TIER_ORDER,
         "colors": {"Essential": "#27ae60", "Classic": "#2980b9", "Premium": "#e67e22", "Max": "#c0392b"},
     },
-    "corporate": {
+    corporate={
         "order": CORPORATE_TIER_ORDER,
         "display": {"S": "S", "M": "M Pro", "L": "L Pro", "XL": "XL Pro"},
         "colors": {"S": "#27ae60", "M": "#2980b9", "L": "#e67e22", "XL": "#c0392b"},
     },
-}
+)
 
 # ── In-memory state ──
 
-_venues_data: dict | None = None
-_details_data: dict = {}
+_cities_index: list[City] = []
+_venues_response_cache: dict[int, tuple[float, VenuesPayload]] = {}
 _enrichment_running = False
 
 
-# ── Cache helpers ──
+def _invalidate_venues_cache(city_id: int) -> None:
+    _venues_response_cache.pop(city_id, None)
 
 
-def read_cache(path: Path, max_age_hours: float) -> dict | None:
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        cached_at = data.get("_cached_at", 0)
-        if (time.time() - cached_at) > max_age_hours * 3600:
-            return None
-        return data
-    except (json.JSONDecodeError, KeyError):
-        return None
+# ── Lifespan ──
 
 
-def write_cache(path: Path, data: dict) -> None:
-    out = {**data, "_cached_at": time.time()}
-    path.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize SQLite storage, sync /cities index, and purge stale courses."""
+    global _cities_index
+
+    await run_in_threadpool(storage.init, DB_PATH)
+
+    cities_fetched_at = await run_in_threadpool(storage.get_cities_fetched_at)
+    if cities_fetched_at is None or (time.time() - cities_fetched_at) > CITIES_TTL:
+        try:
+            raw_cities = await fetch_all_cities()
+            cities = [transform_city(c) for c in raw_cities if c.get("id")]
+            await run_in_threadpool(storage.upsert_cities, cities, time.time())
+        except Exception:
+            logger.exception("Failed to sync /cities on startup; continuing with existing cache")
+
+    _cities_index = await run_in_threadpool(storage.list_cities)
+    await run_in_threadpool(storage.purge_stale_courses, float(COURSES_STALE))
+
+    # Re-derive visit_limits from cached booking_limits_text on every startup.
+    # Cheap (~ms per row) and ensures parser changes take effect without a refetch.
+    reparsed = await run_in_threadpool(storage.reparse_visit_limits, parse_visit_limits)
+    if reparsed:
+        logger.info("Re-parsed visit limits for %d cached venue_details rows", reparsed)
+
+    yield
+
+    storage.close()
+
+
+app = FastAPI(title="USC Venue Explorer API", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
 # ── Visit limits parsing ──
 
-VISIT_LIMIT_RE = re.compile(
-    r"(S|M|L|XL)-Mitglieder\s+können.*?(\d+)\s*(?:x|Mal)\s*pro\s*Monat",
+# Matches the body of a "<tiers>-Mitglieder können|dürfen ... N x/Mal pro/im/am (Monat|Tag)" sentence.
+# Tier names live in the prefix immediately before "Mitglieder" — extracted separately
+# so we can handle grouped forms like "L- & XL-Mitglieder" or "M, L und XL-Mitglieder".
+# Per-day limits are converted to a 30-day month equivalent.
+#
+# Filler words may appear both before the count ("im Rahmen ihres Kontingents von insgesamt 4 x")
+# and between the count and the preposition ("4 x Sport im Monat", "8x Padel pro Monat"), so the
+# pattern allows lazy non-period stretches on either side. Requiring `x|Mal` after the digit biases
+# the capture toward genuine visit counts rather than incidental numbers in the same sentence.
+VISIT_LIMIT_SEGMENT_RE = re.compile(
+    r"Mitglieder\s+(?:können|dürfen)[^.]*?(\d+)\s*-?\s*(?:x|mal)\b[^.]*?\b(?:pro|im|am|/)\s*(Monat|Tag)",
     re.IGNORECASE,
 )
+CORPORATE_TIER_TOKEN_RE = re.compile(r"\b(XL|S|M|L)\b", re.IGNORECASE)
+PRIVATE_TIER_TOKEN_RE = re.compile(r"\b(Essential|Classic|Premium|Max)\b", re.IGNORECASE)
+PRIVATE_TO_CORP = {v: k for k, v in CORP_TO_PRIVATE.items()}
+DAYS_PER_MONTH = 30
 
 
-def parse_visit_limits(text: str | None) -> dict | None:
-    """Parse bookingLimitsText into structured visit limits."""
+def parse_visit_limits(text: str | None) -> VisitLimits | None:
+    """Parse bookingLimitsText into a structured VisitLimits model.
+
+    Both corporate (S/M/L/XL) and private (Essential/Classic/Premium/Max) tier
+    names in the source text are matched directly. Whichever side is parsed gets
+    the other side derived via the CORP_TO_PRIVATE mapping.
+
+    "pro Monat" is taken at face value; "pro Tag" is converted to a monthly
+    figure assuming a 30-day month (e.g. "1 Mal pro Tag" → 30 / month).
+    """
     if not text:
         return None
-    matches = VISIT_LIMIT_RE.findall(text)
-    if not matches:
+
+    corporate: dict[str, int | None] = {}
+    private: dict[str, int | None] = {}
+    saw_segment = False
+
+    for m in VISIT_LIMIT_SEGMENT_RE.finditer(text):
+        saw_segment = True
+        count = int(m.group(1))
+        if m.group(2).lower() == "tag":
+            count *= DAYS_PER_MONTH
+        # Look at the text just before "Mitglieder" for the tier prefix.
+        # Trim to the most recent sentence/line break so we don't pick up
+        # tier names belonging to a previous sentence.
+        prefix = text[max(0, m.start() - 80) : m.start()]
+        for sep in (".", "\n", "\r"):
+            idx = prefix.rfind(sep)
+            if idx >= 0:
+                prefix = prefix[idx + 1 :]
+        for tier in CORPORATE_TIER_TOKEN_RE.findall(prefix):
+            tier = tier.upper()
+            if tier in CORPORATE_TIER_ORDER and tier not in corporate:
+                corporate[tier] = count
+        for tier in PRIVATE_TIER_TOKEN_RE.findall(prefix):
+            tier = tier.capitalize()
+            if tier in PRIVATE_TIER_ORDER and tier not in private:
+                private[tier] = count
+
+    if not corporate and not private:
+        logger.warning(
+            "parse_visit_limits: could not extract any tier limits from text: %r",
+            text,
+        )
         return None
 
-    corporate = {}
-    private = {}
-    for tier_letter, count in matches:
-        tier_letter = tier_letter.upper()
-        count = int(count)
-        # Keep first match per tier (general limit, not per-activity limit)
-        if tier_letter not in corporate:
-            corporate[tier_letter] = count
-            private_name = CORP_TO_PRIVATE.get(tier_letter)
-            if private_name:
-                private[private_name] = count
+    # In practice USC's text always uses corporate-style letters, so a missing
+    # direct private match is the norm — log at debug, not warning.
+    if saw_segment and not corporate:
+        logger.debug(
+            "parse_visit_limits: no corporate tiers parsed (only private) from text: %r",
+            text,
+        )
+    if saw_segment and not private:
+        logger.debug(
+            "parse_visit_limits: no private tiers parsed (only corporate) from text: %r",
+            text,
+        )
 
-    if not corporate:
-        return None
+    # Cross-fill: USC almost always uses corporate-style letters, but if either
+    # side is populated, derive the other via the 1:1 mapping.
+    for corp, priv in CORP_TO_PRIVATE.items():
+        if corp in corporate and priv not in private:
+            private[priv] = corporate[corp]
+        if priv in private and corp not in corporate:
+            corporate[corp] = private[priv]
 
-    # Fill in nulls for tiers not mentioned
     for t in CORPORATE_TIER_ORDER:
         corporate.setdefault(t, None)
     for t in PRIVATE_TIER_ORDER:
         private.setdefault(t, None)
 
-    return {"private": private, "corporate": corporate}
+    return VisitLimits(private=private, corporate=corporate)
 
 
 # ── Venue transformation ──
@@ -169,8 +231,8 @@ def min_tier(tiers: list[str], order: list[str]) -> str | None:
     return None
 
 
-def transform_venue(raw: dict, detail: dict | None = None) -> dict:
-    """Transform a USC API venue object into the frontend format."""
+def transform_venue(raw: dict, detail: VenueDetail | None = None) -> Venue:
+    """Transform a USC API venue object into a Venue model."""
     loc = raw.get("location", {})
     plan_types = raw.get("planTypes", [])
     plan_types_b2b = raw.get("planTypesB2B", [])
@@ -182,74 +244,99 @@ def transform_venue(raw: dict, detail: dict | None = None) -> dict:
     lng = loc.get("longitude")
     slug = raw.get("urlSlug", "")
 
-    categories = raw.get("categories", [])
-    activities = []
-    for cat in categories:
+    activities: list[str] = []
+    for cat in raw.get("categories", []) or []:
         name = (cat.get("translations") or {}).get("en_GB") or cat.get("name", "")
         if name and name not in activities:
             activities.append(name)
 
-    ratings = raw.get("ratings", {})
-    district_obj = loc.get("district", {})
+    ratings = raw.get("ratings", {}) or {}
+    district_obj = loc.get("district", {}) or {}
 
-    visit_limits = None
-    booking_limits_text = None
-    if detail:
-        visit_limits = detail.get("visit_limits")
-        booking_limits_text = detail.get("bookingLimitsText")
+    return Venue(
+        name=(raw.get("name") or "").strip(),
+        slug=slug,
+        url=f"https://urbansportsclub.com/en/venues/{slug}" if slug else "",
+        tiers_private=tiers_private,
+        tiers_corporate=tiers_corporate,
+        min_tier_private=min_tier(tiers_private, PRIVATE_TIER_ORDER),
+        min_tier_corporate=min_tier(tiers_corporate, CORPORATE_TIER_ORDER),
+        activities=activities,
+        district=district_obj.get("name", ""),
+        street=loc.get("address", "") or "",
+        is_plus=raw.get("isPlusCheckin", 0) == 1,
+        address_id=str(raw.get("id", "")),
+        lat=lat,
+        lng=lng,
+        address=VenueAddress(
+            street=loc.get("address", "") or "",
+            postal_code=loc.get("postalCode", "") or "",
+            city=f"{(loc.get('city') or {}).get('name', '')}, {(loc.get('country') or {}).get('code', '')}",
+        ),
+        rating=ratings.get("averageScore"),
+        review_count=ratings.get("totalRatings"),
+        visit_limits=detail.visit_limits if detail else None,
+        bookingLimitsText=detail.bookingLimitsText if detail else None,
+        is_online=raw.get("isOnline", 0) == 1,
+        has_coordinates=bool(lat and lng),
+    )
 
-    return {
-        "name": raw.get("name", "").strip(),
-        "slug": slug,
-        "url": f"https://urbansportsclub.com/en/venues/{slug}" if slug else "",
-        "tiers_private": tiers_private,
-        "tiers_corporate": tiers_corporate,
-        "min_tier_private": min_tier(tiers_private, PRIVATE_TIER_ORDER),
-        "min_tier_corporate": min_tier(tiers_corporate, CORPORATE_TIER_ORDER),
-        "activities": activities,
-        "district": district_obj.get("name", ""),
-        "street": loc.get("address", ""),
-        "is_plus": raw.get("isPlusCheckin", 0) == 1,
-        "address_id": str(raw.get("id", "")),
-        "lat": lat,
-        "lng": lng,
-        "address": {
-            "street": loc.get("address", ""),
-            "postal_code": loc.get("postalCode", ""),
-            "city": f"{loc.get('city', {}).get('name', '')}, {loc.get('country', {}).get('code', '')}",
-        },
-        "rating": ratings.get("averageScore"),
-        "review_count": ratings.get("totalRatings"),
-        "visit_limits": visit_limits,
-        "bookingLimitsText": booking_limits_text,
-        "is_online": raw.get("isOnline", 0) == 1,
-        "has_coordinates": bool(lat and lng),
-    }
+
+# ── City transformation ──
+
+
+def transform_city(raw: dict) -> City:
+    """Transform a USC /cities row into a City model."""
+    return City(
+        id=int(raw.get("id")),
+        name=raw.get("name", ""),
+        country_code=(raw.get("country") or {}).get("code")
+        if isinstance(raw.get("country"), dict)
+        else raw.get("countryCode"),
+        centroid_lat=raw.get("lat") or raw.get("latitude"),
+        centroid_lng=raw.get("lon") or raw.get("lng") or raw.get("longitude"),
+        venue_address_count=raw.get("venueAddressCount"),
+    )
 
 
 # ── API fetching ──
 
 
-async def fetch_all_venue_pages() -> list[dict]:
+async def fetch_all_cities() -> list[dict]:
+    """Fetch the USC /cities index (small, ~218 rows)."""
+    async with httpx.AsyncClient(headers=USC_HEADERS, timeout=30) as client:
+        resp = await client.get(f"{USC_API}/cities")
+        resp.raise_for_status()
+        data = resp.json()
+    # USC wraps lists in {"data": [...]} but older endpoints return raw lists.
+    if isinstance(data, dict):
+        return data.get("data") or []
+    return data or []
+
+
+async def fetch_all_venue_pages(usc_city_id: int) -> list[dict]:
     """Fetch all venue pages from the USC API concurrently."""
     async with httpx.AsyncClient(headers=USC_HEADERS, timeout=30) as client:
-        # First request to determine total pages
-        first = await client.get(f"{USC_API}/venues", params={"cityId": CITY_ID, "page": 1, "pageSize": PAGE_SIZE})
+        first = await client.get(
+            f"{USC_API}/venues",
+            params={"cityId": usc_city_id, "page": 1, "pageSize": PAGE_SIZE},
+        )
         first.raise_for_status()
         first_data = first.json().get("data", [])
         if not first_data:
             return []
 
         all_venues = list(first_data)
-
         if len(first_data) < PAGE_SIZE:
             return all_venues
 
-        # Calculate remaining pages needed (add 1 extra to be safe)
-        estimated_total = len(first_data) * 30  # rough upper bound
+        estimated_total = len(first_data) * 30
         total_pages = (estimated_total // PAGE_SIZE) + 2
         tasks = [
-            client.get(f"{USC_API}/venues", params={"cityId": CITY_ID, "page": p, "pageSize": PAGE_SIZE})
+            client.get(
+                f"{USC_API}/venues",
+                params={"cityId": usc_city_id, "page": p, "pageSize": PAGE_SIZE},
+            )
             for p in range(2, total_pages + 1)
         ]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
@@ -276,57 +363,42 @@ async def fetch_venue_detail(venue_id: int) -> dict:
 # ── Course transformation and fetching ──
 
 
-def transform_course(raw: dict) -> dict:
-    """Transform a USC API course object into the frontend format."""
+def transform_course(raw: dict) -> Course:
+    """Transform a USC API course object into a Course model."""
     venue = raw.get("venue") or {}
     loc = venue.get("location") or {}
     district = (loc.get("district") or {}).get("name", "")
     category = raw.get("category") or {}
     start_time = raw.get("startTime") or ""
     end_time = raw.get("endTime") or ""
-    return {
-        "id": raw.get("id"),
-        "date": raw.get("date", ""),
-        "title": raw.get("title", ""),
-        "start_time": start_time[:5],
-        "end_time": end_time[:5],
-        "venue_id": str(venue.get("id", "")),
-        "venue_name": venue.get("name", ""),
-        "lat": loc.get("latitude"),
-        "lng": loc.get("longitude"),
-        "district": district,
-        "category": category.get("name", ""),
-        "category_id": category.get("id"),
-        "teacher": raw.get("teacherName", "") or "",
-        "free_spots": raw.get("freeSpots"),
-        "max_spots": raw.get("maximumNumber"),
-        "is_online": raw.get("isOnline", 0) == 1,
-        "is_plus": raw.get("isPlusCheckin", 0) == 1,
-    }
-
-
-_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
-
-
-def _course_cache_path(date_str: str) -> Path:
-    # Caller must pass a validated YYYY-MM-DD string. This guard prevents path
-    # traversal if an unvalidated input ever reaches this function.
-    if not _DATE_RE.fullmatch(date_str):
-        raise ValueError(f"Invalid date_str for cache path: {date_str!r}")
-    return CACHE_DIR / f"courses_{date_str}.json"
+    return Course(
+        id=raw.get("id"),
+        date=raw.get("date", ""),
+        title=raw.get("title", ""),
+        start_time=start_time[:5],
+        end_time=end_time[:5],
+        venue_id=str(venue.get("id", "")),
+        venue_name=venue.get("name", ""),
+        lat=loc.get("latitude"),
+        lng=loc.get("longitude"),
+        district=district,
+        category=category.get("name", ""),
+        category_id=category.get("id"),
+        teacher=raw.get("teacherName", "") or "",
+        free_spots=raw.get("freeSpots"),
+        max_spots=raw.get("maximumNumber"),
+        is_online=raw.get("isOnline", 0) == 1,
+        is_plus=raw.get("isPlusCheckin", 0) == 1,
+    )
 
 
 async def fetch_courses_for_date(
     date_str: str,
+    usc_city_id: int,
     client: httpx.AsyncClient,
     semaphore: asyncio.Semaphore,
-) -> list[dict]:
-    """Fetch all courses for a single date. Uses per-day disk cache with 2-day TTL."""
-    cache_path = _course_cache_path(date_str)
-    cached = read_cache(cache_path, COURSES_TTL_HOURS)
-    if cached is not None:
-        return cached.get("courses", [])
-
+) -> list[Course]:
+    """Fetch all courses for a single date from USC (no caching — the caller handles storage)."""
     all_raw: list[dict] = []
     page = 1
     while True:
@@ -334,7 +406,7 @@ async def fetch_courses_for_date(
             resp = await client.get(
                 f"{USC_API}/courses",
                 params={
-                    "cityId": CITY_ID,
+                    "cityId": usc_city_id,
                     "startDate": date_str,
                     "forDurationOfDays": 1,
                     "pageSize": PAGE_SIZE,
@@ -350,150 +422,146 @@ async def fetch_courses_for_date(
         if len(classes) < PAGE_SIZE:
             break
         page += 1
-        if page > 50:  # safety bound
+        if page > 50:
             break
 
-    courses = [transform_course(c) for c in all_raw]
-    courses.sort(key=lambda c: (c["date"], c["start_time"]))
-    write_cache(cache_path, {"courses": courses})
+    # USC occasionally returns the same course_id twice in a single day's payload
+    # (observed: byte-identical duplicates). Dedupe at the source so both the
+    # response and the storage layer see unique ids per (date, id).
+    seen: set = set()
+    courses: list[Course] = []
+    for raw in all_raw:
+        c = transform_course(raw)
+        if c.id in seen:
+            continue
+        seen.add(c.id)
+        courses.append(c)
+    courses.sort(key=lambda c: (c.date, c.start_time))
     return courses
 
 
 # ── Background enrichment ──
 
 
-async def enrich_venue_details() -> None:
-    """Background task: fetch details for all venues that lack cached detail data."""
-    global _details_data, _enrichment_running
+async def enrich_venue_details(city_id: int) -> None:
+    """Background task: fetch details for any venue in `city_id` missing or with stale enrichment."""
+    global _enrichment_running
     if _enrichment_running:
         return
     _enrichment_running = True
 
     try:
-        # Load existing detail cache
-        cached = read_cache(DETAILS_CACHE_FILE, DETAILS_TTL_HOURS)
-        if cached:
-            _details_data = {k: v for k, v in cached.items() if k != "_cached_at"}
-
-        if _venues_data is None:
+        venue_ids = await run_in_threadpool(storage.list_venue_ids_needing_details, city_id, float(DETAILS_TTL))
+        if not venue_ids:
             return
 
-        venue_ids = [v["address_id"] for v in _venues_data["venues"]]
         semaphore = asyncio.Semaphore(5)
+        processed = 0
 
         async def fetch_one(vid: str) -> None:
-            if vid in _details_data:
-                return
+            nonlocal processed
             async with semaphore:
                 try:
                     raw = await fetch_venue_detail(int(vid))
                     limits_text = raw.get("bookingLimitsText")
-                    _details_data[vid] = {
-                        "visit_limits": parse_visit_limits(limits_text),
-                        "bookingLimitsText": limits_text,
-                        "importantInfo": raw.get("importantInfo"),
-                        "phone": raw.get("phone"),
-                        "website": raw.get("website"),
-                        "description": raw.get("description"),
-                        "fetched_at": time.time(),
-                    }
+                    detail = VenueDetail(
+                        visit_limits=parse_visit_limits(limits_text),
+                        bookingLimitsText=limits_text,
+                        importantInfo=raw.get("importantInfo"),
+                        phone=raw.get("phone"),
+                        website=raw.get("website"),
+                        description=raw.get("description"),
+                        fetched_at=time.time(),
+                    )
+                    await run_in_threadpool(storage.upsert_venue_detail, vid, detail)
+                    processed += 1
+                    if processed % 50 == 0:
+                        _invalidate_venues_cache(city_id)
                 except Exception:
-                    pass  # skip failures, will retry on next enrichment cycle
+                    pass  # skip failures, retry next cycle
 
-        # Process in batches to periodically save progress
-        batch_size = 50
-        for i in range(0, len(venue_ids), batch_size):
-            batch = venue_ids[i : i + batch_size]
-            await asyncio.gather(*[fetch_one(vid) for vid in batch])
-            # Save progress to disk
-            write_cache(DETAILS_CACHE_FILE, dict(_details_data))
-
-        # Final merge into in-memory venues data
-        _merge_details_into_venues()
+        await asyncio.gather(*[fetch_one(vid) for vid in venue_ids])
+        _invalidate_venues_cache(city_id)
 
     finally:
         _enrichment_running = False
 
 
-def _merge_details_into_venues() -> None:
-    """Merge cached detail data into the in-memory venues list."""
-    if _venues_data is None:
-        return
-    for venue in _venues_data["venues"]:
-        detail = _details_data.get(venue["address_id"])
-        if detail:
-            venue["visit_limits"] = detail.get("visit_limits")
-            venue["bookingLimitsText"] = detail.get("bookingLimitsText")
-
-
 # ── Endpoints ──
 
 
-@app.get("/api/venues")
+@app.get("/api/venues", response_model=VenuesPayload)
 async def get_venues():
-    global _venues_data
+    city_id = BERLIN_CITY_ID
 
-    # Return from cache if fresh
-    if _venues_data and read_cache(VENUES_CACHE_FILE, VENUES_TTL_HOURS):
-        return _venues_data
+    # Fast path: in-memory response cache.
+    cached = _venues_response_cache.get(city_id)
+    if cached and (time.time() - cached[0]) < VENUES_TTL:
+        return cached[1]
 
-    # Fetch from USC API
-    raw_venues = await fetch_all_venue_pages()
+    # Slow-ish path: DB still fresh?
+    fetched_at = await run_in_threadpool(storage.get_venues_fetched_at, city_id)
+    if fetched_at is not None and (time.time() - fetched_at) < VENUES_TTL:
+        payload = await run_in_threadpool(storage.get_venues_payload, city_id)
+        if payload is not None:
+            payload.tier_config = TIER_CONFIG
+            _venues_response_cache[city_id] = (time.time(), payload)
+            return payload
 
-    # Transform
-    venues = [transform_venue(v, _details_data.get(str(v.get("id", "")))) for v in raw_venues]
-    # Filter out deleted/empty venues and venues with no tier access
-    venues = [v for v in venues if v["name"] and (v["tiers_private"] or v["tiers_corporate"])]
-    venues.sort(key=lambda v: v["name"])
+    # Cold path: fetch from USC, store, return.
+    raw_venues = await fetch_all_venue_pages(usc_city_id=city_id)
+    venues = [transform_venue(v) for v in raw_venues]
+    venues = [v for v in venues if v.name and (v.tiers_private or v.tiers_corporate)]
+    venues.sort(key=lambda v: v.name)
 
-    _venues_data = {
-        "fetched_at": time.time(),
-        "total_venues": len(venues),
-        "venues_with_coords": sum(1 for v in venues if v["has_coordinates"]),
-        "tier_config": TIER_CONFIG,
-        "venues": venues,
-    }
+    total = len(venues)
+    with_coords = sum(1 for v in venues if v.has_coordinates)
+    now = time.time()
+    await run_in_threadpool(storage.upsert_venues, city_id, venues, now, total, with_coords)
 
-    write_cache(VENUES_CACHE_FILE, _venues_data)
+    # Re-read via storage so the response shape matches (LEFT JOIN with any
+    # existing enrichment data that survived the refresh).
+    payload = await run_in_threadpool(storage.get_venues_payload, city_id)
+    assert payload is not None
+    payload.tier_config = TIER_CONFIG
+    _venues_response_cache[city_id] = (time.time(), payload)
 
-    # Kick off background enrichment
-    asyncio.create_task(enrich_venue_details())
-
-    return _venues_data
+    asyncio.create_task(enrich_venue_details(city_id))
+    return payload
 
 
-@app.get("/api/venues/{venue_id}")
+@app.get("/api/venues/{venue_id}", response_model=VenueDetail)
 async def get_venue_detail(venue_id: int):
     vid = str(venue_id)
+    cached = await run_in_threadpool(storage.get_venue_detail, vid)
+    if cached is not None:
+        return cached
 
-    # Check detail cache
-    if vid in _details_data:
-        return _details_data[vid]
-
-    # Fetch from API
-    raw = await fetch_venue_detail(venue_id)
+    try:
+        raw = await fetch_venue_detail(venue_id)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            raise HTTPException(status_code=404, detail=f"Venue {venue_id} not found") from e
+        raise
     limits_text = raw.get("bookingLimitsText")
-    detail = {
-        "visit_limits": parse_visit_limits(limits_text),
-        "bookingLimitsText": limits_text,
-        "importantInfo": raw.get("importantInfo"),
-        "phone": raw.get("phone"),
-        "website": raw.get("website"),
-        "description": raw.get("description"),
-        "fetched_at": time.time(),
-    }
-
-    # Cache
-    _details_data[vid] = detail
-    write_cache(DETAILS_CACHE_FILE, dict(_details_data))
-
+    detail = VenueDetail(
+        visit_limits=parse_visit_limits(limits_text),
+        bookingLimitsText=limits_text,
+        importantInfo=raw.get("importantInfo"),
+        phone=raw.get("phone"),
+        website=raw.get("website"),
+        description=raw.get("description"),
+        fetched_at=time.time(),
+    )
+    await run_in_threadpool(storage.upsert_venue_detail, vid, detail)
+    _invalidate_venues_cache(BERLIN_CITY_ID)
     return detail
 
 
 @app.get("/api/categories")
 async def get_categories():
-    cached = read_cache(CATEGORIES_CACHE_FILE, CATEGORIES_TTL_HOURS)
-    if cached:
+    cached = await run_in_threadpool(storage.get_categories, float(CATEGORIES_TTL))
+    if cached is not None:
         return cached
 
     async with httpx.AsyncClient(headers=USC_HEADERS, timeout=30) as client:
@@ -501,20 +569,15 @@ async def get_categories():
         resp.raise_for_status()
         data = resp.json()
 
-    write_cache(CATEGORIES_CACHE_FILE, data)
+    await run_in_threadpool(storage.set_categories, data, time.time())
     return data
 
 
-@app.get("/api/courses")
+@app.get("/api/courses", response_model=CoursesResponse)
 async def get_courses(start_date: str, days: int = 1):
-    """Get all courses across Berlin for a date or date range.
+    """Get all courses across the city for a date range.
 
-    Params:
-      start_date: start date, YYYY-MM-DD (query param name: `start_date`)
-      days: number of days starting from `start_date` (1-13, default 1)
-
-    Filtering by category/time/text is done client-side. Each day is cached
-    independently with a 2-day TTL so repeated/overlapping queries are cheap.
+    Each day is cached independently with a 2-day TTL so repeated queries are cheap.
     """
     try:
         start = date.fromisoformat(start_date)
@@ -526,31 +589,47 @@ async def get_courses(start_date: str, days: int = 1):
 
     days = max(1, min(days, 13))
     date_list = [(start + timedelta(days=i)).isoformat() for i in range(days)]
+    city_id = BERLIN_CITY_ID
 
-    semaphore = asyncio.Semaphore(5)
-    errors: list[dict] = []
-    async with httpx.AsyncClient(headers=USC_HEADERS, timeout=30) as client:
-        results = await asyncio.gather(
-            *[fetch_courses_for_date(d, client, semaphore) for d in date_list],
-            return_exceptions=True,
-        )
+    # Partition dates into fresh (served from DB) vs stale (need to refetch).
+    fetches = await run_in_threadpool(storage.get_course_fetches, city_id, date_list)
+    now = time.time()
+    fresh_dates = [d for d in date_list if d in fetches and (now - fetches[d]) < COURSES_TTL]
+    stale_dates = [d for d in date_list if d not in fresh_dates]
 
-    merged: list[dict] = []
-    for d, r in zip(date_list, results, strict=True):
-        if isinstance(r, Exception):
-            logger.warning("Failed to fetch courses for %s: %r", d, r)
-            errors.append({"date": d, "reason": str(r)})
-            continue
-        merged.extend(r)
-    merged.sort(key=lambda c: (c["date"], c["start_time"]))
+    merged: dict[str, list[Course]] = {}
+    if fresh_dates:
+        merged.update(await run_in_threadpool(storage.get_courses_for_dates, city_id, fresh_dates))
 
-    return {
-        "courses": merged,
-        "date_from": date_list[0],
-        "date_to": date_list[-1],
-        "total": len(merged),
-        "errors": errors,
-    }
+    errors: list[CourseFetchError] = []
+    if stale_dates:
+        semaphore = asyncio.Semaphore(5)
+        async with httpx.AsyncClient(headers=USC_HEADERS, timeout=30) as client:
+            results = await asyncio.gather(
+                *[fetch_courses_for_date(d, city_id, client, semaphore) for d in stale_dates],
+                return_exceptions=True,
+            )
+        for d, r in zip(stale_dates, results, strict=True):
+            if isinstance(r, Exception):
+                logger.warning("Failed to fetch courses for %s: %r", d, r)
+                errors.append(CourseFetchError(date=d, reason=str(r)))
+                merged[d] = []
+                continue
+            merged[d] = r
+            await run_in_threadpool(storage.upsert_courses_for_date, city_id, d, r, time.time())
+
+    flat: list[Course] = []
+    for d in date_list:
+        flat.extend(merged.get(d, []))
+    flat.sort(key=lambda c: (c.date, c.start_time))
+
+    return CoursesResponse(
+        courses=flat,
+        date_from=date_list[0],
+        date_to=date_list[-1],
+        total=len(flat),
+        errors=errors,
+    )
 
 
 @app.get("/api/health")

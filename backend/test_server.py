@@ -1,5 +1,8 @@
 """Outcome-based tests for server pure functions."""
 
+import time
+
+from models import VenueDetail, VisitLimits
 from server import (
     CORPORATE_TIER_ORDER,
     PRIVATE_TIER_ORDER,
@@ -27,12 +30,11 @@ def test_parse_visit_limits_no_match():
 def test_parse_visit_limits_single_tier():
     result = parse_visit_limits("S-Mitglieder können 4x pro Monat trainieren.")
     assert result is not None
-    assert result["corporate"]["S"] == 4
-    assert result["private"]["Essential"] == 4
-    # Other tiers should be None
-    assert result["corporate"]["M"] is None
-    assert result["corporate"]["L"] is None
-    assert result["corporate"]["XL"] is None
+    assert result.corporate["S"] == 4
+    assert result.private["Essential"] == 4
+    assert result.corporate["M"] is None
+    assert result.corporate["L"] is None
+    assert result.corporate["XL"] is None
 
 
 def test_parse_visit_limits_multiple_tiers():
@@ -44,26 +46,114 @@ def test_parse_visit_limits_multiple_tiers():
     )
     result = parse_visit_limits(text)
     assert result is not None
-    assert result["corporate"] == {"S": 4, "M": 8, "L": 12, "XL": 16}
-    assert result["private"] == {"Essential": 4, "Classic": 8, "Premium": 12, "Max": 16}
+    assert result.corporate == {"S": 4, "M": 8, "L": 12, "XL": 16}
+    assert result.private == {"Essential": 4, "Classic": 8, "Premium": 12, "Max": 16}
 
 
 def test_parse_visit_limits_mal_variant():
     result = parse_visit_limits("M-Mitglieder können 8 Mal pro Monat trainieren.")
     assert result is not None
-    assert result["corporate"]["M"] == 8
-    assert result["private"]["Classic"] == 8
+    assert result.corporate["M"] == 8
+    assert result.private["Classic"] == 8
+
+
+def test_parse_visit_limits_grouped_tier_prefix():
+    """USC frequently groups tiers like 'L- & XL-Mitglieder können 8 Mal pro Monat'."""
+    text = (
+        "M-Mitglieder können 4 Mal pro Monat CORE Training besuchen.\r\n\r\n"
+        "L- & XL-Mitglieder können 8 Mal pro Monat CORE Training besuchen."
+    )
+    result = parse_visit_limits(text)
+    assert result is not None
+    assert result.corporate["M"] == 4
+    assert result.corporate["L"] == 8
+    assert result.corporate["XL"] == 8
+    assert result.corporate["S"] is None
+    assert result.private["Premium"] == 8
+    assert result.private["Max"] == 8
+
+
+def test_parse_visit_limits_grouped_with_und():
+    result = parse_visit_limits("M, L und XL-Mitglieder können 8x pro Monat trainieren.")
+    assert result is not None
+    assert result.corporate["M"] == 8
+    assert result.corporate["L"] == 8
+    assert result.corporate["XL"] == 8
+    assert result.corporate["S"] is None
+
+
+def test_parse_visit_limits_im_monat_variant():
+    result = parse_visit_limits("S-Mitglieder können 4x im Monat trainieren.")
+    assert result is not None
+    assert result.corporate["S"] == 4
+
+
+def test_parse_visit_limits_per_day_converted_to_month():
+    """'1 Mal pro Tag' should be converted to 30 / month (30-day month assumption)."""
+    text = "M, L & XL-Mitglieder können diesen Standort 1 Mal pro Tag besuchen"
+    result = parse_visit_limits(text)
+    assert result is not None
+    assert result.corporate["M"] == 30
+    assert result.corporate["L"] == 30
+    assert result.corporate["XL"] == 30
+    assert result.corporate["S"] is None
+
+
+def test_parse_visit_limits_per_day_multi_visit():
+    result = parse_visit_limits("XL-Mitglieder können 2x pro Tag trainieren.")
+    assert result is not None
+    assert result.corporate["XL"] == 60
+
+
+def test_parse_visit_limits_duerfen_variant():
+    """USC also uses 'dürfen' instead of 'können' (e.g. Berliner Bäderbetriebe)."""
+    result = parse_visit_limits("M, L & XL-Mitglieder dürfen 1 x am Tag schwimmen gehen")
+    assert result is not None
+    assert result.corporate["M"] == 30
+    assert result.corporate["L"] == 30
+    assert result.corporate["XL"] == 30
+    assert result.corporate["S"] is None
+
+
+def test_parse_visit_limits_filler_between_count_and_preposition():
+    """Real text has noun fillers between the count and 'pro/im Monat'."""
+    result = parse_visit_limits(
+        "S-Mitglieder können im Rahmen ihres Kontingents von insgesamt 4 x Sport im Monat trainieren"
+    )
+    assert result is not None
+    assert result.corporate["S"] == 4
+
+
+def test_parse_visit_limits_hyphen_mal_form():
+    """'8-Mal pro Monat' (hyphenated) should parse the same as '8 Mal pro Monat'."""
+    result = parse_visit_limits("M-Mitglieder können diesen Standort insgesamt 8-Mal pro Monat besuchen")
+    assert result is not None
+    assert result.corporate["M"] == 8
+
+
+def test_parse_visit_limits_baederbetriebe_full_text():
+    """Both sentences in a real Berliner Bäderbetriebe text should parse together."""
+    text = (
+        "M, L & XL-Mitglieder\xa0dürfen\xa01 x am Tag\xa0bei den Berliner Bäderbetrieben schwimmen gehen\r\n\r\n"
+        "S-Mitglieder\xa0können im Rahmen ihres\xa0Kontingents von insgesamt\xa04 x Sport im Monat\xa0die Berliner Bäderbetriebe\xa0besuchen"
+    )
+    result = parse_visit_limits(text)
+    assert result is not None
+    assert result.corporate["S"] == 4
+    assert result.corporate["M"] == 30
+    assert result.corporate["L"] == 30
+    assert result.corporate["XL"] == 30
 
 
 def test_parse_visit_limits_unmentioned_tiers_are_none():
     result = parse_visit_limits("L-Mitglieder können 5x pro Monat trainieren.")
     assert result is not None
     for tier in CORPORATE_TIER_ORDER:
-        assert tier in result["corporate"]
+        assert tier in result.corporate
     for tier in PRIVATE_TIER_ORDER:
-        assert tier in result["private"]
-    assert result["corporate"]["L"] == 5
-    assert result["corporate"]["S"] is None
+        assert tier in result.private
+    assert result.corporate["L"] == 5
+    assert result.corporate["S"] is None
 
 
 # ── min_tier ──
@@ -116,16 +206,16 @@ def _make_raw(**overrides):
 
 def test_transform_venue_basic():
     result = transform_venue(_make_raw())
-    assert result["name"] == "Test Gym"
-    assert result["slug"] == "test-gym"
-    assert result["url"] == "https://urbansportsclub.com/en/venues/test-gym"
-    assert result["tiers_corporate"] == ["M"]
-    assert result["tiers_private"] == ["Classic"]
-    assert result["min_tier_corporate"] == "M"
-    assert result["min_tier_private"] == "Classic"
-    assert result["has_coordinates"] is True
-    assert result["district"] == "Mitte"
-    assert result["visit_limits"] is None
+    assert result.name == "Test Gym"
+    assert result.slug == "test-gym"
+    assert result.url == "https://urbansportsclub.com/en/venues/test-gym"
+    assert result.tiers_corporate == ["M"]
+    assert result.tiers_private == ["Classic"]
+    assert result.min_tier_corporate == "M"
+    assert result.min_tier_private == "Classic"
+    assert result.has_coordinates is True
+    assert result.district == "Mitte"
+    assert result.visit_limits is None
 
 
 def test_transform_venue_missing_coordinates():
@@ -142,20 +232,28 @@ def test_transform_venue_missing_coordinates():
             }
         )
     )
-    assert result["has_coordinates"] is False
+    assert result.has_coordinates is False
 
 
 def test_transform_venue_with_detail():
-    detail = {"visit_limits": {"corporate": {"M": 8}}, "bookingLimitsText": "some text"}
+    detail = VenueDetail(
+        visit_limits=VisitLimits(
+            private={"Essential": None, "Classic": 8, "Premium": None, "Max": None},
+            corporate={"S": None, "M": 8, "L": None, "XL": None},
+        ),
+        bookingLimitsText="some text",
+        fetched_at=time.time(),
+    )
     result = transform_venue(_make_raw(), detail=detail)
-    assert result["visit_limits"] == {"corporate": {"M": 8}}
-    assert result["bookingLimitsText"] == "some text"
+    assert result.visit_limits is not None
+    assert result.visit_limits.corporate["M"] == 8
+    assert result.bookingLimitsText == "some text"
 
 
 def test_transform_venue_without_detail():
     result = transform_venue(_make_raw(), detail=None)
-    assert result["visit_limits"] is None
-    assert result["bookingLimitsText"] is None
+    assert result.visit_limits is None
+    assert result.bookingLimitsText is None
 
 
 def test_transform_venue_activities():
@@ -166,12 +264,12 @@ def test_transform_venue_activities():
         ]
     )
     result = transform_venue(raw)
-    assert result["activities"] == ["Yoga", "Swimming"]
+    assert result.activities == ["Yoga", "Swimming"]
 
 
 def test_transform_venue_empty_slug():
     result = transform_venue(_make_raw(urlSlug=""))
-    assert result["url"] == ""
+    assert result.url == ""
 
 
 # ── transform_course ──
@@ -206,48 +304,48 @@ def _make_raw_course(**overrides):
 
 def test_transform_course_basic():
     result = transform_course(_make_raw_course())
-    assert result["id"] == 99051489
-    assert result["date"] == "2026-04-05"
-    assert result["title"] == "Kundalini with Paula"
-    assert result["start_time"] == "12:15"
-    assert result["end_time"] == "13:30"
-    assert result["venue_id"] == "4926"
-    assert result["venue_name"] == "Yellow Yoga - Studio Sonne"
-    assert result["lat"] == 52.48444
-    assert result["lng"] == 13.43498
-    assert result["district"] == "Neukölln"
-    assert result["category"] == "Yoga"
-    assert result["category_id"] == 6
-    assert result["teacher"] == "Paula"
-    assert result["free_spots"] == 32
-    assert result["max_spots"] == 40
-    assert result["is_online"] is False
-    assert result["is_plus"] is False
+    assert result.id == 99051489
+    assert result.date == "2026-04-05"
+    assert result.title == "Kundalini with Paula"
+    assert result.start_time == "12:15"
+    assert result.end_time == "13:30"
+    assert result.venue_id == "4926"
+    assert result.venue_name == "Yellow Yoga - Studio Sonne"
+    assert result.lat == 52.48444
+    assert result.lng == 13.43498
+    assert result.district == "Neukölln"
+    assert result.category == "Yoga"
+    assert result.category_id == 6
+    assert result.teacher == "Paula"
+    assert result.free_spots == 32
+    assert result.max_spots == 40
+    assert result.is_online is False
+    assert result.is_plus is False
 
 
 def test_transform_course_time_truncation():
     result = transform_course(_make_raw_course(startTime="09:00:00", endTime="10:00:00"))
-    assert result["start_time"] == "09:00"
-    assert result["end_time"] == "10:00"
+    assert result.start_time == "09:00"
+    assert result.end_time == "10:00"
 
 
 def test_transform_course_missing_optional_fields():
     raw = _make_raw_course(teacherName=None, freeSpots=None)
     result = transform_course(raw)
-    assert result["teacher"] == ""
-    assert result["free_spots"] is None
+    assert result.teacher == ""
+    assert result.free_spots is None
 
 
 def test_transform_course_missing_venue_location():
     raw = _make_raw_course(venue={"id": 1, "name": "Nowhere", "location": {}})
     result = transform_course(raw)
-    assert result["lat"] is None
-    assert result["lng"] is None
-    assert result["district"] == ""
+    assert result.lat is None
+    assert result.lng is None
+    assert result.district == ""
 
 
 def test_transform_course_plus_and_online_flags():
     raw = _make_raw_course(isOnline=1, isPlusCheckin=1)
     result = transform_course(raw)
-    assert result["is_online"] is True
-    assert result["is_plus"] is True
+    assert result.is_online is True
+    assert result.is_plus is True
