@@ -32,6 +32,10 @@ let coursesLoaded = false;
 let coursesLoadToken = 0;
 let courseMarkers = new Map();
 
+let courseStartDate = null; // ISO YYYY-MM-DD, selected range start
+let courseEndDate = null;   // ISO YYYY-MM-DD, selected range end
+const DATE_STRIP_DAYS = 14; // chips shown: today .. today+13
+
 // Current state
 function getMembershipType() {
   return document.querySelector('#membership-toggle input:checked').value;
@@ -160,30 +164,83 @@ function scheduleViewportUpdate() {
 // ── Courses view ──
 
 function initCoursesView() {
-  // Default date = today
-  const today = new Date().toISOString().slice(0, 10);
-  const startEl = document.getElementById("course-date-start");
-  const endEl = document.getElementById("course-date-end");
-  startEl.value = today;
-  endEl.value = today;
+  // Default selection = today.
+  courseStartDate = todayIso();
+  courseEndDate = courseStartDate;
+  renderDateStrip();
 
   // Bind view tabs
   document.querySelectorAll(".view-tab").forEach((btn) =>
     btn.addEventListener("click", () => switchView(btn.dataset.view))
   );
 
-  // Bind filters that require re-fetching
-  startEl.addEventListener("change", fetchCourses);
-  endEl.addEventListener("change", fetchCourses);
-
   // Bind client-side filter events
   document.getElementById("category-filter").addEventListener("change", applyCourseFilters);
   document.getElementById("course-spots-filter").addEventListener("change", applyCourseFilters);
   document.getElementById("course-plus-filter").addEventListener("change", applyCourseFilters);
   document.getElementById("course-search-filter").addEventListener("input", applyCourseFilters);
-  document.querySelectorAll("#time-toggle input").forEach((cb) =>
-    cb.addEventListener("change", applyCourseFilters)
-  );
+
+  initTimeSlider();
+}
+
+function todayIso() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+// Add `n` days to an ISO date string, returning a new ISO date string.
+// Mirrors the date math already used in fetchCourses.
+function addDaysIso(iso, n) {
+  const d = new Date(iso + "T00:00:00");
+  d.setDate(d.getDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
+function renderDateStrip() {
+  const strip = document.getElementById("date-strip");
+  const today = todayIso();
+  strip.innerHTML = "";
+  for (let i = 0; i < DATE_STRIP_DAYS; i++) {
+    const iso = addDaysIso(today, i);
+    const d = new Date(iso + "T00:00:00");
+    const dow = d.toLocaleDateString(undefined, { weekday: "short" });
+    const chip = document.createElement("div");
+    chip.className = "date-chip";
+    chip.dataset.date = iso;
+    chip.innerHTML =
+      `<span class="dow">${dow}</span><span class="num">${d.getDate()}</span>`;
+    chip.addEventListener("click", () => onDateChipClick(iso));
+    strip.appendChild(chip);
+  }
+  updateDateChipStates();
+}
+
+// Tap one chip = single day. Tap a second (while a single day is selected) =
+// range between them. Tap again (while a range is selected) = fresh single day.
+function onDateChipClick(iso) {
+  const isSingle = courseStartDate === courseEndDate;
+  if (isSingle && courseStartDate) {
+    const anchor = courseStartDate;
+    courseStartDate = iso < anchor ? iso : anchor;
+    courseEndDate = iso < anchor ? anchor : iso;
+  } else {
+    courseStartDate = iso;
+    courseEndDate = iso;
+  }
+  updateDateChipStates();
+  fetchCourses();
+}
+
+function updateDateChipStates() {
+  const today = todayIso();
+  document.querySelectorAll("#date-strip .date-chip").forEach((chip) => {
+    const iso = chip.dataset.date;
+    chip.classList.toggle("today", iso === today);
+    chip.classList.toggle("selected", iso === courseStartDate || iso === courseEndDate);
+    chip.classList.toggle(
+      "inrange",
+      iso > courseStartDate && iso < courseEndDate,
+    );
+  });
 }
 
 function switchView(view) {
@@ -214,15 +271,12 @@ function daysBetween(start, end) {
 }
 
 async function fetchCourses() {
-  const startDate = document.getElementById("course-date-start").value;
-  let endDate = document.getElementById("course-date-end").value;
+  const startDate = courseStartDate;
+  let endDate = courseEndDate;
   if (!startDate) return;
-  if (!endDate || endDate < startDate) {
-    endDate = startDate;
-    document.getElementById("course-date-end").value = startDate;
-  }
+  if (!endDate || endDate < startDate) endDate = startDate;
 
-  const days = Math.min(13, Math.max(1, daysBetween(startDate, endDate) + 1));
+  const days = Math.min(14, Math.max(1, daysBetween(startDate, endDate) + 1));
   const dateList = [];
   for (let i = 0; i < days; i++) {
     const d = new Date(startDate + "T00:00:00");
@@ -330,8 +384,8 @@ function applyCourseFilters() {
   const plusOnly = document.getElementById("course-plus-filter").checked;
   const search = document.getElementById("course-search-filter").value.toLowerCase();
   // Only show courses within the currently selected date range.
-  const startDate = document.getElementById("course-date-start").value;
-  const endDate = document.getElementById("course-date-end").value || startDate;
+  const startDate = courseStartDate;
+  const endDate = courseEndDate || courseStartDate;
 
   filteredCourses = allCourses.filter((c) => {
     if (c.date < startDate || c.date > endDate) return false;
@@ -948,3 +1002,5 @@ function esc(str) {
 }
 
 init();
+
+function initTimeSlider() { /* implemented in Task 4 */ }
