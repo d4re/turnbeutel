@@ -440,10 +440,107 @@ function buildCoursePopup(venueData) {
 
 // ── Filters ──
 
-function onMapViewportChange() {
-  saveLastView();
-  // Full behavior added in Task 9.
+function cityBounds(city) {
+  if (city.lat_min != null && city.lat_max != null) {
+    return {
+      south: city.lat_min,
+      north: city.lat_max,
+      west: city.lng_min,
+      east: city.lng_max,
+    };
+  }
+  if (city.centroid_lat == null || city.centroid_lng == null) return null;
+  return {
+    south: city.centroid_lat - CENTROID_BBOX_HALF_DEG,
+    north: city.centroid_lat + CENTROID_BBOX_HALF_DEG,
+    west: city.centroid_lng - CENTROID_BBOX_HALF_DEG,
+    east: city.centroid_lng + CENTROID_BBOX_HALF_DEG,
+  };
 }
+
+function boundsIntersect(viewport, city) {
+  if (!city) return false;
+  return !(
+    city.east < viewport.getWest() ||
+    city.west > viewport.getEast() ||
+    city.north < viewport.getSouth() ||
+    city.south > viewport.getNorth()
+  );
+}
+
+function citiesInViewport(viewport) {
+  const center = viewport.getCenter();
+  const matches = [];
+  for (const city of allCities) {
+    const cb = cityBounds(city);
+    if (!cb) continue;
+    if (boundsIntersect(viewport, cb)) {
+      const dx = (city.centroid_lat ?? 0) - center.lat;
+      const dy = (city.centroid_lng ?? 0) - center.lng;
+      matches.push({ id: city.id, distSq: dx * dx + dy * dy });
+    }
+  }
+  matches.sort((a, b) => a.distSq - b.distSq);
+  return matches.map((m) => m.id);
+}
+
+async function fetchVenuesForCities(cityIds) {
+  const query = cityIds.map((id) => `city_ids=${id}`).join("&");
+  const resp = await fetch(`${API_BASE}/api/venues?${query}`);
+  if (!resp.ok) throw new Error(`/api/venues ${resp.status}`);
+  return resp.json();
+}
+
+function mergeVenuesResponse(data) {
+  // Only set tier_config the first time — it's global.
+  if (data.tier_config && Object.keys(tierConfig).length === 0) {
+    tierConfig = data.tier_config;
+  }
+  for (const cityEntry of data.cities || []) {
+    loadedVenueCities.add(cityEntry.city_id);
+    for (const venue of cityEntry.venues || []) {
+      // Venue ids are unique per city; tag with city_id for dedupe.
+      venue.city_id = cityEntry.city_id;
+      allVenues.push(venue);
+    }
+  }
+  rebuildFilterOptions(allVenues);
+  updateSliderLabels();
+  updateSliderFill();
+  applyFilters();
+}
+
+async function onMapViewportChange() {
+  saveLastView();
+  const zoom = map.getZoom();
+
+  if (zoom < MIN_FETCH_ZOOM) {
+    markerCluster.clearLayers();
+    showCityPins();
+    return;
+  }
+  hideCityPins();
+
+  const visible = citiesInViewport(map.getBounds());
+  const needed = visible.filter((id) => !loadedVenueCities.has(id));
+
+  if (needed.length > 0) {
+    try {
+      const data = await fetchVenuesForCities(needed);
+      mergeVenuesResponse(data);
+    } catch (err) {
+      console.warn("Venue fetch failed", err);
+    }
+  } else if (currentView === "venues") {
+    applyFilters();
+  }
+
+  if (currentView === "courses") refreshCoursesForViewport();
+}
+
+function showCityPins() {}
+function hideCityPins() {}
+function refreshCoursesForViewport() {}
 
 function bindFilterEvents() {
   document.querySelectorAll("#membership-toggle input").forEach((r) =>
@@ -655,6 +752,7 @@ function renderList(venues) {
 }
 
 function renderMap(venues) {
+  if (currentView !== "venues") return;
   markerCluster.clearLayers();
   const colors = getTierColors();
   for (const venue of venues) {
