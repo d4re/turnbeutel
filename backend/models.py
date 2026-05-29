@@ -89,6 +89,7 @@ class Course(BaseModel):
 class CourseFetchError(BaseModel):
     date: str
     reason: str
+    city_id: int | None = None
 
 
 class CoursesResponse(BaseModel):
@@ -115,3 +116,48 @@ class City(BaseModel):
     lat_max: float | None = None
     lng_min: float | None = None
     lng_max: float | None = None
+
+
+class CitiesResponse(BaseModel):
+    """Response shape for GET /api/cities."""
+
+    cities: list[City]
+    default_city_id: int
+
+
+class CityVenuesEntry(BaseModel):
+    """One city's slice of a multi-city venues payload."""
+
+    city_id: int
+    city_name: str
+    fetched_at: float
+    total: int
+    with_coordinates: int
+    venues: list[Venue]
+
+
+class MultiCityVenuesPayload(BaseModel):
+    """Response shape for GET /api/venues (city-grouped)."""
+
+    cities: list[CityVenuesEntry]
+    tier_config: TierConfig
+
+
+class CityCoursesEntry(BaseModel):
+    """One city's slice of a multi-city courses payload."""
+
+    city_id: int
+    city_name: str
+    date_from: str
+    date_to: str
+    total: int
+    courses: list[Course]
+
+
+class MultiCityCoursesResponse(BaseModel):
+    """Response shape for GET /api/courses (city-grouped)."""
+
+    cities: list[CityCoursesEntry]
+    date_from: str
+    date_to: str
+    errors: list[CourseFetchError]
