@@ -365,20 +365,8 @@ function populateCategoryFilter(courses) {
   if (cats.includes(current)) sel.value = current;
 }
 
-function getSelectedTimeSlots() {
-  return [...document.querySelectorAll("#time-toggle input:checked")].map((cb) => cb.value);
-}
-
-function courseTimeSlot(startTime) {
-  const hour = parseInt(startTime.split(":")[0], 10);
-  if (isNaN(hour)) return null;
-  if (hour < 12) return "morning";
-  if (hour < 17) return "afternoon";
-  return "evening";
-}
-
 function applyCourseFilters() {
-  const timeSlots = getSelectedTimeSlots();
+  const { lower: timeLower, upper: timeUpper } = timeFilterBounds();
   const category = document.getElementById("category-filter").value;
   const spotsOnly = document.getElementById("course-spots-filter").checked;
   const plusOnly = document.getElementById("course-plus-filter").checked;
@@ -390,8 +378,8 @@ function applyCourseFilters() {
   filteredCourses = allCourses.filter((c) => {
     if (c.date < startDate || c.date > endDate) return false;
 
-    const slot = courseTimeSlot(c.start_time);
-    if (!slot || !timeSlots.includes(slot)) return false;
+    const startMin = startTimeToMinutes(c.start_time);
+    if (startMin === null || startMin < timeLower || startMin > timeUpper) return false;
     if (category && c.category !== category) return false;
     if (spotsOnly && !(c.free_spots && c.free_spots > 0)) return false;
     if (plusOnly && !c.is_plus) return false;
@@ -1003,4 +991,94 @@ function esc(str) {
 
 init();
 
-function initTimeSlider() { /* implemented in Task 4 */ }
+// Value domain for both range inputs: 0 = "Any" (no lower bound),
+// 33 = "24:00" (no upper bound), 1..32 = 08:00..23:30 in 30-min steps.
+const TIME_MIN_INDEX = 0;
+const TIME_MAX_INDEX = 33;
+
+function timeIndexToMinutes(i) {
+  // Concrete clock time for an inner index; callers handle the open extremes.
+  return 480 + (i - 1) * 30; // index 1 -> 08:00 (480), index 33 -> 24:00 (1440)
+}
+
+function formatTimeIndex(i) {
+  if (i <= TIME_MIN_INDEX) return "Any";
+  const mins = timeIndexToMinutes(i);
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+}
+
+function initTimeSlider() {
+  document.getElementById("time-slider-min").addEventListener("input", onTimeSliderChange);
+  document.getElementById("time-slider-max").addEventListener("input", onTimeSliderChange);
+  updateTimeSliderFill();
+  updateTimeSliderDescription();
+}
+
+function onTimeSliderChange() {
+  const minSlider = document.getElementById("time-slider-min");
+  const maxSlider = document.getElementById("time-slider-max");
+  const minVal = parseInt(minSlider.value);
+  const maxVal = parseInt(maxSlider.value);
+
+  // Prevent the handles from crossing (same idiom as the tier slider).
+  if (minVal > maxVal) {
+    if (this === minSlider) {
+      maxSlider.value = minVal;
+    } else {
+      minSlider.value = maxVal;
+    }
+  }
+
+  updateTimeSliderFill();
+  updateTimeSliderDescription();
+  applyCourseFilters();
+}
+
+function updateTimeSliderFill() {
+  const minVal = parseInt(document.getElementById("time-slider-min").value);
+  const maxVal = parseInt(document.getElementById("time-slider-max").value);
+  const fill = document.getElementById("time-slider-fill");
+  const pctMin = (minVal / TIME_MAX_INDEX) * 100;
+  const pctMax = (maxVal / TIME_MAX_INDEX) * 100;
+  fill.style.left = pctMin + "%";
+  fill.style.width = (pctMax - pctMin) + "%";
+}
+
+function updateTimeSliderDescription() {
+  const minVal = parseInt(document.getElementById("time-slider-min").value);
+  const maxVal = parseInt(document.getElementById("time-slider-max").value);
+  const descEl = document.getElementById("time-slider-description");
+  const openLow = minVal <= TIME_MIN_INDEX;
+  const openHigh = maxVal >= TIME_MAX_INDEX;
+  if (openLow && openHigh) {
+    descEl.textContent = "Showing courses at any time";
+  } else if (openLow) {
+    descEl.textContent = `Showing courses starting up to ${formatTimeIndex(maxVal)}`;
+  } else if (openHigh) {
+    descEl.textContent = `Showing courses starting from ${formatTimeIndex(minVal)}`;
+  } else {
+    descEl.textContent =
+      `Showing courses starting ${formatTimeIndex(minVal)} – ${formatTimeIndex(maxVal)}`;
+  }
+}
+
+// Returns {lower, upper} bounds in minutes-of-day; open extremes use ±Infinity.
+function timeFilterBounds() {
+  const minVal = parseInt(document.getElementById("time-slider-min").value);
+  const maxVal = parseInt(document.getElementById("time-slider-max").value);
+  return {
+    lower: minVal <= TIME_MIN_INDEX ? -Infinity : timeIndexToMinutes(minVal),
+    upper: maxVal >= TIME_MAX_INDEX ? Infinity : timeIndexToMinutes(maxVal),
+  };
+}
+
+// Parse an "HH:MM" (or "HH:MM:SS") start_time string to minutes-of-day.
+function startTimeToMinutes(startTime) {
+  if (!startTime || startTime.length < 5) return null;
+  const h = parseInt(startTime.slice(0, 2), 10);
+  const m = parseInt(startTime.slice(3, 5), 10);
+  if (isNaN(h) || isNaN(m)) return null;
+  return h * 60 + m;
+}
