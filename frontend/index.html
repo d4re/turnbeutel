@@ -91,21 +91,20 @@
 
                 <div class="filter-group">
                     <label class="filter-label">Time of Day</label>
-                    <div class="toggle-group time-toggle" id="time-toggle">
-                        <label class="toggle-option">
-                            <input type="checkbox" value="morning" checked>
-                            <span>Morning</span>
-                        </label>
-                        <label class="toggle-option">
-                            <input type="checkbox" value="afternoon" checked>
-                            <span>Afternoon</span>
-                        </label>
-                        <label class="toggle-option">
-                            <input type="checkbox" value="evening" checked>
-                            <span>Evening</span>
-                        </label>
+                    <div id="time-slider">
+                        <div class="slider-track-container">
+                            <div class="slider-track"></div>
+                            <div class="time-any-zone"></div>
+                            <div class="time-divider"></div>
+                            <div class="slider-fill" id="time-slider-fill"></div>
+                            <input type="range" id="time-slider-min" min="0" max="33" value="0" step="1">
+                            <input type="range" id="time-slider-max" min="0" max="33" value="33" step="1">
+                        </div>
+                        <div class="time-slider-ticks">
+                            <span>Any</span><span>8</span><span>12</span><span>16</span><span>20</span><span>24</span>
+                        </div>
+                        <div class="slider-description" id="time-slider-description"></div>
                     </div>
-                    <div class="slider-description">Morning &lt;12, Afternoon 12–17, Evening ≥17</div>
                 </div>
 
                 <div class="filter-group">

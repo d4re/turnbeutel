@@ -627,3 +627,38 @@ select:focus, input[type="text"]:focus {
 .legend-swatch.today { background: #fdf1dc; border: 1px solid #f0cd92; }
 .legend-swatch.selected { background: #1a1a2e; }
 .legend-swatch.inrange { background: #dbe8f7; border: 1px solid #a9cbf0; }
+
+/* Time-of-day slider extras (reuses .slider-track/.slider-fill/range thumb rules) */
+#time-slider { padding: 4px 0; }
+
+/* grey "Any" zone covering the leftmost step (index 0 -> 1 of 33) */
+.time-any-zone {
+    position: absolute;
+    top: 14px;
+    left: 0;
+    width: 3.03%; /* 1/33 of the track */
+    height: 4px;
+    background: #c9d3df;
+    border-radius: 2px 0 0 2px;
+    pointer-events: none;
+}
+.time-divider {
+    position: absolute;
+    top: 11px;
+    left: 3.03%;
+    width: 1px;
+    height: 10px;
+    background: #fff;
+    pointer-events: none;
+}
+
+.time-slider-ticks {
+    display: flex;
+    justify-content: space-between;
+    padding: 2px 4px 0;
+    margin: 0 8px;
+    font-size: 11px;
+    font-weight: 600;
+    color: #999;
+}
+.time-slider-ticks span:first-child { color: #7d8a9a; font-style: italic; }
