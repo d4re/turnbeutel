@@ -22,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 
 import storage
 from models import (
+    CitiesResponse,
     City,
     Course,
     CourseFetchError,
@@ -631,6 +632,12 @@ async def get_courses(start_date: str, days: int = 1):
         total=len(flat),
         errors=errors,
     )
+
+
+@app.get("/api/cities", response_model=CitiesResponse)
+async def get_cities():
+    """Return the cached cities index, seeded from USC on startup."""
+    return CitiesResponse(cities=list(_cities_index), default_city_id=DEFAULT_CITY_ID)
 
 
 @app.get("/api/health")

@@ -448,3 +448,16 @@ def test_seeded_client_boots_and_has_cities_index(seeded_client):
     # Lifespan ran; _cities_index should be populated from the seeded DB.
     assert len(server._cities_index) == 2
     assert {c.id for c in server._cities_index} == {1, 2}
+
+
+def test_get_cities_returns_seeded_list(seeded_client):
+    resp = seeded_client.get("/api/cities")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["default_city_id"] == 1
+    ids = {c["id"] for c in data["cities"]}
+    assert ids == {1, 2}
+    berlin = next(c for c in data["cities"] if c["id"] == 1)
+    assert berlin["name"] == "Berlin"
+    assert berlin["centroid_lat"] == 52.52
+    assert berlin["centroid_lng"] == 13.405
