@@ -1,8 +1,14 @@
 """Outcome-based tests for server pure functions."""
 
 import time
+from pathlib import Path
 
-from models import VenueDetail, VisitLimits
+import pytest
+from fastapi.testclient import TestClient
+
+import server
+import storage
+from models import City, Venue, VenueAddress, VenueDetail, VisitLimits
 from server import (
     CORPORATE_TIER_ORDER,
     PRIVATE_TIER_ORDER,
@@ -349,3 +355,96 @@ def test_transform_course_plus_and_online_flags():
     result = transform_course(raw)
     assert result.is_online is True
     assert result.is_plus is True
+
+
+# ── Server endpoint fixtures ───────────────────────────────────────────────
+
+
+@pytest.fixture
+def seeded_client(tmp_path: Path, monkeypatch):
+    """FastAPI TestClient with a temp SQLite DB pre-seeded with two cities.
+
+    - `fetch_all_cities` and `fetch_venue_detail` are monkeypatched to no-ops so
+      neither lifespan nor background enrichment hits USC.
+    - `fetch_all_venue_pages` and `fetch_courses_for_date` are left as stubs
+      that individual tests override (see `monkeypatch.setattr` calls inside
+      each test).
+    - The temp DB is seeded with cities 1 ("Berlin") and 2 ("Hamburg") so
+      `_cities_index` has content after lifespan runs `storage.list_cities()`.
+    - Module-level caches (`_venues_response_cache`, `_enrichment_cities`) are
+      cleared on setup so tests don't leak state into each other.
+    """
+    storage.close()
+    db_path = tmp_path / "test.db"
+    storage.init(db_path)
+    storage.upsert_cities(
+        [
+            City(
+                id=1,
+                name="Berlin",
+                country_code="DE",
+                centroid_lat=52.52,
+                centroid_lng=13.405,
+            ),
+            City(
+                id=2,
+                name="Hamburg",
+                country_code="DE",
+                centroid_lat=53.55,
+                centroid_lng=9.99,
+            ),
+        ],
+        fetched_at=time.time(),
+    )
+    storage.close()
+
+    monkeypatch.setattr(server, "DB_PATH", db_path)
+
+    # Reset module-level caches so state doesn't leak between tests.
+    server._venues_response_cache.clear()
+    server._enrichment_cities.clear()
+
+    async def _fake_cities():
+        return []
+
+    async def _fake_venue_detail(venue_id):
+        return {}
+
+    monkeypatch.setattr(server, "fetch_all_cities", _fake_cities)
+    monkeypatch.setattr(server, "fetch_venue_detail", _fake_venue_detail)
+
+    with TestClient(server.app) as client:
+        yield client
+
+    storage.close()
+
+
+def _make_venue(venue_id: str, name: str, lat: float, lng: float) -> Venue:
+    """Minimal Venue factory for endpoint tests."""
+    return Venue(
+        name=name,
+        slug=name.lower().replace(" ", "-"),
+        url=f"https://example.com/{venue_id}",
+        tiers_private=["Essential"],
+        tiers_corporate=["S"],
+        min_tier_private="Essential",
+        min_tier_corporate="S",
+        activities=["Yoga"],
+        district="",
+        street="",
+        is_plus=False,
+        address_id=venue_id,
+        lat=lat,
+        lng=lng,
+        address=VenueAddress(),
+        rating=None,
+        review_count=None,
+        is_online=False,
+        has_coordinates=True,
+    )
+
+
+def test_seeded_client_boots_and_has_cities_index(seeded_client):
+    # Lifespan ran; _cities_index should be populated from the seeded DB.
+    assert len(server._cities_index) == 2
+    assert {c.id for c in server._cities_index} == {1, 2}
