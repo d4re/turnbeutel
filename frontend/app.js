@@ -16,6 +16,10 @@ const MIN_FETCH_ZOOM = 9;
 const CENTROID_BBOX_HALF_DEG = 0.18; // ~20 km fallback until real bbox is known
 const VIEWPORT_DEBOUNCE_MS = 200;
 const LAST_VIEW_KEY = "usc.lastView";
+// Time-of-day slider value domain: 0 = "Any" (no lower bound),
+// 33 = "24:00" (no upper bound), 1..32 = 08:00..23:30 in 30-min steps.
+const TIME_MIN_INDEX = 0;
+const TIME_MAX_INDEX = 33;
 let cityPinLayer = null;
 let viewportDebounceTimer = null;
 
@@ -993,11 +997,6 @@ function esc(str) {
 }
 
 init();
-
-// Value domain for both range inputs: 0 = "Any" (no lower bound),
-// 33 = "24:00" (no upper bound), 1..32 = 08:00..23:30 in 30-min steps.
-const TIME_MIN_INDEX = 0;
-const TIME_MAX_INDEX = 33;
 
 function timeIndexToMinutes(i) {
   // Concrete clock time for an INNER index (1..32). Do not call with 0 or 33 —
