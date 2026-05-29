@@ -45,8 +45,9 @@ USC_HEADERS = {
     "Accept-Encoding": "gzip, deflate",
     "Accept-Language": "en-US;q=1.0",
 }
-BERLIN_CITY_ID = 1
+DEFAULT_CITY_ID = 1
 PAGE_SIZE = 100
+MAX_CONCURRENT_VENUE_FETCHES = 3
 
 CACHE_DIR = Path(__file__).parent / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
@@ -57,7 +58,7 @@ DETAILS_TTL = 7 * 24 * 3600
 CATEGORIES_TTL = 7 * 24 * 3600
 COURSES_TTL = 48 * 3600
 COURSES_STALE = 3 * 24 * 3600
-CITIES_TTL = 30 * 24 * 3600
+CITIES_TTL = 7 * 24 * 3600
 
 # ── Tier mappings ──
 
@@ -81,7 +82,8 @@ TIER_CONFIG = TierConfig(
 
 _cities_index: list[City] = []
 _venues_response_cache: dict[int, tuple[float, VenuesPayload]] = {}
-_enrichment_running = False
+_enrichment_cities: set[int] = set()
+_venue_fetch_semaphore = asyncio.Semaphore(MAX_CONCURRENT_VENUE_FETCHES)
 
 
 def _invalidate_venues_cache(city_id: int) -> None:
@@ -445,10 +447,9 @@ async def fetch_courses_for_date(
 
 async def enrich_venue_details(city_id: int) -> None:
     """Background task: fetch details for any venue in `city_id` missing or with stale enrichment."""
-    global _enrichment_running
-    if _enrichment_running:
+    if city_id in _enrichment_cities:
         return
-    _enrichment_running = True
+    _enrichment_cities.add(city_id)
 
     try:
         venue_ids = await run_in_threadpool(storage.list_venue_ids_needing_details, city_id, float(DETAILS_TTL))
@@ -484,7 +485,7 @@ async def enrich_venue_details(city_id: int) -> None:
         _invalidate_venues_cache(city_id)
 
     finally:
-        _enrichment_running = False
+        _enrichment_cities.discard(city_id)
 
 
 # ── Endpoints ──
@@ -492,7 +493,7 @@ async def enrich_venue_details(city_id: int) -> None:
 
 @app.get("/api/venues", response_model=VenuesPayload)
 async def get_venues():
-    city_id = BERLIN_CITY_ID
+    city_id = DEFAULT_CITY_ID
 
     # Fast path: in-memory response cache.
     cached = _venues_response_cache.get(city_id)
@@ -554,7 +555,7 @@ async def get_venue_detail(venue_id: int):
         fetched_at=time.time(),
     )
     await run_in_threadpool(storage.upsert_venue_detail, vid, detail)
-    _invalidate_venues_cache(BERLIN_CITY_ID)
+    _invalidate_venues_cache(DEFAULT_CITY_ID)
     return detail
 
 
@@ -589,7 +590,7 @@ async def get_courses(start_date: str, days: int = 1):
 
     days = max(1, min(days, 13))
     date_list = [(start + timedelta(days=i)).isoformat() for i in range(days)]
-    city_id = BERLIN_CITY_ID
+    city_id = DEFAULT_CITY_ID
 
     # Partition dates into fresh (served from DB) vs stale (need to refetch).
     fetches = await run_in_threadpool(storage.get_course_fetches, city_id, date_list)
