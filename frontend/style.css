@@ -544,3 +544,86 @@ select:focus, input[type="text"]:focus {
     font-size: 11px;
     color: #888;
 }
+
+/* Date strip (Courses view) */
+.date-strip {
+    display: flex;
+    gap: 6px;
+    overflow-x: auto;
+    padding-bottom: 4px;
+    /* fade the right edge to hint at more dates */
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent);
+    mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent);
+}
+
+.date-chip {
+    flex: 0 0 40px;
+    box-sizing: border-box;
+    text-align: center;
+    padding: 7px 0;
+    border: 1px solid #ccc;
+    border-radius: 8px;
+    background: #fff;
+    cursor: pointer;
+    transition: background 0.12s, border-color 0.12s;
+}
+
+.date-chip .dow {
+    display: block;
+    font-size: 10px;
+    line-height: 1.4;
+    color: #999;
+    text-transform: uppercase;
+}
+
+.date-chip .num {
+    display: block;
+    font-size: 14px;
+    line-height: 1.2;
+    font-weight: 600;
+    color: #1a1a2e;
+}
+
+.date-chip.today {
+    background: #fdf1dc;
+    border-color: #f0cd92;
+}
+.date-chip.today .dow { color: #d98e04; }
+
+.date-chip.inrange {
+    background: #dbe8f7;
+    border-color: #a9cbf0;
+}
+.date-chip.inrange .num { color: #2471a3; }
+
+.date-chip.selected {
+    background: #1a1a2e;
+    border-color: #1a1a2e;
+}
+.date-chip.selected .num,
+.date-chip.selected .dow { color: #fff; }
+
+/* today + selected: navy fill keeps an amber ring so "today" stays flagged */
+.date-chip.selected.today {
+    box-shadow: 0 0 0 2px #d98e04;
+}
+
+.date-legend {
+    display: flex;
+    gap: 14px;
+    margin-top: 10px;
+    font-size: 11px;
+    color: #777;
+}
+.legend-item { white-space: nowrap; }
+.legend-swatch {
+    display: inline-block;
+    width: 11px;
+    height: 11px;
+    border-radius: 3px;
+    vertical-align: -1px;
+    margin-right: 4px;
+}
+.legend-swatch.today { background: #fdf1dc; border: 1px solid #f0cd92; }
+.legend-swatch.selected { background: #1a1a2e; }
+.legend-swatch.inrange { background: #dbe8f7; border: 1px solid #a9cbf0; }
