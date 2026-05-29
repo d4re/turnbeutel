@@ -329,11 +329,11 @@ function applyCourseFilters() {
   const spotsOnly = document.getElementById("course-spots-filter").checked;
   const plusOnly = document.getElementById("course-plus-filter").checked;
   const search = document.getElementById("course-search-filter").value.toLowerCase();
+  // Only show courses within the currently selected date range.
+  const startDate = document.getElementById("course-date-start").value;
+  const endDate = document.getElementById("course-date-end").value || startDate;
 
   filteredCourses = allCourses.filter((c) => {
-    // Only show courses within the currently selected date range.
-    const startDate = document.getElementById("course-date-start").value;
-    const endDate = document.getElementById("course-date-end").value || startDate;
     if (c.date < startDate || c.date > endDate) return false;
 
     const slot = courseTimeSlot(c.start_time);
