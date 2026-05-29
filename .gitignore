@@ -6,3 +6,5 @@ __pycache__/
 backend/cache/
 backend/.venv/
 frontend/node_modules/
+
+.superpowers/
