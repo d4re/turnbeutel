@@ -560,3 +560,55 @@ def test_get_venues_second_call_is_cached(seeded_client, monkeypatch):
     # Exactly one upstream call — the second request is served from the
     # in-memory `_venues_response_cache`.
     assert calls == [1]
+
+
+def test_get_courses_requires_city_ids(seeded_client):
+    resp = seeded_client.get("/api/courses?start_date=2026-04-11")
+    assert resp.status_code == 400
+    assert "city_ids" in resp.json()["detail"].lower()
+
+
+def test_get_courses_multi_city_grouped(seeded_client, monkeypatch):
+    calls: list[tuple[str, int]] = []
+
+    async def fake_fetch(date_str, usc_city_id, client, semaphore):
+        calls.append((date_str, usc_city_id))
+        from models import Course
+
+        return [
+            Course(
+                id=1000 * usc_city_id,
+                date=date_str,
+                title=f"Class in city {usc_city_id}",
+                start_time="09:00",
+                end_time="10:00",
+                venue_id=f"v-{usc_city_id}",
+                venue_name=f"Venue {usc_city_id}",
+                lat=52.52 if usc_city_id == 1 else 53.55,
+                lng=13.4 if usc_city_id == 1 else 9.99,
+                district="",
+                category="Yoga",
+                category_id=1,
+                teacher="",
+                free_spots=5,
+                max_spots=10,
+                is_online=False,
+                is_plus=False,
+            )
+        ]
+
+    monkeypatch.setattr(server, "fetch_courses_for_date", fake_fetch)
+
+    resp = seeded_client.get("/api/courses?start_date=2026-04-11&days=1&city_ids=1&city_ids=2")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["date_from"] == "2026-04-11"
+    assert data["date_to"] == "2026-04-11"
+    assert len(data["cities"]) == 2
+    by_id = {c["city_id"]: c for c in data["cities"]}
+    assert by_id[1]["total"] == 1
+    assert by_id[2]["total"] == 1
+    assert by_id[1]["courses"][0]["title"] == "Class in city 1"
+    assert by_id[2]["courses"][0]["title"] == "Class in city 2"
+    # One fetch per (city, date).
+    assert sorted(calls) == [("2026-04-11", 1), ("2026-04-11", 2)]

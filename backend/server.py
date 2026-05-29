@@ -24,10 +24,11 @@ import storage
 from models import (
     CitiesResponse,
     City,
+    CityCoursesEntry,
     CityVenuesEntry,
     Course,
     CourseFetchError,
-    CoursesResponse,
+    MultiCityCoursesResponse,
     MultiCityVenuesPayload,
     TierConfig,
     Venue,
@@ -619,12 +620,19 @@ async def get_categories():
     return data
 
 
-@app.get("/api/courses", response_model=CoursesResponse)
-async def get_courses(start_date: str, days: int = 1):
-    """Get all courses across the city for a date range.
+@app.get("/api/courses", response_model=MultiCityCoursesResponse)
+async def get_courses(
+    start_date: str,
+    days: int = 1,
+    city_ids: list[int] | None = Query(None),
+):
+    """Get courses across one or more cities for a date range.
 
-    Each day is cached independently with a 2-day TTL so repeated queries are cheap.
+    Each (city_id, date) pair is cached independently with a 2-day TTL.
     """
+    if not city_ids:
+        raise HTTPException(status_code=400, detail="city_ids query parameter is required")
+
     try:
         start = date.fromisoformat(start_date)
     except ValueError as e:
@@ -635,45 +643,72 @@ async def get_courses(start_date: str, days: int = 1):
 
     days = max(1, min(days, 13))
     date_list = [(start + timedelta(days=i)).isoformat() for i in range(days)]
-    city_id = DEFAULT_CITY_ID
 
-    # Partition dates into fresh (served from DB) vs stale (need to refetch).
-    fetches = await run_in_threadpool(storage.get_course_fetches, city_id, date_list)
+    # Dedupe city_ids while preserving order, keep only known ones.
+    seen: set[int] = set()
+    ordered_cities: list[int] = []
+    for cid in city_ids:
+        if cid in seen:
+            continue
+        seen.add(cid)
+        if any(c.id == cid for c in _cities_index):
+            ordered_cities.append(cid)
+
     now = time.time()
-    fresh_dates = [d for d in date_list if d in fetches and (now - fetches[d]) < COURSES_TTL]
-    stale_dates = [d for d in date_list if d not in fresh_dates]
-
-    merged: dict[str, list[Course]] = {}
-    if fresh_dates:
-        merged.update(await run_in_threadpool(storage.get_courses_for_dates, city_id, fresh_dates))
-
+    entries: list[CityCoursesEntry] = []
     errors: list[CourseFetchError] = []
-    if stale_dates:
-        semaphore = asyncio.Semaphore(5)
+
+    # Partition per (city, date): fresh from DB vs stale -> needs fetch.
+    # All stale fetches share one Semaphore so fan-out stays bounded.
+    semaphore = asyncio.Semaphore(5)
+    per_city_merged: dict[int, dict[str, list[Course]]] = {cid: {} for cid in ordered_cities}
+    stale_work: list[tuple[int, str]] = []
+
+    for cid in ordered_cities:
+        fetches = await run_in_threadpool(storage.get_course_fetches, cid, date_list)
+        fresh_dates = [d for d in date_list if d in fetches and (now - fetches[d]) < COURSES_TTL]
+        stale_dates = [d for d in date_list if d not in fresh_dates]
+        if fresh_dates:
+            per_city_merged[cid].update(await run_in_threadpool(storage.get_courses_for_dates, cid, fresh_dates))
+        for d in stale_dates:
+            stale_work.append((cid, d))
+
+    if stale_work:
         async with httpx.AsyncClient(headers=USC_HEADERS, timeout=30) as client:
             results = await asyncio.gather(
-                *[fetch_courses_for_date(d, city_id, client, semaphore) for d in stale_dates],
+                *[fetch_courses_for_date(d, cid, client, semaphore) for (cid, d) in stale_work],
                 return_exceptions=True,
             )
-        for d, r in zip(stale_dates, results, strict=True):
+        for (cid, d), r in zip(stale_work, results, strict=True):
             if isinstance(r, Exception):
-                logger.warning("Failed to fetch courses for %s: %r", d, r)
-                errors.append(CourseFetchError(date=d, reason=str(r)))
-                merged[d] = []
+                logger.warning("Failed to fetch courses for city=%s %s: %r", cid, d, r)
+                errors.append(CourseFetchError(date=d, reason=str(r), city_id=cid))
+                per_city_merged[cid][d] = []
                 continue
-            merged[d] = r
-            await run_in_threadpool(storage.upsert_courses_for_date, city_id, d, r, time.time())
+            per_city_merged[cid][d] = r
+            await run_in_threadpool(storage.upsert_courses_for_date, cid, d, r, time.time())
 
-    flat: list[Course] = []
-    for d in date_list:
-        flat.extend(merged.get(d, []))
-    flat.sort(key=lambda c: (c.date, c.start_time))
+    for cid in ordered_cities:
+        city = next(c for c in _cities_index if c.id == cid)
+        flat: list[Course] = []
+        for d in date_list:
+            flat.extend(per_city_merged[cid].get(d, []))
+        flat.sort(key=lambda c: (c.date, c.start_time))
+        entries.append(
+            CityCoursesEntry(
+                city_id=cid,
+                city_name=city.name,
+                date_from=date_list[0],
+                date_to=date_list[-1],
+                total=len(flat),
+                courses=flat,
+            )
+        )
 
-    return CoursesResponse(
-        courses=flat,
+    return MultiCityCoursesResponse(
+        cities=entries,
         date_from=date_list[0],
         date_to=date_list[-1],
-        total=len(flat),
         errors=errors,
     )
 
