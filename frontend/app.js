@@ -217,6 +217,8 @@ function renderDateStrip() {
 // Tap one chip = single day. Tap a second (while a single day is selected) =
 // range between them. Tap again (while a range is selected) = fresh single day.
 function onDateChipClick(iso) {
+  const prevStart = courseStartDate;
+  const prevEnd = courseEndDate;
   const isSingle = courseStartDate === courseEndDate;
   if (isSingle && courseStartDate) {
     const anchor = courseStartDate;
@@ -226,6 +228,7 @@ function onDateChipClick(iso) {
     courseStartDate = iso;
     courseEndDate = iso;
   }
+  if (courseStartDate === prevStart && courseEndDate === prevEnd) return;
   updateDateChipStates();
   fetchCourses();
 }
@@ -997,7 +1000,8 @@ const TIME_MIN_INDEX = 0;
 const TIME_MAX_INDEX = 33;
 
 function timeIndexToMinutes(i) {
-  // Concrete clock time for an inner index; callers handle the open extremes.
+  // Concrete clock time for an INNER index (1..32). Do not call with 0 or 33 —
+  // those are the open-ended "Any" / "24:00" sentinels handled by the callers.
   return 480 + (i - 1) * 30; // index 1 -> 08:00 (480), index 33 -> 24:00 (1440)
 }
 
@@ -1058,6 +1062,8 @@ function updateTimeSliderDescription() {
     descEl.textContent = `Showing courses starting up to ${formatTimeIndex(maxVal)}`;
   } else if (openHigh) {
     descEl.textContent = `Showing courses starting from ${formatTimeIndex(minVal)}`;
+  } else if (minVal === maxVal) {
+    descEl.textContent = `Showing courses starting at ${formatTimeIndex(minVal)}`;
   } else {
     descEl.textContent =
       `Showing courses starting ${formatTimeIndex(minVal)} – ${formatTimeIndex(maxVal)}`;
