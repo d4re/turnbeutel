@@ -601,7 +601,7 @@ async def get_venue_detail(venue_id: int):
         fetched_at=time.time(),
     )
     await run_in_threadpool(storage.upsert_venue_detail, vid, detail)
-    _invalidate_venues_cache(DEFAULT_CITY_ID)
+    _venues_response_cache.clear()
     return detail
 
 
