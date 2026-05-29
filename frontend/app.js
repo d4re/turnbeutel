@@ -538,8 +538,34 @@ async function onMapViewportChange() {
   if (currentView === "courses") refreshCoursesForViewport();
 }
 
-function showCityPins() {}
-function hideCityPins() {}
+function showCityPins() {
+  if (!cityPinLayer) return;
+  cityPinLayer.clearLayers();
+  for (const city of allCities) {
+    if (city.centroid_lat == null || city.centroid_lng == null) continue;
+    const marker = L.circleMarker([city.centroid_lat, city.centroid_lng], {
+      radius: 6,
+      fillColor: "#4a90d9",
+      color: "#fff",
+      weight: 1.5,
+      opacity: 1,
+      fillOpacity: 0.9,
+    });
+    marker.bindTooltip(city.name, { permanent: false, direction: "top" });
+    marker.on("click", () => {
+      map.flyTo([city.centroid_lat, city.centroid_lng], MIN_FETCH_ZOOM);
+    });
+    cityPinLayer.addLayer(marker);
+  }
+  if (!map.hasLayer(cityPinLayer)) map.addLayer(cityPinLayer);
+}
+
+function hideCityPins() {
+  if (cityPinLayer && map.hasLayer(cityPinLayer)) {
+    map.removeLayer(cityPinLayer);
+  }
+}
+
 function refreshCoursesForViewport() {}
 
 function bindFilterEvents() {
