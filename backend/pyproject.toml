@@ -24,6 +24,10 @@ line-length = 120
 select = ["E", "W", "F", "I", "UP", "B", "SIM"]
 ignore = ["E501"]
 
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's parameter markers are designed to be called in argument defaults.
+extend-immutable-calls = ["fastapi.Query", "fastapi.Depends", "fastapi.Path", "fastapi.Body"]
+
 [tool.pytest.ini_options]
 testpaths = ["."]
 pythonpath = ["."]

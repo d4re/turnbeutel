@@ -15,7 +15,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -24,9 +24,11 @@ import storage
 from models import (
     CitiesResponse,
     City,
+    CityVenuesEntry,
     Course,
     CourseFetchError,
     CoursesResponse,
+    MultiCityVenuesPayload,
     TierConfig,
     Venue,
     VenueAddress,
@@ -492,44 +494,86 @@ async def enrich_venue_details(city_id: int) -> None:
 # ── Endpoints ──
 
 
-@app.get("/api/venues", response_model=VenuesPayload)
-async def get_venues():
-    city_id = DEFAULT_CITY_ID
+async def _load_venues_for_city(city_id: int) -> CityVenuesEntry | None:
+    """Resolve one city's venues, honoring memory and DB caches.
 
-    # Fast path: in-memory response cache.
-    cached = _venues_response_cache.get(city_id)
-    if cached and (time.time() - cached[0]) < VENUES_TTL:
-        return cached[1]
+    Returns None if the city is not in `_cities_index` (unknown id).
+    """
+    city = next((c for c in _cities_index if c.id == city_id), None)
+    if city is None:
+        return None
 
-    # Slow-ish path: DB still fresh?
-    fetched_at = await run_in_threadpool(storage.get_venues_fetched_at, city_id)
-    if fetched_at is not None and (time.time() - fetched_at) < VENUES_TTL:
-        payload = await run_in_threadpool(storage.get_venues_payload, city_id)
-        if payload is not None:
-            payload.tier_config = TIER_CONFIG
-            _venues_response_cache[city_id] = (time.time(), payload)
-            return payload
-
-    # Cold path: fetch from USC, store, return.
-    raw_venues = await fetch_all_venue_pages(usc_city_id=city_id)
-    venues = [transform_venue(v) for v in raw_venues]
-    venues = [v for v in venues if v.name and (v.tiers_private or v.tiers_corporate)]
-    venues.sort(key=lambda v: v.name)
-
-    total = len(venues)
-    with_coords = sum(1 for v in venues if v.has_coordinates)
     now = time.time()
-    await run_in_threadpool(storage.upsert_venues, city_id, venues, now, total, with_coords)
 
-    # Re-read via storage so the response shape matches (LEFT JOIN with any
-    # existing enrichment data that survived the refresh).
-    payload = await run_in_threadpool(storage.get_venues_payload, city_id)
-    assert payload is not None
-    payload.tier_config = TIER_CONFIG
-    _venues_response_cache[city_id] = (time.time(), payload)
+    cached = _venues_response_cache.get(city_id)
+    if cached and (now - cached[0]) < VENUES_TTL:
+        payload = cached[1]
+    else:
+        fetched_at = await run_in_threadpool(storage.get_venues_fetched_at, city_id)
+        if fetched_at is not None and (now - fetched_at) < VENUES_TTL:
+            payload = await run_in_threadpool(storage.get_venues_payload, city_id)
+            if payload is not None:
+                payload.tier_config = TIER_CONFIG
+                _venues_response_cache[city_id] = (now, payload)
+        else:
+            payload = None
 
-    asyncio.create_task(enrich_venue_details(city_id))
-    return payload
+        if payload is None:
+            # Bound concurrent live USC pulls globally. The cache reads above are
+            # unthrottled; only the cold fetch acquires the semaphore.
+            async with _venue_fetch_semaphore:
+                # Re-check the cache: another request may have fetched this same
+                # city while we were queued on the semaphore.
+                cached = _venues_response_cache.get(city_id)
+                if cached and (time.time() - cached[0]) < VENUES_TTL:
+                    payload = cached[1]
+                else:
+                    raw_venues = await fetch_all_venue_pages(usc_city_id=city_id)
+                    venues = [transform_venue(v) for v in raw_venues]
+                    venues = [v for v in venues if v.name and (v.tiers_private or v.tiers_corporate)]
+                    venues.sort(key=lambda v: v.name)
+
+                    total = len(venues)
+                    with_coords = sum(1 for v in venues if v.has_coordinates)
+                    now = time.time()
+                    await run_in_threadpool(storage.upsert_venues, city_id, venues, now, total, with_coords)
+
+                    payload = await run_in_threadpool(storage.get_venues_payload, city_id)
+                    assert payload is not None
+                    payload.tier_config = TIER_CONFIG
+                    _venues_response_cache[city_id] = (now, payload)
+                    asyncio.create_task(enrich_venue_details(city_id))
+
+    return CityVenuesEntry(
+        city_id=city_id,
+        city_name=city.name,
+        fetched_at=payload.fetched_at,
+        total=payload.total_venues,
+        with_coordinates=payload.venues_with_coords,
+        venues=payload.venues,
+    )
+
+
+@app.get("/api/venues", response_model=MultiCityVenuesPayload)
+async def get_venues(city_ids: list[int] | None = Query(None)):
+    if not city_ids:
+        raise HTTPException(status_code=400, detail="city_ids query parameter is required")
+
+    # Dedupe while preserving order.
+    seen: set[int] = set()
+    ordered: list[int] = []
+    for cid in city_ids:
+        if cid not in seen:
+            seen.add(cid)
+            ordered.append(cid)
+
+    # Resolve cities concurrently: cached cities return instantly, while live
+    # USC pulls are bounded by `_venue_fetch_semaphore`. gather preserves the
+    # input order, so `entries` stays in `ordered` order.
+    results = await asyncio.gather(*[_load_venues_for_city(cid) for cid in ordered])
+    entries = [e for e in results if e is not None]
+
+    return MultiCityVenuesPayload(cities=entries, tier_config=TIER_CONFIG)
 
 
 @app.get("/api/venues/{venue_id}", response_model=VenueDetail)

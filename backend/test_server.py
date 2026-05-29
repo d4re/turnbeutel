@@ -410,8 +410,14 @@ def seeded_client(tmp_path: Path, monkeypatch):
     async def _fake_venue_detail(venue_id):
         return {}
 
+    async def _fake_enrich(city_id):
+        # No-op: the fire-and-forget enrichment task would otherwise outlive the
+        # SQLite connection and touch it after fixture teardown (segfault).
+        return None
+
     monkeypatch.setattr(server, "fetch_all_cities", _fake_cities)
     monkeypatch.setattr(server, "fetch_venue_detail", _fake_venue_detail)
+    monkeypatch.setattr(server, "enrich_venue_details", _fake_enrich)
 
     with TestClient(server.app) as client:
         yield client
@@ -461,3 +467,96 @@ def test_get_cities_returns_seeded_list(seeded_client):
     assert berlin["name"] == "Berlin"
     assert berlin["centroid_lat"] == 52.52
     assert berlin["centroid_lng"] == 13.405
+
+
+def test_get_venues_requires_city_ids(seeded_client):
+    resp = seeded_client.get("/api/venues")
+    assert resp.status_code == 400
+    assert "city_ids" in resp.json()["detail"].lower()
+
+
+def test_get_venues_multi_city_grouped(seeded_client, monkeypatch):
+    calls: list[int] = []
+
+    async def fake_fetch(usc_city_id: int):
+        calls.append(usc_city_id)
+        if usc_city_id == 1:
+            return [
+                {
+                    "name": "Berlin Studio",
+                    "urlSlug": "berlin-studio",
+                    "planTypes": ["S"],
+                    "planTypesB2B": ["S"],
+                    "categories": [],
+                    "ratings": {},
+                    "id": "b1",
+                    "location": {"latitude": 52.52, "longitude": 13.4},
+                    "isOnline": 0,
+                    "isPlusCheckin": 0,
+                }
+            ]
+        return [
+            {
+                "name": "Hamburg Studio",
+                "urlSlug": "hamburg-studio",
+                "planTypes": ["S"],
+                "planTypesB2B": ["S"],
+                "categories": [],
+                "ratings": {},
+                "id": "h1",
+                "location": {"latitude": 53.55, "longitude": 9.99},
+                "isOnline": 0,
+                "isPlusCheckin": 0,
+            }
+        ]
+
+    monkeypatch.setattr(server, "fetch_all_venue_pages", fake_fetch)
+
+    resp = seeded_client.get("/api/venues?city_ids=1&city_ids=2")
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert "tier_config" in data
+    assert len(data["cities"]) == 2
+    by_id = {c["city_id"]: c for c in data["cities"]}
+    assert by_id[1]["city_name"] == "Berlin"
+    assert by_id[2]["city_name"] == "Hamburg"
+    assert by_id[1]["total"] == 1
+    assert by_id[2]["total"] == 1
+    assert by_id[1]["venues"][0]["name"] == "Berlin Studio"
+    assert by_id[2]["venues"][0]["name"] == "Hamburg Studio"
+    # Each city fetched exactly once.
+    assert sorted(calls) == [1, 2]
+
+
+def test_get_venues_second_call_is_cached(seeded_client, monkeypatch):
+    calls: list[int] = []
+
+    async def fake_fetch(usc_city_id: int):
+        calls.append(usc_city_id)
+        return [
+            {
+                "name": "Studio A",
+                "urlSlug": "studio-a",
+                "planTypes": ["S"],
+                "planTypesB2B": ["S"],
+                "categories": [],
+                "ratings": {},
+                "id": "a1",
+                "location": {"latitude": 52.52, "longitude": 13.4},
+                "isOnline": 0,
+                "isPlusCheckin": 0,
+            }
+        ]
+
+    monkeypatch.setattr(server, "fetch_all_venue_pages", fake_fetch)
+
+    first = seeded_client.get("/api/venues?city_ids=1")
+    assert first.status_code == 200
+
+    second = seeded_client.get("/api/venues?city_ids=1")
+    assert second.status_code == 200
+
+    # Exactly one upstream call — the second request is served from the
+    # in-memory `_venues_response_cache`.
+    assert calls == [1]
