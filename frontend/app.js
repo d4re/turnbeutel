@@ -7,6 +7,18 @@ const API_BASE = "";
 let tierConfig = {};
 let map, markerCluster, allVenues, filteredVenues;
 
+// Multi-city state
+let allCities = [];
+let defaultCityId = 1;
+const loadedVenueCities = new Set();
+const loadedCourseCities = new Map(); // city_id -> Set<date-string>
+const MIN_FETCH_ZOOM = 9;
+const CENTROID_BBOX_HALF_DEG = 0.18; // ~20 km fallback until real bbox is known
+const VIEWPORT_DEBOUNCE_MS = 200;
+const LAST_VIEW_KEY = "usc.lastView";
+let cityPinLayer = null;
+let viewportDebounceTimer = null;
+
 // Per-venue UI state, kept off the venue objects so the data layer stays pure.
 const venueMarkers = new WeakMap();        // venue -> Leaflet marker
 const venueDetailFetched = new Set();      // address_id whose detail has been fetched
@@ -55,13 +67,62 @@ function getTierIndex(tierName) {
   return getTierOrder().indexOf(tierName);
 }
 
+function loadLastView() {
+  try {
+    const raw = localStorage.getItem(LAST_VIEW_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (
+      typeof parsed.lat === "number" &&
+      typeof parsed.lng === "number" &&
+      typeof parsed.zoom === "number"
+    ) {
+      return parsed;
+    }
+  } catch {
+    /* ignore malformed stored view */
+  }
+  return null;
+}
+
+function saveLastView() {
+  const c = map.getCenter();
+  localStorage.setItem(
+    LAST_VIEW_KEY,
+    JSON.stringify({ lat: c.lat, lng: c.lng, zoom: map.getZoom() }),
+  );
+}
+
 // ── Init ──
 
 async function init() {
   document.getElementById("venue-list").innerHTML =
-    '<div class="loading">Loading venue data...</div>';
+    '<div class="loading">Loading city index...</div>';
 
-  map = L.map("map").setView([52.52, 13.405], 11);
+  try {
+    const citiesResp = await fetch(`${API_BASE}/api/cities`);
+    if (!citiesResp.ok) throw new Error(`/api/cities ${citiesResp.status}`);
+    const citiesData = await citiesResp.json();
+    allCities = citiesData.cities || [];
+    defaultCityId = citiesData.default_city_id ?? 1;
+    tierConfig = {}; // filled on first /api/venues response
+  } catch (err) {
+    document.getElementById("venue-list").innerHTML =
+      `<div class="loading">Error loading cities: ${esc(err.message)}</div>`;
+    return;
+  }
+
+  const lastView = loadLastView();
+  const defaultCity = allCities.find((c) => c.id === defaultCityId);
+  const fallbackCenter =
+    defaultCity && defaultCity.centroid_lat != null
+      ? [defaultCity.centroid_lat, defaultCity.centroid_lng]
+      : [52.52, 13.405];
+
+  map = L.map("map").setView(
+    lastView ? [lastView.lat, lastView.lng] : fallbackCenter,
+    lastView ? lastView.zoom : 11,
+  );
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
     attribution: "&copy; OpenStreetMap contributors",
     maxZoom: 19,
@@ -74,30 +135,26 @@ async function init() {
   });
   map.addLayer(markerCluster);
 
-  try {
-    let resp;
-    try {
-      resp = await fetch(`${API_BASE}/api/venues`);
-      if (!resp.ok) throw new Error(`API ${resp.status}`);
-    } catch {
-      // Fallback to static JSON if backend is unavailable
-      resp = await fetch("../data/venues_final.json");
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    }
-    const data = await resp.json();
-    allVenues = data.venues;
-    tierConfig = data.tier_config;
-    populateFilters(allVenues);
-    updateSliderLabels();
-    updateSliderFill();
-    applyFilters();
-  } catch (err) {
-    document.getElementById("venue-list").innerHTML =
-      `<div class="loading">Error loading data: ${err.message}<br>Start the backend server or check the static data file.</div>`;
-  }
+  cityPinLayer = L.layerGroup();
+
+  allVenues = [];
+  bindFilterEvents();
+  rebuildFilterOptions(allVenues);
+  updateSliderLabels();
+  updateSliderFill();
+
+  map.on("moveend zoomend", scheduleViewportUpdate);
+
+  // Fire the handler once synchronously for the initial view.
+  onMapViewportChange();
 
   // Courses view is independent from the venues fetch — always wire it up.
   initCoursesView();
+}
+
+function scheduleViewportUpdate() {
+  if (viewportDebounceTimer) clearTimeout(viewportDebounceTimer);
+  viewportDebounceTimer = setTimeout(onMapViewportChange, VIEWPORT_DEBOUNCE_MS);
 }
 
 // ── Courses view ──
@@ -383,9 +440,41 @@ function buildCoursePopup(venueData) {
 
 // ── Filters ──
 
-function populateFilters(venues) {
-  const districts = [...new Set(venues.map((v) => v.district).filter(Boolean))].sort();
+function onMapViewportChange() {
+  saveLastView();
+  // Full behavior added in Task 9.
+}
+
+function bindFilterEvents() {
+  document.querySelectorAll("#membership-toggle input").forEach((r) =>
+    r.addEventListener("change", () => {
+      updateSliderLabels();
+      updateSliderFill();
+      applyFilters();
+    }),
+  );
+  document.getElementById("slider-min").addEventListener("input", onSliderChange);
+  document.getElementById("slider-max").addEventListener("input", onSliderChange);
+  document.getElementById("district-filter").addEventListener("change", applyFilters);
+  document.getElementById("activity-filter").addEventListener("change", applyFilters);
+  document.getElementById("plus-filter").addEventListener("change", applyFilters);
+  document.getElementById("coords-filter").addEventListener("change", applyFilters);
+  document.getElementById("search-filter").addEventListener("input", applyFilters);
+}
+
+function rebuildFilterOptions(venues) {
   const distSelect = document.getElementById("district-filter");
+  const actSelect = document.getElementById("activity-filter");
+  const prevDist = distSelect.value;
+  const prevAct = actSelect.value;
+
+  // Each <select> ships a single hardcoded "All ..." placeholder option in
+  // index.html; truncate back to just that, then repopulate from the full
+  // accumulated venue set.
+  distSelect.length = 1;
+  actSelect.length = 1;
+
+  const districts = [...new Set(venues.map((v) => v.district).filter(Boolean))].sort();
   for (const d of districts) {
     const opt = document.createElement("option");
     opt.value = d;
@@ -394,7 +483,6 @@ function populateFilters(venues) {
   }
 
   const activities = [...new Set(venues.flatMap((v) => v.activities).filter(Boolean))].sort();
-  const actSelect = document.getElementById("activity-filter");
   for (const a of activities) {
     const opt = document.createElement("option");
     opt.value = a;
@@ -402,21 +490,9 @@ function populateFilters(venues) {
     actSelect.appendChild(opt);
   }
 
-  // Bind events
-  document.querySelectorAll('#membership-toggle input').forEach((r) =>
-    r.addEventListener("change", () => {
-      updateSliderLabels();
-      updateSliderFill();
-      applyFilters();
-    })
-  );
-  document.getElementById("slider-min").addEventListener("input", onSliderChange);
-  document.getElementById("slider-max").addEventListener("input", onSliderChange);
-  distSelect.addEventListener("change", applyFilters);
-  actSelect.addEventListener("change", applyFilters);
-  document.getElementById("plus-filter").addEventListener("change", applyFilters);
-  document.getElementById("coords-filter").addEventListener("change", applyFilters);
-  document.getElementById("search-filter").addEventListener("input", applyFilters);
+  // Preserve the user's current selection if it still exists post-rebuild.
+  if (districts.includes(prevDist)) distSelect.value = prevDist;
+  if (activities.includes(prevAct)) actSelect.value = prevAct;
 }
 
 // ── Slider ──

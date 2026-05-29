@@ -12,6 +12,8 @@ export default [
         fetch: "readonly",
         console: "readonly",
         setTimeout: "readonly",
+        clearTimeout: "readonly",
+        localStorage: "readonly",
         L: "readonly",
       },
     },
