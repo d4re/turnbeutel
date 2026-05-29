@@ -223,25 +223,67 @@ async function fetchCourses() {
   }
 
   const days = Math.min(13, Math.max(1, daysBetween(startDate, endDate) + 1));
+  const dateList = [];
+  for (let i = 0; i < days; i++) {
+    const d = new Date(startDate + "T00:00:00");
+    d.setDate(d.getDate() + i);
+    dateList.push(d.toISOString().slice(0, 10));
+  }
+
+  const zoom = map.getZoom();
+  const visible = zoom >= MIN_FETCH_ZOOM ? citiesInViewport(map.getBounds()) : [];
 
   const listEl = document.getElementById("course-list");
-  listEl.innerHTML = '<div class="loading">Loading courses...</div>';
+  if (visible.length === 0) {
+    listEl.innerHTML =
+      '<div class="loading">Zoom in on a city to load courses.</div>';
+    allCourses = [];
+    applyCourseFilters();
+    return;
+  }
 
+  // Decide which (city_id, date) pairs still need fetching.
+  const missingByCity = new Map();
+  for (const cid of visible) {
+    const cached = loadedCourseCities.get(cid) ?? new Set();
+    const missing = dateList.filter((d) => !cached.has(d));
+    if (missing.length > 0) missingByCity.set(cid, missing);
+  }
+
+  listEl.innerHTML = '<div class="loading">Loading courses...</div>';
   const token = ++coursesLoadToken;
+
   try {
-    const resp = await fetch(
-      `${API_BASE}/api/courses?start_date=${startDate}&days=${days}`
-    );
-    const data = await resp.json().catch(() => ({}));
-    if (token !== coursesLoadToken) return; // stale response
-    if (!resp.ok) {
-      throw new Error(data.detail || data.error || `API ${resp.status}`);
+    // One /api/courses call per city, covering that city's missing dates.
+    // `missing` may be non-contiguous (e.g. the user shifted the date range
+    // after a partial load), so request the whole [first..last] span — the
+    // backend's per-(city,date) cache makes re-covering the middle cheap — and
+    // filter the response to the dates we actually lacked so already-loaded
+    // courses are never double-added.
+    for (const [cid, missing] of missingByCity.entries()) {
+      const spanStart = missing[0];
+      const spanEnd = missing[missing.length - 1];
+      const spanDays = daysBetween(spanStart, spanEnd) + 1;
+      const missingSet = new Set(missing);
+      const resp = await fetch(
+        `${API_BASE}/api/courses?start_date=${spanStart}&days=${spanDays}&city_ids=${cid}`,
+      );
+      const data = await resp.json().catch(() => ({}));
+      if (token !== coursesLoadToken) return;
+      if (!resp.ok) throw new Error(data.detail || `API ${resp.status}`);
+      const cached = loadedCourseCities.get(cid) ?? new Set();
+      for (const d of missing) cached.add(d);
+      loadedCourseCities.set(cid, cached);
+      // `data.cities` is always length 1 (we queried a single city).
+      for (const entry of data.cities || []) {
+        for (const c of entry.courses || []) {
+          if (!missingSet.has(c.date)) continue; // already loaded — skip
+          c.city_id = entry.city_id;
+          allCourses.push(c);
+        }
+      }
     }
-    allCourses = data.courses || [];
     coursesLoaded = true;
-    if (data.errors && data.errors.length > 0) {
-      console.warn("Some days failed to load:", data.errors);
-    }
     populateCategoryFilter(allCourses);
     applyCourseFilters();
   } catch (err) {
@@ -289,6 +331,11 @@ function applyCourseFilters() {
   const search = document.getElementById("course-search-filter").value.toLowerCase();
 
   filteredCourses = allCourses.filter((c) => {
+    // Only show courses within the currently selected date range.
+    const startDate = document.getElementById("course-date-start").value;
+    const endDate = document.getElementById("course-date-end").value || startDate;
+    if (c.date < startDate || c.date > endDate) return false;
+
     const slot = courseTimeSlot(c.start_time);
     if (!slot || !timeSlots.includes(slot)) return false;
     if (category && c.category !== category) return false;
@@ -566,7 +613,9 @@ function hideCityPins() {
   }
 }
 
-function refreshCoursesForViewport() {}
+function refreshCoursesForViewport() {
+  if (currentView === "courses") fetchCourses();
+}
 
 function bindFilterEvents() {
   document.querySelectorAll("#membership-toggle input").forEach((r) =>
