@@ -62,7 +62,7 @@ A **legend** ("Today / Selected / In range") sits directly under the strip and i
 
 - The strip writes to the same `startDate` / `endDate` values that `fetchCourses()` and `applyCourseFilters()` already read, so the existing per-(city,date) cache and viewport-scoped fetch continue to work unchanged.
 - The current `change` listeners on the two date inputs are replaced by chip-tap handlers that update the selected range and call `fetchCourses()`.
-- **Span reconciliation:** the strip shows 14 chips (today + 13). `fetchCourses()` currently clamps the fetched span to 13 days (`Math.min(13, …)`), so a full today→day-14 selection (14 days) would drop the last day. Implementation must align the two — bump the clamp to 14, or cap the strip's max selectable span to 13. Decide during planning; the design intent is that any range the strip lets you select is fully fetched.
+- **Span reconciliation:** the strip shows 14 chips (today + 13). `fetchCourses()` currently clamps the fetched span to 13 days (`Math.min(13, …)`), so a full today→day-14 selection (14 days) would drop the last day. **Decision: bump the clamp to 14** so any range the strip allows is fully fetched.
 
 ---
 
