@@ -14,6 +14,7 @@ from server import (
     PRIVATE_TIER_ORDER,
     min_tier,
     parse_visit_limits,
+    transform_city,
     transform_course,
     transform_venue,
 )
@@ -612,3 +613,25 @@ def test_get_courses_multi_city_grouped(seeded_client, monkeypatch):
     assert by_id[2]["courses"][0]["title"] == "Class in city 2"
     # One fetch per (city, date).
     assert sorted(calls) == [("2026-04-11", 1), ("2026-04-11", 2)]
+
+
+# ── transform_city ──
+
+
+def test_transform_city_uses_default_name():
+    """USC's /cities rows carry the name under `defaultName`, not `name`."""
+    raw = {
+        "id": 93,
+        "defaultName": "Aachen",
+        "lat": 50.780658,
+        "lon": 6.083815,
+        "countryCode": "DE",
+        "venueAddressCount": 122,
+    }
+    c = transform_city(raw)
+    assert c.id == 93
+    assert c.name == "Aachen"
+    assert c.country_code == "DE"
+    assert c.centroid_lat == 50.780658
+    assert c.centroid_lng == 6.083815
+    assert c.venue_address_count == 122

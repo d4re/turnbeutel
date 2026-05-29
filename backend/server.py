@@ -295,7 +295,9 @@ def transform_city(raw: dict) -> City:
     """Transform a USC /cities row into a City model."""
     return City(
         id=int(raw.get("id")),
-        name=raw.get("name", ""),
+        # USC's /cities rows carry the name under `defaultName`; fall back to
+        # `name` for the venue-embedded city shape ({"id", "name"}).
+        name=raw.get("defaultName") or raw.get("name") or "",
         country_code=(raw.get("country") or {}).get("code")
         if isinstance(raw.get("country"), dict)
         else raw.get("countryCode"),
