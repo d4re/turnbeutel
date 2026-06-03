@@ -13,6 +13,10 @@ let defaultCityId = 1;
 const loadedVenueCities = new Set();
 const loadedCourseCities = new Map(); // city_id -> Set<date-string>
 const MIN_FETCH_ZOOM = 9;
+// Cap on concurrent API requests so a wide viewport doesn't hammer the slow
+// upstream USC API all at once. Per-city fetches fan out up to this many at a
+// time (see mapWithConcurrency).
+const MAX_CONCURRENT_REQUESTS = 5;
 const CENTROID_BBOX_HALF_DEG = 0.18; // ~20 km fallback until real bbox is known
 const VIEWPORT_DEBOUNCE_MS = 200;
 const LAST_VIEW_KEY = "usc.lastView";
@@ -323,6 +327,27 @@ function daysBetween(start, end) {
   return Math.round((e - s) / 86400000);
 }
 
+// Run `task` over every item with at most `limit` calls in flight at once.
+// Resolves once all items are processed; rejects on the first task error like
+// Promise.all (workers already in flight still run to completion, and their
+// promises stay handled so a later failure won't surface as an unhandled
+// rejection). Order of execution is not guaranteed, so `task` must not depend
+// on it.
+async function mapWithConcurrency(items, limit, task) {
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const i = next++;
+      await task(items[i], i);
+    }
+  }
+  const workers = [];
+  for (let i = 0; i < Math.min(limit, items.length); i++) {
+    workers.push(worker());
+  }
+  await Promise.all(workers);
+}
+
 async function fetchCourses() {
   const startDate = courseStartDate;
   let endDate = courseEndDate;
@@ -361,35 +386,45 @@ async function fetchCourses() {
   const token = ++coursesLoadToken;
 
   try {
-    // One /api/courses call per city, covering that city's missing dates.
+    // One /api/courses call per city, covering that city's missing dates, fanned
+    // out concurrently (capped at MAX_CONCURRENT_REQUESTS) so total load time is
+    // the slowest city rather than the sum of all of them.
+    //
     // `missing` may be non-contiguous (e.g. the user shifted the date range
     // after a partial load), so request the whole [first..last] span — the
     // backend's per-(city,date) cache makes re-covering the middle cheap — and
     // filter the response to the dates we actually lacked so already-loaded
     // courses are never double-added.
-    for (const [cid, missing] of missingByCity.entries()) {
-      const spanStart = missing[0];
-      const spanEnd = missing[missing.length - 1];
-      const spanDays = daysBetween(spanStart, spanEnd) + 1;
-      const missingSet = new Set(missing);
-      const resp = await fetch(
-        `${API_BASE}/api/courses?start_date=${spanStart}&days=${spanDays}&city_ids=${cid}`,
-      );
-      const data = await resp.json().catch(() => ({}));
-      if (token !== coursesLoadToken) return;
-      if (!resp.ok) throw new Error(data.detail || `API ${resp.status}`);
-      const cached = loadedCourseCities.get(cid) ?? new Set();
-      for (const d of missing) cached.add(d);
-      loadedCourseCities.set(cid, cached);
-      // `data.cities` is always length 1 (we queried a single city).
-      for (const entry of data.cities || []) {
-        for (const c of entry.courses || []) {
-          if (!missingSet.has(c.date)) continue; // already loaded — skip
-          c.city_id = entry.city_id;
-          allCourses.push(c);
+    await mapWithConcurrency(
+      [...missingByCity.entries()],
+      MAX_CONCURRENT_REQUESTS,
+      async ([cid, missing]) => {
+        const spanStart = missing[0];
+        const spanEnd = missing[missing.length - 1];
+        const spanDays = daysBetween(spanStart, spanEnd) + 1;
+        const missingSet = new Set(missing);
+        const resp = await fetch(
+          `${API_BASE}/api/courses?start_date=${spanStart}&days=${spanDays}&city_ids=${cid}`,
+        );
+        const data = await resp.json().catch(() => ({}));
+        // A newer load superseded this one — drop the response without touching
+        // shared state so out-of-order responses can't pollute the cache.
+        if (token !== coursesLoadToken) return;
+        if (!resp.ok) throw new Error(data.detail || `API ${resp.status}`);
+        const cached = loadedCourseCities.get(cid) ?? new Set();
+        for (const d of missing) cached.add(d);
+        loadedCourseCities.set(cid, cached);
+        // `data.cities` is always length 1 (we queried a single city).
+        for (const entry of data.cities || []) {
+          for (const c of entry.courses || []) {
+            if (!missingSet.has(c.date)) continue; // already loaded — skip
+            c.city_id = entry.city_id;
+            allCourses.push(c);
+          }
         }
-      }
-    }
+      },
+    );
+    if (token !== coursesLoadToken) return;
     coursesLoaded = true;
     populateCategoryFilter(allCourses);
     applyCourseFilters();
