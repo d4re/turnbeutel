@@ -539,6 +539,8 @@ select:focus, input[type="text"]:focus {
     border-radius: 8px;
     background: #fff;
     cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
     transition: background 0.12s, border-color 0.12s;
 }
 

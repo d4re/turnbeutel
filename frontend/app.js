@@ -40,6 +40,13 @@ let courseStartDate = null; // ISO YYYY-MM-DD, selected range start
 let courseEndDate = null;   // ISO YYYY-MM-DD, selected range end
 const DATE_STRIP_DAYS = 14; // chips shown: today .. today+13
 
+// Date-strip drag selection: a plain tap picks one day; pressing and dragging
+// across chips picks a range. These track an in-progress drag.
+let dateDragAnchor = null;  // ISO of the chip the current drag started on
+let dateDragChanged = false; // did the selection change during this drag?
+let dateDragPrevStart = null; // selection to restore if the drag is cancelled
+let dateDragPrevEnd = null;
+
 // Current state
 function getMembershipType() {
   return document.querySelector('#membership-toggle input:checked').value;
@@ -173,6 +180,11 @@ function initCoursesView() {
   courseEndDate = courseStartDate;
   renderDateStrip();
 
+  // A date-strip drag can end (or be cancelled by a scroll) anywhere on the
+  // page, so the release listeners live on the document.
+  document.addEventListener("pointerup", endDateDrag);
+  document.addEventListener("pointercancel", cancelDateDrag);
+
   // Bind view tabs
   document.querySelectorAll(".view-tab").forEach((btn) =>
     btn.addEventListener("click", () => switchView(btn.dataset.view))
@@ -187,16 +199,24 @@ function initCoursesView() {
   initTimeSlider();
 }
 
+// Format a Date as a local YYYY-MM-DD. Unlike toISOString(), this does NOT
+// shift into UTC, so "today" stays today in timezones ahead of UTC.
+function localIso(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
 function todayIso() {
-  return new Date().toISOString().slice(0, 10);
+  return localIso(new Date());
 }
 
 // Add `n` days to an ISO date string, returning a new ISO date string.
-// Mirrors the date math already used in fetchCourses.
 function addDaysIso(iso, n) {
   const d = new Date(iso + "T00:00:00");
   d.setDate(d.getDate() + n);
-  return d.toISOString().slice(0, 10);
+  return localIso(d);
 }
 
 function renderDateStrip() {
@@ -212,29 +232,55 @@ function renderDateStrip() {
     chip.dataset.date = iso;
     chip.innerHTML =
       `<span class="dow">${dow}</span><span class="num">${d.getDate()}</span>`;
-    chip.addEventListener("click", () => onDateChipClick(iso));
+    chip.addEventListener("pointerdown", (e) => startDateDrag(e, iso));
+    chip.addEventListener("pointerenter", () => extendDateDrag(iso));
     strip.appendChild(chip);
   }
   updateDateChipStates();
 }
 
-// Tap one chip = single day. Tap a second (while a single day is selected) =
-// range between them. Tap again (while a range is selected) = fresh single day.
-function onDateChipClick(iso) {
-  const prevStart = courseStartDate;
-  const prevEnd = courseEndDate;
-  const isSingle = courseStartDate === courseEndDate;
-  if (isSingle && courseStartDate) {
-    const anchor = courseStartDate;
-    courseStartDate = iso < anchor ? iso : anchor;
-    courseEndDate = iso < anchor ? anchor : iso;
-  } else {
-    courseStartDate = iso;
-    courseEndDate = iso;
+// A plain tap selects a single day; pressing and dragging across chips selects
+// a range. Selection updates live during the drag and only triggers a fetch
+// once, on release.
+function startDateDrag(e, iso) {
+  if (e.button !== undefined && e.button !== 0) return; // primary button only
+  dateDragAnchor = iso;
+  dateDragChanged = false;
+  dateDragPrevStart = courseStartDate;
+  dateDragPrevEnd = courseEndDate;
+  setDateSelection(iso, iso);
+}
+
+function extendDateDrag(iso) {
+  if (dateDragAnchor === null) return;
+  const start = iso < dateDragAnchor ? iso : dateDragAnchor;
+  const end = iso < dateDragAnchor ? dateDragAnchor : iso;
+  setDateSelection(start, end);
+}
+
+function endDateDrag() {
+  if (dateDragAnchor === null) return;
+  dateDragAnchor = null;
+  if (dateDragChanged) fetchCourses();
+}
+
+// Abort an in-progress drag (e.g. a touch that became a scroll) and restore the
+// selection that was in effect before it started.
+function cancelDateDrag() {
+  if (dateDragAnchor === null) return;
+  dateDragAnchor = null;
+  if (dateDragChanged) {
+    setDateSelection(dateDragPrevStart, dateDragPrevEnd);
+    dateDragChanged = false;
   }
-  if (courseStartDate === prevStart && courseEndDate === prevEnd) return;
+}
+
+function setDateSelection(start, end) {
+  if (start === courseStartDate && end === courseEndDate) return;
+  courseStartDate = start;
+  courseEndDate = end;
+  dateDragChanged = true;
   updateDateChipStates();
-  fetchCourses();
 }
 
 function updateDateChipStates() {
@@ -288,7 +334,7 @@ async function fetchCourses() {
   for (let i = 0; i < days; i++) {
     const d = new Date(startDate + "T00:00:00");
     d.setDate(d.getDate() + i);
-    dateList.push(d.toISOString().slice(0, 10));
+    dateList.push(localIso(d));
   }
 
   const zoom = map.getZoom();
