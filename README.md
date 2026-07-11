@@ -29,6 +29,13 @@ Build and run as a container:
 docker compose up --build
 ```
 
+Or run the prebuilt image published by CI (defaults to the `main` tag; override with `IMAGE_TAG`):
+
+```bash
+docker compose -f docker-compose.prod.yml up -d
+IMAGE_TAG=v1.0.0 docker compose -f docker-compose.prod.yml up -d
+```
+
 The app is available at **http://localhost:8000**. Venue cache is persisted in a Docker volume across restarts.
 
 ### Manual start (without make)

@@ -1,0 +1,15 @@
+# Runs the prebuilt image published by CI instead of building locally.
+# Usage:
+#   docker compose -f docker-compose.prod.yml up -d
+#   IMAGE_TAG=v1.0.0 docker compose -f docker-compose.prod.yml up -d
+services:
+  app:
+    image: ghcr.io/d4re/turnbeutel:${IMAGE_TAG:-main}
+    ports:
+      - "8000:8000"
+    volumes:
+      - venue-cache:/app/backend/cache
+    restart: unless-stopped
+
+volumes:
+  venue-cache:
