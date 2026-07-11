@@ -102,6 +102,8 @@ All fetched data (cities, venues, venue details, courses, categories) is cached 
 
 When running via Docker, the cache is stored in a named volume (`venue-cache`) and persists across container rebuilds.
 
+The frontend additionally keeps an in-memory cache of loaded cities and dates with a soft 60-minute TTL: panning back to already-loaded data within the TTL makes no requests, while stale data is transparently re-fetched (and replaced) the next time the viewport or date selection touches it. A page reload always re-fetches.
+
 ## License
 
 [MIT](LICENSE)
