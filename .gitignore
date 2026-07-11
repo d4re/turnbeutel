@@ -2,7 +2,9 @@
 data/
 __pycache__/
 *.pyc
-.claude/
+# Ignore personal Claude Code state but share project skills with the team
+.claude/*
+!.claude/skills/
 .local/
 backend/cache/
 backend/.venv/
