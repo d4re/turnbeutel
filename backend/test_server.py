@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 import server
 import storage
-from models import City, Venue, VenueAddress, VenueDetail, VisitLimits
+from models import City, Course, Venue, VenueAddress, VenueDetail, VisitLimits
 from server import (
     CORPORATE_TIER_ORDER,
     PRIVATE_TIER_ORDER,
@@ -358,6 +358,145 @@ def test_transform_course_plus_and_online_flags():
     assert result.is_plus is True
 
 
+# ── fetch_all_venue_pages ───────────────────────────────────────────────────
+
+
+def _raw_venue_page(page: int, n: int) -> list[dict]:
+    return [
+        {
+            "name": f"Venue {page}-{i}",
+            "urlSlug": f"venue-{page}-{i}",
+            "planTypes": ["S"],
+            "planTypesB2B": ["S"],
+            "categories": [],
+            "ratings": {},
+            "id": page * 1000 + i,
+            "location": {"latitude": 52.5, "longitude": 13.4},
+            "isOnline": 0,
+            "isPlusCheckin": 0,
+        }
+        for i in range(n)
+    ]
+
+
+def _run_fetch_all_venue_pages(page_sizes: dict[int, int], expected_count=None, record=None):
+    """Drive fetch_all_venue_pages against a mock USC with the given page sizes."""
+    import asyncio
+
+    import httpx
+
+    state = {"in_flight": 0, "max_in_flight": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        if record is not None:
+            record.append(page)
+        state["in_flight"] += 1
+        state["max_in_flight"] = max(state["max_in_flight"], state["in_flight"])
+        await asyncio.sleep(0.01)
+        state["in_flight"] -= 1
+        return httpx.Response(200, json={"data": _raw_venue_page(page, page_sizes.get(page, 0))})
+
+    async def run():
+        transport = httpx.MockTransport(handler)
+        real_client = httpx.AsyncClient
+
+        def patched_client(**kwargs):
+            kwargs["transport"] = transport
+            return real_client(**kwargs)
+
+        import unittest.mock
+
+        with unittest.mock.patch.object(httpx, "AsyncClient", patched_client):
+            return await server.fetch_all_venue_pages(1, expected_count=expected_count)
+
+    venues = asyncio.run(run())
+    return venues, state["max_in_flight"]
+
+
+def test_fetch_all_venue_pages_known_count_fetches_exact_pages_in_one_round():
+    """With venueAddressCount known (230 -> 3 pages), all pages are requested
+    together and no speculative pages beyond the expected ones are fetched."""
+    record: list[int] = []
+    venues, max_in_flight = _run_fetch_all_venue_pages({1: 100, 2: 100, 3: 30}, expected_count=230, record=record)
+    assert len(venues) == 230
+    assert sorted(record) == [1, 2, 3]  # no wasted requests past page 3
+    assert max_in_flight == 3  # page 1 fetched together with 2 and 3
+
+
+def test_fetch_all_venue_pages_stale_count_still_fetches_everything():
+    """If the city grew past the cached venueAddressCount, discovery continues."""
+    venues, _ = _run_fetch_all_venue_pages({1: 100, 2: 20}, expected_count=100)
+    assert len(venues) == 120
+
+
+def test_fetch_all_venue_pages_no_count_falls_back_to_discovery():
+    venues, _ = _run_fetch_all_venue_pages({1: 100, 2: 50}, expected_count=None)
+    assert len(venues) == 150
+
+
+# ── fetch_courses_for_date ──────────────────────────────────────────────────
+
+
+def test_fetch_courses_for_date_fetches_pages_concurrently():
+    """A day with many pages must be fetched in parallel batches, not one page
+    at a time — serial pagination made big cities take ~14 round trips."""
+    import asyncio
+
+    import httpx
+
+    in_flight = 0
+    max_in_flight = 0
+    # 6 full pages + 1 short page = 650 courses.
+    page_sizes = {1: 100, 2: 100, 3: 100, 4: 100, 5: 100, 6: 100, 7: 50}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal in_flight, max_in_flight
+        page = int(request.url.params["page"])
+        in_flight += 1
+        max_in_flight = max(max_in_flight, in_flight)
+        await asyncio.sleep(0.01)
+        in_flight -= 1
+        n = page_sizes.get(page, 0)
+        classes = [_make_raw_course(id=(page * 1000 + i)) for i in range(n)]
+        return httpx.Response(200, json={"data": {"classes": classes}})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await server.fetch_courses_for_date("2026-04-05", 1, client, asyncio.Semaphore(5))
+
+    courses = asyncio.run(run())
+
+    assert len(courses) == 650
+    assert len({c.id for c in courses}) == 650
+    # With serial pagination max_in_flight is 1; batched fetching overlaps pages.
+    assert max_in_flight > 1
+
+
+def test_fetch_courses_for_date_single_short_page():
+    """A single short page must not trigger extra page requests beyond the first batch."""
+    import asyncio
+
+    import httpx
+
+    requested_pages: list[int] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        requested_pages.append(page)
+        classes = [_make_raw_course(id=i) for i in range(3)] if page == 1 else []
+        return httpx.Response(200, json={"data": {"classes": classes}})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await server.fetch_courses_for_date("2026-04-05", 1, client, asyncio.Semaphore(5))
+
+    courses = asyncio.run(run())
+    assert len(courses) == 3
+    # Speculative fetching may cover the first batch, but must stop there.
+    assert max(requested_pages) <= 5
+
+
 # ── Server endpoint fixtures ───────────────────────────────────────────────
 
 
@@ -404,6 +543,8 @@ def seeded_client(tmp_path: Path, monkeypatch):
     # Reset module-level caches so state doesn't leak between tests.
     server._venues_response_cache.clear()
     server._enrichment_cities.clear()
+    server._venue_refresh_cities.clear()
+    server._course_refresh_keys.clear()
 
     async def _fake_cities():
         return []
@@ -479,7 +620,7 @@ def test_get_venues_requires_city_ids(seeded_client):
 def test_get_venues_multi_city_grouped(seeded_client, monkeypatch):
     calls: list[int] = []
 
-    async def fake_fetch(usc_city_id: int):
+    async def fake_fetch(usc_city_id: int, expected_count=None):
         calls.append(usc_city_id)
         if usc_city_id == 1:
             return [
@@ -533,7 +674,7 @@ def test_get_venues_multi_city_grouped(seeded_client, monkeypatch):
 def test_get_venues_second_call_is_cached(seeded_client, monkeypatch):
     calls: list[int] = []
 
-    async def fake_fetch(usc_city_id: int):
+    async def fake_fetch(usc_city_id: int, expected_count=None):
         calls.append(usc_city_id)
         return [
             {
@@ -561,6 +702,130 @@ def test_get_venues_second_call_is_cached(seeded_client, monkeypatch):
     # Exactly one upstream call — the second request is served from the
     # in-memory `_venues_response_cache`.
     assert calls == [1]
+
+
+def test_large_responses_are_gzip_compressed(seeded_client, monkeypatch):
+    """Venue payloads run to megabytes; the server must honor Accept-Encoding: gzip."""
+
+    async def fake_fetch(usc_city_id: int, expected_count=None):
+        return [
+            {
+                "name": f"Studio {i}",
+                "urlSlug": f"studio-{i}",
+                "planTypes": ["S"],
+                "planTypesB2B": ["S"],
+                "categories": [],
+                "ratings": {},
+                "id": f"v{i}",
+                "location": {"latitude": 52.52, "longitude": 13.4},
+                "isOnline": 0,
+                "isPlusCheckin": 0,
+            }
+            for i in range(20)
+        ]
+
+    monkeypatch.setattr(server, "fetch_all_venue_pages", fake_fetch)
+
+    resp = seeded_client.get("/api/venues?city_ids=1", headers={"Accept-Encoding": "gzip"})
+    assert resp.status_code == 200
+    assert resp.headers.get("content-encoding") == "gzip"
+    # The body still decodes transparently.
+    assert len(resp.json()["cities"][0]["venues"]) == 20
+
+
+def _make_course(course_id: int, date: str, title: str) -> Course:
+    return Course(
+        id=course_id,
+        date=date,
+        title=title,
+        start_time="09:00",
+        end_time="10:00",
+        venue_id="v1",
+        venue_name="Venue",
+        lat=52.52,
+        lng=13.4,
+        district="",
+        category="Yoga",
+        category_id=1,
+        teacher="",
+        free_spots=5,
+        max_spots=10,
+        is_online=False,
+        is_plus=False,
+    )
+
+
+def _wait_until(predicate, timeout: float = 2.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
+def test_get_venues_stale_cache_served_immediately_then_refreshed(seeded_client, monkeypatch):
+    """An expired-but-present venue snapshot must be returned right away, with
+    the live refetch happening in the background — not blocking the request."""
+    stale_at = time.time() - server.VENUES_TTL - 3600
+    storage.upsert_venues(1, [_make_venue("v1", "Old Studio", 52.5, 13.4)], stale_at, 1, 1)
+
+    calls: list[int] = []
+
+    async def fake_fetch(usc_city_id: int, expected_count=None):
+        calls.append(usc_city_id)
+        return [
+            {
+                "name": "New Studio",
+                "urlSlug": "new-studio",
+                "planTypes": ["S"],
+                "planTypesB2B": ["S"],
+                "categories": [],
+                "ratings": {},
+                "id": "v2",
+                "location": {"latitude": 52.52, "longitude": 13.4},
+                "isOnline": 0,
+                "isPlusCheckin": 0,
+            }
+        ]
+
+    monkeypatch.setattr(server, "fetch_all_venue_pages", fake_fetch)
+
+    resp = seeded_client.get("/api/venues?city_ids=1")
+    assert resp.status_code == 200
+    venues = resp.json()["cities"][0]["venues"]
+    # The stale snapshot is served, not the live refetch.
+    assert [v["name"] for v in venues] == ["Old Studio"]
+
+    # The background refresh runs to completion and lands in storage.
+    assert _wait_until(lambda: calls == [1])
+    assert _wait_until(lambda: (storage.get_venues_fetched_at(1) or 0) > stale_at)
+    refreshed = storage.get_venues_payload(1)
+    assert [v.name for v in refreshed.venues] == ["New Studio"]
+
+
+def test_get_courses_stale_cache_served_immediately_then_refreshed(seeded_client, monkeypatch):
+    """Expired-but-present course days are served from cache with a background refresh."""
+    stale_at = time.time() - server.COURSES_TTL - 3600
+    storage.upsert_courses_for_date(1, "2026-04-11", [_make_course(1, "2026-04-11", "Old Class")], stale_at)
+
+    calls: list[tuple[str, int]] = []
+
+    async def fake_fetch(date_str, usc_city_id, client, semaphore):
+        calls.append((date_str, usc_city_id))
+        return [_make_course(2, date_str, "New Class")]
+
+    monkeypatch.setattr(server, "fetch_courses_for_date", fake_fetch)
+
+    resp = seeded_client.get("/api/courses?start_date=2026-04-11&days=1&city_ids=1")
+    assert resp.status_code == 200
+    titles = [c["title"] for c in resp.json()["cities"][0]["courses"]]
+    assert titles == ["Old Class"]
+
+    assert _wait_until(lambda: calls == [("2026-04-11", 1)])
+    assert _wait_until(lambda: (storage.get_course_fetches(1, ["2026-04-11"]).get("2026-04-11") or 0) > stale_at)
+    refreshed = storage.get_courses_for_dates(1, ["2026-04-11"])["2026-04-11"]
+    assert [c.title for c in refreshed] == ["New Class"]
 
 
 def test_get_courses_requires_city_ids(seeded_client):

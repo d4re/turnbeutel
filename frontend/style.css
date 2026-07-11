@@ -383,6 +383,24 @@ select:focus, input[type="text"]:focus {
     color: #999;
 }
 
+/* "Show N more" button at the end of a chunked list */
+.show-more {
+    display: block;
+    width: 100%;
+    padding: 12px 16px;
+    border: none;
+    border-bottom: 1px solid #eee;
+    background: #f7f7f7;
+    color: #4a90d9;
+    font: inherit;
+    cursor: pointer;
+    text-align: center;
+}
+
+.show-more:hover {
+    background: #efefef;
+}
+
 /* View tabs */
 .view-tabs {
     display: flex;

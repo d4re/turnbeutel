@@ -18,6 +18,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 
 import storage
@@ -56,6 +57,8 @@ VENUE_PAGE_BATCH = 5
 MAX_CONCURRENT_VENUE_FETCHES = 3
 # Must cover the frontend's date strip (today .. today+13 = 14 days).
 MAX_COURSE_DAYS = 14
+COURSE_PAGE_BATCH = 5
+MAX_COURSE_PAGES = 50
 
 CACHE_DIR = Path(__file__).parent / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
@@ -92,6 +95,9 @@ _cities_index: list[City] = []
 _venues_response_cache: dict[int, tuple[float, VenuesPayload]] = {}
 _enrichment_cities: set[int] = set()
 _venue_fetch_semaphore = asyncio.Semaphore(MAX_CONCURRENT_VENUE_FETCHES)
+# Guards against duplicate stale-while-revalidate refreshes.
+_venue_refresh_cities: set[int] = set()
+_course_refresh_keys: set[tuple[int, str]] = set()
 
 
 def _invalidate_venues_cache(city_id: int) -> None:
@@ -133,6 +139,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Turnbeutel API", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+# Venue/course payloads are large (Berlin: ~1.4 MB JSON, ~0.16 MB gzipped).
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
 # ── Visit limits parsing ──
@@ -326,12 +334,15 @@ async def fetch_all_cities() -> list[dict]:
     return data or []
 
 
-async def fetch_all_venue_pages(usc_city_id: int) -> list[dict]:
+async def fetch_all_venue_pages(usc_city_id: int, expected_count: int | None = None) -> list[dict]:
     """Fetch all venue pages from the USC API in bounded batches.
 
-    Pages are fetched VENUE_PAGE_BATCH at a time until a short page signals the
-    end (capped at MAX_VENUE_PAGES as a runaway guard). A failed page raises so
-    a venue list with a silent gap is never cached.
+    When `expected_count` (the city's venueAddressCount from /cities) is known,
+    exactly the expected pages are enqueued upfront — page 1 no longer costs a
+    lone discovery round trip. Discovery batches of VENUE_PAGE_BATCH still
+    follow if the city grew past the cached count (or when the count is
+    unknown), capped at MAX_VENUE_PAGES as a runaway guard. A failed page
+    raises so a venue list with a silent gap is never cached.
     """
     async with httpx.AsyncClient(headers=USC_HEADERS, timeout=30) as client:
 
@@ -343,11 +354,27 @@ async def fetch_all_venue_pages(usc_city_id: int) -> list[dict]:
             resp.raise_for_status()
             return resp.json().get("data", [])
 
-        all_venues = await fetch_page(1)
-        if len(all_venues) < PAGE_SIZE:
-            return all_venues
+        all_venues: list[dict] = []
 
-        page = 2
+        if expected_count and expected_count > 0:
+            expected_pages = min(-(-expected_count // PAGE_SIZE), MAX_VENUE_PAGES)
+            page = 1
+            while page <= expected_pages:
+                batch_end = min(page + VENUE_PAGE_BATCH, expected_pages + 1)
+                batch = await asyncio.gather(*[fetch_page(p) for p in range(page, batch_end)])
+                for data in batch:
+                    all_venues.extend(data)
+                    if len(data) < PAGE_SIZE:
+                        return all_venues
+                page = batch_end
+        else:
+            all_venues = await fetch_page(1)
+            if len(all_venues) < PAGE_SIZE:
+                return all_venues
+            page = 2
+
+        # Discovery: the expected count was stale (or unknown) — keep fetching
+        # batches until a short page appears.
         while page <= MAX_VENUE_PAGES:
             batch = await asyncio.gather(*[fetch_page(p) for p in range(page, page + VENUE_PAGE_BATCH)])
             for data in batch:
@@ -411,10 +438,15 @@ async def fetch_courses_for_date(
     client: httpx.AsyncClient,
     semaphore: asyncio.Semaphore,
 ) -> list[Course]:
-    """Fetch all courses for a single date from USC (no caching — the caller handles storage)."""
-    all_raw: list[dict] = []
-    page = 1
-    while True:
+    """Fetch all courses for a single date from USC (no caching — the caller handles storage).
+
+    Pages are fetched speculatively COURSE_PAGE_BATCH at a time until a short
+    page signals the end (capped at MAX_COURSE_PAGES). The shared semaphore
+    still bounds total concurrency toward USC, so overlapping batches never
+    exceed the global request limit.
+    """
+
+    async def fetch_page(page: int) -> list[dict]:
         async with semaphore:
             resp = await client.get(
                 f"{USC_API}/courses",
@@ -428,15 +460,21 @@ async def fetch_courses_for_date(
             )
         resp.raise_for_status()
         data = resp.json().get("data") or {}
-        classes = data.get("classes") or []
-        if not classes:
+        return data.get("classes") or []
+
+    all_raw: list[dict] = []
+    page = 1
+    while page <= MAX_COURSE_PAGES:
+        batch = await asyncio.gather(*[fetch_page(p) for p in range(page, page + COURSE_PAGE_BATCH)])
+        done = False
+        for classes in batch:
+            all_raw.extend(classes)
+            if len(classes) < PAGE_SIZE:
+                done = True
+                break
+        if done:
             break
-        all_raw.extend(classes)
-        if len(classes) < PAGE_SIZE:
-            break
-        page += 1
-        if page > 50:
-            break
+        page += COURSE_PAGE_BATCH
 
     # USC occasionally returns the same course_id twice in a single day's payload
     # (observed: byte-identical duplicates). Dedupe at the source so both the
@@ -511,8 +549,54 @@ def _fresh_cached_payload(city_id: int) -> VenuesPayload | None:
     return None
 
 
+async def _fetch_and_cache_venues(city: City) -> VenuesPayload:
+    """Live-fetch a city's venues from USC, persist them, and prime the caches."""
+    # Bound concurrent live USC pulls globally. Cache reads elsewhere are
+    # unthrottled; only live fetches acquire the semaphore.
+    async with _venue_fetch_semaphore:
+        # Re-check: another request may have fetched this same city while we
+        # were queued on the semaphore.
+        payload = _fresh_cached_payload(city.id)
+        if payload is not None:
+            return payload
+
+        raw_venues = await fetch_all_venue_pages(usc_city_id=city.id, expected_count=city.venue_address_count)
+        venues = [transform_venue(v) for v in raw_venues]
+        venues = [v for v in venues if v.name and (v.tiers_private or v.tiers_corporate)]
+        venues.sort(key=lambda v: v.name)
+
+        total = len(venues)
+        with_coords = sum(1 for v in venues if v.has_coordinates)
+        now = time.time()
+        await run_in_threadpool(storage.upsert_venues, city.id, venues, now, total, with_coords)
+
+        payload = await run_in_threadpool(storage.get_venues_payload, city.id)
+        assert payload is not None
+        payload.tier_config = TIER_CONFIG
+        _venues_response_cache[city.id] = (now, payload)
+        asyncio.create_task(enrich_venue_details(city.id))
+        return payload
+
+
+async def _refresh_venues_in_background(city: City) -> None:
+    """Stale-while-revalidate worker: refetch a city whose snapshot expired."""
+    if city.id in _venue_refresh_cities:
+        return
+    _venue_refresh_cities.add(city.id)
+    try:
+        await _fetch_and_cache_venues(city)
+    except Exception:
+        logger.warning("Background venue refresh failed for city=%s", city.id, exc_info=True)
+    finally:
+        _venue_refresh_cities.discard(city.id)
+
+
 async def _load_venues_for_city(city_id: int) -> CityVenuesEntry | None:
     """Resolve one city's venues, honoring memory and DB caches.
+
+    An expired-but-present DB snapshot is served immediately and refreshed in
+    the background (stale-while-revalidate); only a city with no snapshot at
+    all blocks on the live USC fetch.
 
     Returns None if the city is not in `_cities_index` (unknown id).
     """
@@ -524,35 +608,19 @@ async def _load_venues_for_city(city_id: int) -> CityVenuesEntry | None:
 
     if payload is None:
         fetched_at = await run_in_threadpool(storage.get_venues_fetched_at, city_id)
-        if fetched_at is not None and (time.time() - fetched_at) < VENUES_TTL:
+        if fetched_at is not None:
             payload = await run_in_threadpool(storage.get_venues_payload, city_id)
             if payload is not None:
                 payload.tier_config = TIER_CONFIG
-                _venues_response_cache[city_id] = (time.time(), payload)
+                if (time.time() - fetched_at) < VENUES_TTL:
+                    _venues_response_cache[city_id] = (time.time(), payload)
+                else:
+                    # Stale: serve it now, refresh out-of-band. Deliberately not
+                    # put in the memory cache — the refresh will prime it.
+                    asyncio.create_task(_refresh_venues_in_background(city))
 
     if payload is None:
-        # Bound concurrent live USC pulls globally. The cache reads above are
-        # unthrottled; only the cold fetch acquires the semaphore.
-        async with _venue_fetch_semaphore:
-            # Re-check: another request may have fetched this same city while we
-            # were queued on the semaphore.
-            payload = _fresh_cached_payload(city_id)
-            if payload is None:
-                raw_venues = await fetch_all_venue_pages(usc_city_id=city_id)
-                venues = [transform_venue(v) for v in raw_venues]
-                venues = [v for v in venues if v.name and (v.tiers_private or v.tiers_corporate)]
-                venues.sort(key=lambda v: v.name)
-
-                total = len(venues)
-                with_coords = sum(1 for v in venues if v.has_coordinates)
-                now = time.time()
-                await run_in_threadpool(storage.upsert_venues, city_id, venues, now, total, with_coords)
-
-                payload = await run_in_threadpool(storage.get_venues_payload, city_id)
-                assert payload is not None
-                payload.tier_config = TIER_CONFIG
-                _venues_response_cache[city_id] = (now, payload)
-                asyncio.create_task(enrich_venue_details(city_id))
+        payload = await _fetch_and_cache_venues(city)
 
     return CityVenuesEntry(
         city_id=city_id,
@@ -624,6 +692,28 @@ async def get_categories():
     return data
 
 
+async def _refresh_courses_in_background(pairs: list[tuple[int, str]]) -> None:
+    """Stale-while-revalidate worker: refetch expired (city, date) course days."""
+    work = [p for p in pairs if p not in _course_refresh_keys]
+    if not work:
+        return
+    _course_refresh_keys.update(work)
+    try:
+        semaphore = asyncio.Semaphore(5)
+        async with httpx.AsyncClient(headers=USC_HEADERS, timeout=30) as client:
+            results = await asyncio.gather(
+                *[fetch_courses_for_date(d, cid, client, semaphore) for (cid, d) in work],
+                return_exceptions=True,
+            )
+        for (cid, d), r in zip(work, results, strict=True):
+            if isinstance(r, Exception):
+                logger.warning("Background course refresh failed for city=%s %s: %r", cid, d, r)
+                continue
+            await run_in_threadpool(storage.upsert_courses_for_date, cid, d, r, time.time())
+    finally:
+        _course_refresh_keys.difference_update(work)
+
+
 @app.get("/api/courses", response_model=MultiCityCoursesResponse)
 async def get_courses(
     start_date: str,
@@ -656,20 +746,29 @@ async def get_courses(
     entries: list[CityCoursesEntry] = []
     errors: list[CourseFetchError] = []
 
-    # Partition per (city, date): fresh from DB vs stale -> needs fetch.
-    # All stale fetches share one Semaphore so fan-out stays bounded.
+    # Partition per (city, date): any cached day is served from the DB — expired
+    # ones get a background refresh (stale-while-revalidate) — and only days
+    # with no cache at all block on a live fetch, sharing one Semaphore so
+    # fan-out stays bounded.
     semaphore = asyncio.Semaphore(5)
     per_city_merged: dict[int, dict[str, list[Course]]] = {cid: {} for cid in ordered_cities}
     stale_work: list[tuple[int, str]] = []
+    refresh_work: list[tuple[int, str]] = []
 
     for cid in ordered_cities:
         fetches = await run_in_threadpool(storage.get_course_fetches, cid, date_list)
-        fresh_dates = [d for d in date_list if d in fetches and (now - fetches[d]) < COURSES_TTL]
-        stale_dates = [d for d in date_list if d not in fresh_dates]
-        if fresh_dates:
-            per_city_merged[cid].update(await run_in_threadpool(storage.get_courses_for_dates, cid, fresh_dates))
-        for d in stale_dates:
-            stale_work.append((cid, d))
+        cached_dates = [d for d in date_list if d in fetches]
+        if cached_dates:
+            per_city_merged[cid].update(await run_in_threadpool(storage.get_courses_for_dates, cid, cached_dates))
+        for d in cached_dates:
+            if (now - fetches[d]) >= COURSES_TTL:
+                refresh_work.append((cid, d))
+        for d in date_list:
+            if d not in fetches:
+                stale_work.append((cid, d))
+
+    if refresh_work:
+        asyncio.create_task(_refresh_courses_in_background(refresh_work))
 
     if stale_work:
         async with httpx.AsyncClient(headers=USC_HEADERS, timeout=30) as client:
