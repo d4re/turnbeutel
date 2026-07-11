@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 import server
 import storage
-from models import City, Venue, VenueAddress, VenueDetail, VisitLimits
+from models import City, Course, Venue, VenueAddress, VenueDetail, VisitLimits
 from server import (
     CORPORATE_TIER_ORDER,
     PRIVATE_TIER_ORDER,
@@ -543,6 +543,8 @@ def seeded_client(tmp_path: Path, monkeypatch):
     # Reset module-level caches so state doesn't leak between tests.
     server._venues_response_cache.clear()
     server._enrichment_cities.clear()
+    server._venue_refresh_cities.clear()
+    server._course_refresh_keys.clear()
 
     async def _fake_cities():
         return []
@@ -729,6 +731,101 @@ def test_large_responses_are_gzip_compressed(seeded_client, monkeypatch):
     assert resp.headers.get("content-encoding") == "gzip"
     # The body still decodes transparently.
     assert len(resp.json()["cities"][0]["venues"]) == 20
+
+
+def _make_course(course_id: int, date: str, title: str) -> Course:
+    return Course(
+        id=course_id,
+        date=date,
+        title=title,
+        start_time="09:00",
+        end_time="10:00",
+        venue_id="v1",
+        venue_name="Venue",
+        lat=52.52,
+        lng=13.4,
+        district="",
+        category="Yoga",
+        category_id=1,
+        teacher="",
+        free_spots=5,
+        max_spots=10,
+        is_online=False,
+        is_plus=False,
+    )
+
+
+def _wait_until(predicate, timeout: float = 2.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
+def test_get_venues_stale_cache_served_immediately_then_refreshed(seeded_client, monkeypatch):
+    """An expired-but-present venue snapshot must be returned right away, with
+    the live refetch happening in the background — not blocking the request."""
+    stale_at = time.time() - server.VENUES_TTL - 3600
+    storage.upsert_venues(1, [_make_venue("v1", "Old Studio", 52.5, 13.4)], stale_at, 1, 1)
+
+    calls: list[int] = []
+
+    async def fake_fetch(usc_city_id: int, expected_count=None):
+        calls.append(usc_city_id)
+        return [
+            {
+                "name": "New Studio",
+                "urlSlug": "new-studio",
+                "planTypes": ["S"],
+                "planTypesB2B": ["S"],
+                "categories": [],
+                "ratings": {},
+                "id": "v2",
+                "location": {"latitude": 52.52, "longitude": 13.4},
+                "isOnline": 0,
+                "isPlusCheckin": 0,
+            }
+        ]
+
+    monkeypatch.setattr(server, "fetch_all_venue_pages", fake_fetch)
+
+    resp = seeded_client.get("/api/venues?city_ids=1")
+    assert resp.status_code == 200
+    venues = resp.json()["cities"][0]["venues"]
+    # The stale snapshot is served, not the live refetch.
+    assert [v["name"] for v in venues] == ["Old Studio"]
+
+    # The background refresh runs to completion and lands in storage.
+    assert _wait_until(lambda: calls == [1])
+    assert _wait_until(lambda: (storage.get_venues_fetched_at(1) or 0) > stale_at)
+    refreshed = storage.get_venues_payload(1)
+    assert [v.name for v in refreshed.venues] == ["New Studio"]
+
+
+def test_get_courses_stale_cache_served_immediately_then_refreshed(seeded_client, monkeypatch):
+    """Expired-but-present course days are served from cache with a background refresh."""
+    stale_at = time.time() - server.COURSES_TTL - 3600
+    storage.upsert_courses_for_date(1, "2026-04-11", [_make_course(1, "2026-04-11", "Old Class")], stale_at)
+
+    calls: list[tuple[str, int]] = []
+
+    async def fake_fetch(date_str, usc_city_id, client, semaphore):
+        calls.append((date_str, usc_city_id))
+        return [_make_course(2, date_str, "New Class")]
+
+    monkeypatch.setattr(server, "fetch_courses_for_date", fake_fetch)
+
+    resp = seeded_client.get("/api/courses?start_date=2026-04-11&days=1&city_ids=1")
+    assert resp.status_code == 200
+    titles = [c["title"] for c in resp.json()["cities"][0]["courses"]]
+    assert titles == ["Old Class"]
+
+    assert _wait_until(lambda: calls == [("2026-04-11", 1)])
+    assert _wait_until(lambda: (storage.get_course_fetches(1, ["2026-04-11"]).get("2026-04-11") or 0) > stale_at)
+    refreshed = storage.get_courses_for_dates(1, ["2026-04-11"])["2026-04-11"]
+    assert [c.title for c in refreshed] == ["New Class"]
 
 
 def test_get_courses_requires_city_ids(seeded_client):

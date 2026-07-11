@@ -95,6 +95,9 @@ _cities_index: list[City] = []
 _venues_response_cache: dict[int, tuple[float, VenuesPayload]] = {}
 _enrichment_cities: set[int] = set()
 _venue_fetch_semaphore = asyncio.Semaphore(MAX_CONCURRENT_VENUE_FETCHES)
+# Guards against duplicate stale-while-revalidate refreshes.
+_venue_refresh_cities: set[int] = set()
+_course_refresh_keys: set[tuple[int, str]] = set()
 
 
 def _invalidate_venues_cache(city_id: int) -> None:
@@ -546,8 +549,54 @@ def _fresh_cached_payload(city_id: int) -> VenuesPayload | None:
     return None
 
 
+async def _fetch_and_cache_venues(city: City) -> VenuesPayload:
+    """Live-fetch a city's venues from USC, persist them, and prime the caches."""
+    # Bound concurrent live USC pulls globally. Cache reads elsewhere are
+    # unthrottled; only live fetches acquire the semaphore.
+    async with _venue_fetch_semaphore:
+        # Re-check: another request may have fetched this same city while we
+        # were queued on the semaphore.
+        payload = _fresh_cached_payload(city.id)
+        if payload is not None:
+            return payload
+
+        raw_venues = await fetch_all_venue_pages(usc_city_id=city.id, expected_count=city.venue_address_count)
+        venues = [transform_venue(v) for v in raw_venues]
+        venues = [v for v in venues if v.name and (v.tiers_private or v.tiers_corporate)]
+        venues.sort(key=lambda v: v.name)
+
+        total = len(venues)
+        with_coords = sum(1 for v in venues if v.has_coordinates)
+        now = time.time()
+        await run_in_threadpool(storage.upsert_venues, city.id, venues, now, total, with_coords)
+
+        payload = await run_in_threadpool(storage.get_venues_payload, city.id)
+        assert payload is not None
+        payload.tier_config = TIER_CONFIG
+        _venues_response_cache[city.id] = (now, payload)
+        asyncio.create_task(enrich_venue_details(city.id))
+        return payload
+
+
+async def _refresh_venues_in_background(city: City) -> None:
+    """Stale-while-revalidate worker: refetch a city whose snapshot expired."""
+    if city.id in _venue_refresh_cities:
+        return
+    _venue_refresh_cities.add(city.id)
+    try:
+        await _fetch_and_cache_venues(city)
+    except Exception:
+        logger.warning("Background venue refresh failed for city=%s", city.id, exc_info=True)
+    finally:
+        _venue_refresh_cities.discard(city.id)
+
+
 async def _load_venues_for_city(city_id: int) -> CityVenuesEntry | None:
     """Resolve one city's venues, honoring memory and DB caches.
+
+    An expired-but-present DB snapshot is served immediately and refreshed in
+    the background (stale-while-revalidate); only a city with no snapshot at
+    all blocks on the live USC fetch.
 
     Returns None if the city is not in `_cities_index` (unknown id).
     """
@@ -559,35 +608,19 @@ async def _load_venues_for_city(city_id: int) -> CityVenuesEntry | None:
 
     if payload is None:
         fetched_at = await run_in_threadpool(storage.get_venues_fetched_at, city_id)
-        if fetched_at is not None and (time.time() - fetched_at) < VENUES_TTL:
+        if fetched_at is not None:
             payload = await run_in_threadpool(storage.get_venues_payload, city_id)
             if payload is not None:
                 payload.tier_config = TIER_CONFIG
-                _venues_response_cache[city_id] = (time.time(), payload)
+                if (time.time() - fetched_at) < VENUES_TTL:
+                    _venues_response_cache[city_id] = (time.time(), payload)
+                else:
+                    # Stale: serve it now, refresh out-of-band. Deliberately not
+                    # put in the memory cache — the refresh will prime it.
+                    asyncio.create_task(_refresh_venues_in_background(city))
 
     if payload is None:
-        # Bound concurrent live USC pulls globally. The cache reads above are
-        # unthrottled; only the cold fetch acquires the semaphore.
-        async with _venue_fetch_semaphore:
-            # Re-check: another request may have fetched this same city while we
-            # were queued on the semaphore.
-            payload = _fresh_cached_payload(city_id)
-            if payload is None:
-                raw_venues = await fetch_all_venue_pages(usc_city_id=city_id, expected_count=city.venue_address_count)
-                venues = [transform_venue(v) for v in raw_venues]
-                venues = [v for v in venues if v.name and (v.tiers_private or v.tiers_corporate)]
-                venues.sort(key=lambda v: v.name)
-
-                total = len(venues)
-                with_coords = sum(1 for v in venues if v.has_coordinates)
-                now = time.time()
-                await run_in_threadpool(storage.upsert_venues, city_id, venues, now, total, with_coords)
-
-                payload = await run_in_threadpool(storage.get_venues_payload, city_id)
-                assert payload is not None
-                payload.tier_config = TIER_CONFIG
-                _venues_response_cache[city_id] = (now, payload)
-                asyncio.create_task(enrich_venue_details(city_id))
+        payload = await _fetch_and_cache_venues(city)
 
     return CityVenuesEntry(
         city_id=city_id,
@@ -659,6 +692,28 @@ async def get_categories():
     return data
 
 
+async def _refresh_courses_in_background(pairs: list[tuple[int, str]]) -> None:
+    """Stale-while-revalidate worker: refetch expired (city, date) course days."""
+    work = [p for p in pairs if p not in _course_refresh_keys]
+    if not work:
+        return
+    _course_refresh_keys.update(work)
+    try:
+        semaphore = asyncio.Semaphore(5)
+        async with httpx.AsyncClient(headers=USC_HEADERS, timeout=30) as client:
+            results = await asyncio.gather(
+                *[fetch_courses_for_date(d, cid, client, semaphore) for (cid, d) in work],
+                return_exceptions=True,
+            )
+        for (cid, d), r in zip(work, results, strict=True):
+            if isinstance(r, Exception):
+                logger.warning("Background course refresh failed for city=%s %s: %r", cid, d, r)
+                continue
+            await run_in_threadpool(storage.upsert_courses_for_date, cid, d, r, time.time())
+    finally:
+        _course_refresh_keys.difference_update(work)
+
+
 @app.get("/api/courses", response_model=MultiCityCoursesResponse)
 async def get_courses(
     start_date: str,
@@ -691,20 +746,29 @@ async def get_courses(
     entries: list[CityCoursesEntry] = []
     errors: list[CourseFetchError] = []
 
-    # Partition per (city, date): fresh from DB vs stale -> needs fetch.
-    # All stale fetches share one Semaphore so fan-out stays bounded.
+    # Partition per (city, date): any cached day is served from the DB — expired
+    # ones get a background refresh (stale-while-revalidate) — and only days
+    # with no cache at all block on a live fetch, sharing one Semaphore so
+    # fan-out stays bounded.
     semaphore = asyncio.Semaphore(5)
     per_city_merged: dict[int, dict[str, list[Course]]] = {cid: {} for cid in ordered_cities}
     stale_work: list[tuple[int, str]] = []
+    refresh_work: list[tuple[int, str]] = []
 
     for cid in ordered_cities:
         fetches = await run_in_threadpool(storage.get_course_fetches, cid, date_list)
-        fresh_dates = [d for d in date_list if d in fetches and (now - fetches[d]) < COURSES_TTL]
-        stale_dates = [d for d in date_list if d not in fresh_dates]
-        if fresh_dates:
-            per_city_merged[cid].update(await run_in_threadpool(storage.get_courses_for_dates, cid, fresh_dates))
-        for d in stale_dates:
-            stale_work.append((cid, d))
+        cached_dates = [d for d in date_list if d in fetches]
+        if cached_dates:
+            per_city_merged[cid].update(await run_in_threadpool(storage.get_courses_for_dates, cid, cached_dates))
+        for d in cached_dates:
+            if (now - fetches[d]) >= COURSES_TTL:
+                refresh_work.append((cid, d))
+        for d in date_list:
+            if d not in fetches:
+                stale_work.append((cid, d))
+
+    if refresh_work:
+        asyncio.create_task(_refresh_courses_in_background(refresh_work))
 
     if stale_work:
         async with httpx.AsyncClient(headers=USC_HEADERS, timeout=30) as client:
