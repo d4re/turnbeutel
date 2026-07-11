@@ -563,6 +563,35 @@ def test_get_venues_second_call_is_cached(seeded_client, monkeypatch):
     assert calls == [1]
 
 
+def test_large_responses_are_gzip_compressed(seeded_client, monkeypatch):
+    """Venue payloads run to megabytes; the server must honor Accept-Encoding: gzip."""
+
+    async def fake_fetch(usc_city_id: int):
+        return [
+            {
+                "name": f"Studio {i}",
+                "urlSlug": f"studio-{i}",
+                "planTypes": ["S"],
+                "planTypesB2B": ["S"],
+                "categories": [],
+                "ratings": {},
+                "id": f"v{i}",
+                "location": {"latitude": 52.52, "longitude": 13.4},
+                "isOnline": 0,
+                "isPlusCheckin": 0,
+            }
+            for i in range(20)
+        ]
+
+    monkeypatch.setattr(server, "fetch_all_venue_pages", fake_fetch)
+
+    resp = seeded_client.get("/api/venues?city_ids=1", headers={"Accept-Encoding": "gzip"})
+    assert resp.status_code == 200
+    assert resp.headers.get("content-encoding") == "gzip"
+    # The body still decodes transparently.
+    assert len(resp.json()["cities"][0]["venues"]) == 20
+
+
 def test_get_courses_requires_city_ids(seeded_client):
     resp = seeded_client.get("/api/courses?start_date=2026-04-11")
     assert resp.status_code == 400

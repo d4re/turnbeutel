@@ -18,6 +18,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 
 import storage
@@ -133,6 +134,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Turnbeutel API", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+# Venue/course payloads are large (Berlin: ~1.4 MB JSON, ~0.16 MB gzipped).
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
 # ── Visit limits parsing ──
