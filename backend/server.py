@@ -51,7 +51,11 @@ USC_HEADERS = {
 }
 DEFAULT_CITY_ID = 1
 PAGE_SIZE = 100
+MAX_VENUE_PAGES = 100
+VENUE_PAGE_BATCH = 5
 MAX_CONCURRENT_VENUE_FETCHES = 3
+# Must cover the frontend's date strip (today .. today+13 = 14 days).
+MAX_COURSE_DAYS = 14
 
 CACHE_DIR = Path(__file__).parent / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
@@ -323,49 +327,50 @@ async def fetch_all_cities() -> list[dict]:
 
 
 async def fetch_all_venue_pages(usc_city_id: int) -> list[dict]:
-    """Fetch all venue pages from the USC API concurrently."""
-    async with httpx.AsyncClient(headers=USC_HEADERS, timeout=30) as client:
-        first = await client.get(
-            f"{USC_API}/venues",
-            params={"cityId": usc_city_id, "page": 1, "pageSize": PAGE_SIZE},
-        )
-        first.raise_for_status()
-        first_data = first.json().get("data", [])
-        if not first_data:
-            return []
+    """Fetch all venue pages from the USC API in bounded batches.
 
-        all_venues = list(first_data)
-        if len(first_data) < PAGE_SIZE:
+    Pages are fetched VENUE_PAGE_BATCH at a time until a short page signals the
+    end (capped at MAX_VENUE_PAGES as a runaway guard). A failed page raises so
+    a venue list with a silent gap is never cached.
+    """
+    async with httpx.AsyncClient(headers=USC_HEADERS, timeout=30) as client:
+
+        async def fetch_page(page: int) -> list[dict]:
+            resp = await client.get(
+                f"{USC_API}/venues",
+                params={"cityId": usc_city_id, "page": page, "pageSize": PAGE_SIZE},
+            )
+            resp.raise_for_status()
+            return resp.json().get("data", [])
+
+        all_venues = await fetch_page(1)
+        if len(all_venues) < PAGE_SIZE:
             return all_venues
 
-        estimated_total = len(first_data) * 30
-        total_pages = (estimated_total // PAGE_SIZE) + 2
-        tasks = [
-            client.get(
-                f"{USC_API}/venues",
-                params={"cityId": usc_city_id, "page": p, "pageSize": PAGE_SIZE},
-            )
-            for p in range(2, total_pages + 1)
-        ]
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for resp in responses:
-            if isinstance(resp, Exception):
-                continue
-            data = resp.json().get("data", [])
-            if not data:
-                break
-            all_venues.extend(data)
+        page = 2
+        while page <= MAX_VENUE_PAGES:
+            batch = await asyncio.gather(*[fetch_page(p) for p in range(page, page + VENUE_PAGE_BATCH)])
+            for data in batch:
+                all_venues.extend(data)
+                if len(data) < PAGE_SIZE:
+                    return all_venues
+            page += VENUE_PAGE_BATCH
 
         return all_venues
 
 
-async def fetch_venue_detail(venue_id: int) -> dict:
-    """Fetch a single venue detail from the USC API."""
-    async with httpx.AsyncClient(headers=USC_HEADERS, timeout=30) as client:
-        resp = await client.get(f"{USC_API}/venues/{venue_id}")
-        resp.raise_for_status()
-        return resp.json().get("data", {})
+async def fetch_venue_detail(venue_id: int, client: httpx.AsyncClient | None = None) -> dict:
+    """Fetch a single venue detail from the USC API.
+
+    Pass `client` to reuse connections across many calls (background enrichment);
+    without it a one-shot client is created.
+    """
+    if client is None:
+        async with httpx.AsyncClient(headers=USC_HEADERS, timeout=30) as one_shot:
+            return await fetch_venue_detail(venue_id, one_shot)
+    resp = await client.get(f"{USC_API}/venues/{venue_id}")
+    resp.raise_for_status()
+    return resp.json().get("data", {})
 
 
 # ── Course transformation and fetching ──
@@ -465,11 +470,11 @@ async def enrich_venue_details(city_id: int) -> None:
         semaphore = asyncio.Semaphore(5)
         processed = 0
 
-        async def fetch_one(vid: str) -> None:
+        async def fetch_one(vid: str, client: httpx.AsyncClient) -> None:
             nonlocal processed
             async with semaphore:
                 try:
-                    raw = await fetch_venue_detail(int(vid))
+                    raw = await fetch_venue_detail(int(vid), client)
                     limits_text = raw.get("bookingLimitsText")
                     detail = VenueDetail(
                         visit_limits=parse_visit_limits(limits_text),
@@ -487,7 +492,8 @@ async def enrich_venue_details(city_id: int) -> None:
                 except Exception:
                     pass  # skip failures, retry next cycle
 
-        await asyncio.gather(*[fetch_one(vid) for vid in venue_ids])
+        async with httpx.AsyncClient(headers=USC_HEADERS, timeout=30) as client:
+            await asyncio.gather(*[fetch_one(vid, client) for vid in venue_ids])
         _invalidate_venues_cache(city_id)
 
     finally:
@@ -639,7 +645,7 @@ async def get_courses(
             detail="Invalid start_date, expected YYYY-MM-DD",
         ) from e
 
-    days = max(1, min(days, 13))
+    days = max(1, min(days, MAX_COURSE_DAYS))
     date_list = [(start + timedelta(days=i)).isoformat() for i in range(days)]
 
     # Dedupe city_ids while preserving order, keep only known ones.

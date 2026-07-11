@@ -615,6 +615,24 @@ def test_get_courses_multi_city_grouped(seeded_client, monkeypatch):
     assert sorted(calls) == [("2026-04-11", 1), ("2026-04-11", 2)]
 
 
+def test_get_courses_days_clamped_to_date_strip(seeded_client, monkeypatch):
+    """`days` must clamp to 14, matching the frontend's 14-chip date strip."""
+    calls: list[str] = []
+
+    async def fake_fetch(date_str, usc_city_id, client, semaphore):
+        calls.append(date_str)
+        return []
+
+    monkeypatch.setattr(server, "fetch_courses_for_date", fake_fetch)
+
+    resp = seeded_client.get("/api/courses?start_date=2026-04-11&days=30&city_ids=1")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(calls) == 14
+    assert data["date_from"] == "2026-04-11"
+    assert data["date_to"] == "2026-04-24"
+
+
 # ── transform_city ──
 
 

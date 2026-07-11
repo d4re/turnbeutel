@@ -354,7 +354,7 @@ async function fetchCourses() {
   if (!startDate) return;
   if (!endDate || endDate < startDate) endDate = startDate;
 
-  const days = Math.min(14, Math.max(1, daysBetween(startDate, endDate) + 1));
+  const days = Math.min(DATE_STRIP_DAYS, Math.max(1, daysBetween(startDate, endDate) + 1));
   const dateList = [];
   for (let i = 0; i < days; i++) {
     const d = new Date(startDate + "T00:00:00");
@@ -411,8 +411,16 @@ async function fetchCourses() {
         // shared state so out-of-order responses can't pollute the cache.
         if (token !== coursesLoadToken) return;
         if (!resp.ok) throw new Error(data.detail || `API ${resp.status}`);
+        // Dates the backend failed to fetch upstream come back as per-date
+        // errors in a 200 response. Don't mark those as loaded, so the next
+        // fetch retries them instead of treating the day as (empty) cached.
+        const failedDates = new Set(
+          (data.errors || []).filter((e) => e.city_id === cid).map((e) => e.date),
+        );
         const cached = loadedCourseCities.get(cid) ?? new Set();
-        for (const d of missing) cached.add(d);
+        for (const d of missing) {
+          if (!failedDates.has(d)) cached.add(d);
+        }
         loadedCourseCities.set(cid, cached);
         // `data.cities` is always length 1 (we queried a single city).
         for (const entry of data.cities || []) {
