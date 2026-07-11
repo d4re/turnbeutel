@@ -58,6 +58,7 @@ uv run uvicorn server:app --reload --host 0.0.0.0 --port 8000
 - **Click a venue** on the map or in the list to see visit limits per tier (loaded on demand from the API).
 - **Courses tab** — switch to browse classes/courses in the visible cities for a specific day or range (tap a date chip, or drag across chips for a range). Filter by time of day, category, free text, free-spots-only, and PLUS-only. The sidebar shows courses sorted by time; the map shows a marker per venue hosting matching courses, with the full schedule in each popup.
 - **Zoom out** to see pins for every USC city; click one to fly there and load its venues.
+- **On a phone** the sidebar becomes a bottom sheet over a full-screen map: drag the handle (or tap it) to switch between peek, half, and full height, and open filters via the **Filters** button in the sheet header (the badge shows how many filters are active).
 
 ## Project Structure
 

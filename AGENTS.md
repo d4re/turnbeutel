@@ -64,6 +64,12 @@ The dual-handle tier slider filters venues by their **minimum required tier** (t
 
 Vanilla HTML + JS + CSS. Leaflet.js and MarkerCluster loaded from CDN. No bundler, no framework. The only npm dependency is ESLint (dev-only, for linting).
 
+### Mobile layout is a bottom sheet over a full-screen map
+
+Below `max-width: 768px` (one CSS media query, mirrored by `matchMedia` in JS) the sidebar becomes a draggable bottom sheet with three snap states (`data-sheet="peek|half|full"` on `#sidebar`); the map always fills the viewport, so sheet moves never resize the map. Filter panels open as an overlay filling the sheet — the sheet's `transform` makes it the containing block for positioned descendants, so `position: fixed` inside it does NOT reach the viewport. Desktop layout is untouched. Design doc: `docs/superpowers/specs/2026-07-11-mobile-bottom-sheet-design.md`.
+
+Related invariant: don't re-render markers on viewport changes unless new data arrived or the zoom-out branch cleared the layer (`mapMarkersCleared` in `app.js`) — rebuilding markers destroys open popups and made list-tap → popup flaky. Also, `init()` must stay the last statement in `app.js`: it runs immediately and reads top-level `const` bindings that only exist once the whole script has evaluated.
+
 ## Things to Watch Out For
 
 ### Rate limiting

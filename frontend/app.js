@@ -30,6 +30,9 @@ const TIME_MIN_INDEX = 0;
 const TIME_MAX_INDEX = 33;
 let cityPinLayer = null;
 let viewportDebounceTimer = null;
+// True after zooming below MIN_FETCH_ZOOM wiped the cluster layer; the next
+// viewport update must re-render markers even if no new data was fetched.
+let mapMarkersCleared = false;
 
 // Per-venue UI state, kept off the venue objects so the data layer stays pure.
 const venueMarkers = new WeakMap();        // venue -> Leaflet marker
@@ -119,6 +122,10 @@ function saveLastView() {
 // ── Init ──
 
 async function init() {
+  // Wire the mobile sheet before any fetches so the layout works even if the
+  // backend is unreachable.
+  initMobileSheet();
+
   document.getElementById("venue-list").innerHTML =
     '<div class="loading">Loading city index...</div>';
 
@@ -325,6 +332,7 @@ function switchView(view) {
   } else {
     applyCourseFilters();
   }
+  updateFilterBadge();
 }
 
 function daysBetween(start, end) {
@@ -354,7 +362,7 @@ async function mapWithConcurrency(items, limit, task) {
   await Promise.all(workers);
 }
 
-async function fetchCourses() {
+async function fetchCourses(viewportOnly = false) {
   const startDate = courseStartDate;
   let endDate = courseEndDate;
   if (!startDate) return;
@@ -387,6 +395,10 @@ async function fetchCourses() {
     const missing = dateList.filter((d) => !cached.has(d));
     if (missing.length > 0) missingByCity.set(cid, missing);
   }
+
+  // A pure viewport change with everything already cached needs no re-render;
+  // skipping it keeps open popups alive and avoids a "Loading" flash per pan.
+  if (viewportOnly && missingByCity.size === 0 && !mapMarkersCleared) return;
 
   listEl.innerHTML = '<div class="loading">Loading courses...</div>';
   const token = ++coursesLoadToken;
@@ -495,6 +507,7 @@ function applyCourseFilters() {
   renderCourseList(filteredCourses);
   renderCourseMap(filteredCourses);
   updateCourseStats();
+  updateFilterBadge();
 }
 
 function updateCourseStats() {
@@ -574,16 +587,39 @@ function renderCourseListChunk(container, courses, start, prevDate) {
   }
 }
 
+// Pan/zoom to a clustered marker and open its popup. The marker only gets a
+// DOM element once the zoom animation ends AND the cluster group has released
+// it (an animation frame later; clustering is off at the target zooms), so
+// after arriving, retry briefly until the marker is actually displayed.
+function focusMarker(marker, lat, lng, zoom) {
+  const target = L.latLng(lat, lng);
+  const openWhenDisplayed = (triesLeft) => {
+    if (marker.getElement()) {
+      marker.openPopup();
+    } else if (triesLeft > 0) {
+      setTimeout(() => openWhenDisplayed(triesLeft - 1), 50);
+    }
+  };
+  if (map.getZoom() >= zoom && map.getCenter().distanceTo(target) < 5) {
+    openWhenDisplayed(20);
+    return;
+  }
+  map.once("moveend", () => openWhenDisplayed(20));
+  map.setView(target, zoom);
+}
+
 function focusCourseVenueOnMap(course) {
   if (!course.lat || !course.lng) return;
-  map.setView([course.lat, course.lng], 16);
   const marker = courseMarkers.get(course.venue_id);
-  if (marker) marker.openPopup();
+  if (!marker) return;
+  collapseSheetForMap();
+  focusMarker(marker, course.lat, course.lng, 16);
 }
 
 function renderCourseMap(courses) {
   if (currentView !== "courses") return;
   markerCluster.clearLayers();
+  mapMarkersCleared = false;
   courseMarkers = new Map();
 
   const venueMap = new Map();
@@ -612,7 +648,7 @@ function renderCourseMap(courses) {
       opacity: 1,
       fillOpacity: 0.85,
     });
-    marker.bindPopup(() => buildCoursePopup(venueData));
+    marker.bindPopup(() => buildCoursePopup(venueData), popupOptions());
     courseMarkers.set(venueData.venue_id, marker);
     markers.push(marker);
   }
@@ -733,6 +769,7 @@ async function onMapViewportChange() {
 
   if (zoom < MIN_FETCH_ZOOM) {
     markerCluster.clearLayers();
+    mapMarkersCleared = true;
     showCityPins();
     return;
   }
@@ -761,7 +798,9 @@ async function onMapViewportChange() {
     });
     // Re-render once more so a fully failed load clears the loading state.
     if (currentView === "venues") applyFilters();
-  } else if (currentView === "venues") {
+  } else if (currentView === "venues" && mapMarkersCleared) {
+    // Only re-render when the zoom-out branch wiped the markers. Re-rendering
+    // on every pan would rebuild all markers and destroy any open popup.
     applyFilters();
   }
 
@@ -797,7 +836,7 @@ function hideCityPins() {
 }
 
 function refreshCoursesForViewport() {
-  if (currentView === "courses") fetchCourses();
+  if (currentView === "courses") fetchCourses(true);
 }
 
 function bindFilterEvents() {
@@ -939,6 +978,7 @@ function applyFilters() {
   renderList(filteredVenues);
   renderMap(filteredVenues);
   updateStats();
+  updateFilterBadge();
 }
 
 function updateStats() {
@@ -1017,8 +1057,8 @@ function renderVenueListChunk(container, venues, start) {
       item.classList.add("active");
       const marker = venueMarkers.get(venue);
       if (venue.has_coordinates && marker) {
-        map.setView([venue.lat, venue.lng], 15);
-        marker.openPopup();
+        collapseSheetForMap();
+        focusMarker(marker, venue.lat, venue.lng, 15);
       }
     });
 
@@ -1035,6 +1075,7 @@ function renderVenueListChunk(container, venues, start) {
 function renderMap(venues) {
   if (currentView !== "venues") return;
   markerCluster.clearLayers();
+  mapMarkersCleared = false;
   const colors = getTierColors();
   const markers = [];
   for (const venue of venues) {
@@ -1051,7 +1092,7 @@ function renderMap(venues) {
       fillOpacity: 0.85,
     });
 
-    marker.bindPopup(() => buildPopup(venue));
+    marker.bindPopup(() => buildPopup(venue), popupOptions());
     marker.on("click", () => {
       const listItem = document.querySelector(`.venue-item[data-slug="${venue.slug}"]`);
       if (listItem) {
@@ -1155,8 +1196,6 @@ function esc(str) {
   return div.innerHTML;
 }
 
-init();
-
 function timeIndexToMinutes(i) {
   // Concrete clock time for an INNER index (1..32). Do not call with 0 or 33 —
   // those are the open-ended "Any" / "24:00" sentinels handled by the callers.
@@ -1246,3 +1285,192 @@ function startTimeToMinutes(startTime) {
   if (isNaN(h) || isNaN(m)) return null;
   return h * 60 + m;
 }
+
+// ── Mobile bottom sheet ──
+// On narrow screens (see the matching CSS media query) the sidebar becomes a
+// bottom sheet over a full-screen map, snapping between peek/half/full.
+// Dragging is confined to the handle and header; the list body scrolls
+// normally, so drag and scroll zones never overlap.
+// Spec: docs/superpowers/specs/2026-07-11-mobile-bottom-sheet-design.md
+
+const mobileLayout = window.matchMedia("(max-width: 768px)");
+const SHEET_STATES = ["peek", "half", "full"];
+const SHEET_PEEK_HEIGHT = 110; // px visible above the bottom edge; matches CSS
+const SHEET_FULL_TOP = 0.08; // fraction of viewport height; matches 8dvh in CSS
+const SHEET_HALF_TOP = 0.5;
+const SHEET_DRAG_THRESHOLD = 6; // px of movement before a press becomes a drag
+const SHEET_CLICK_SUPPRESS_MS = 150; // swallow clicks this soon after a drag
+
+function isMobileLayout() {
+  return mobileLayout.matches;
+}
+
+// Popup options that keep auto-panned popups clear of the peeked sheet.
+function popupOptions() {
+  return isMobileLayout()
+    ? { autoPanPaddingBottomRight: L.point(12, SHEET_PEEK_HEIGHT + 20) }
+    : {};
+}
+
+function setSheetState(state) {
+  const sidebar = document.getElementById("sidebar");
+  sidebar.dataset.sheet = state;
+  sidebar.style.transform = ""; // let the CSS snap-state transform take over
+}
+
+// Drop the sheet out of the way before focusing something on the map.
+function collapseSheetForMap() {
+  if (isMobileLayout()) setSheetState("peek");
+}
+
+// Viewport y-coordinate of the sheet's top edge for a snap state. Mirrors the
+// CSS custom-property values (safe-area inset ignored; only used to pick the
+// nearest state, the exact position comes from CSS).
+function sheetTopFor(state) {
+  const h = window.innerHeight;
+  if (state === "full") return h * SHEET_FULL_TOP;
+  if (state === "half") return h * SHEET_HALF_TOP;
+  return h - SHEET_PEEK_HEIGHT;
+}
+
+function initMobileSheet() {
+  const sidebar = document.getElementById("sidebar");
+  const handle = document.getElementById("sheet-handle");
+  const header = document.getElementById("sidebar-header");
+
+  let startY = null; // pointer y at pointerdown, null = no active press
+  let startTop = null; // sheet top edge at pointerdown
+  let pointerId = null;
+  let dragging = false;
+  let lastDragEnd = 0;
+
+  function recentDrag() {
+    return Date.now() - lastDragEnd < SHEET_CLICK_SUPPRESS_MS;
+  }
+
+  function onPointerDown(e) {
+    if (!isMobileLayout() || !e.isPrimary) return;
+    startY = e.clientY;
+    startTop = sidebar.getBoundingClientRect().top;
+    pointerId = e.pointerId;
+    dragging = false;
+  }
+
+  function onPointerMove(e) {
+    if (startY === null || e.pointerId !== pointerId) return;
+    const dy = e.clientY - startY;
+    if (!dragging) {
+      if (Math.abs(dy) < SHEET_DRAG_THRESHOLD) return;
+      dragging = true;
+      sidebar.classList.add("dragging");
+    }
+    const top = Math.min(
+      sheetTopFor("peek"),
+      Math.max(sheetTopFor("full"), startTop + dy),
+    );
+    sidebar.style.transform = `translateY(${top - sheetTopFor("full")}px)`;
+  }
+
+  function onPointerEnd(e) {
+    if (startY === null || e.pointerId !== pointerId) return;
+    if (dragging) {
+      const top = sidebar.getBoundingClientRect().top;
+      let nearest = SHEET_STATES[0];
+      for (const s of SHEET_STATES) {
+        if (Math.abs(sheetTopFor(s) - top) < Math.abs(sheetTopFor(nearest) - top)) {
+          nearest = s;
+        }
+      }
+      setSheetState(nearest);
+      lastDragEnd = Date.now();
+    }
+    sidebar.classList.remove("dragging");
+    startY = null;
+    pointerId = null;
+    dragging = false;
+  }
+
+  for (const el of [handle, header]) {
+    el.addEventListener("pointerdown", onPointerDown);
+    // After a real drag, swallow the trailing click so buttons under the
+    // finger don't fire.
+    el.addEventListener(
+      "click",
+      (e) => {
+        if (recentDrag()) {
+          e.stopPropagation();
+          e.preventDefault();
+        }
+      },
+      true,
+    );
+  }
+  // Moves and releases land on the document: a fast mouse drag leaves the
+  // handle before its next pointermove fires, and touch pointers are
+  // implicitly captured anyway. The handlers no-op unless a press is active.
+  document.addEventListener("pointermove", onPointerMove);
+  document.addEventListener("pointerup", onPointerEnd);
+  document.addEventListener("pointercancel", onPointerEnd);
+
+  // A plain tap on the handle cycles through the snap states.
+  handle.addEventListener("click", () => {
+    if (!isMobileLayout() || recentDrag()) return;
+    const next = { peek: "half", half: "full", full: "peek" };
+    setSheetState(next[sidebar.dataset.sheet] || "half");
+  });
+
+  // Filters overlay open/close. The overlay fills the sheet (the sheet's
+  // transform makes it the containing block), so expand to full first.
+  document.getElementById("filters-button").addEventListener("click", () => {
+    setSheetState("full");
+    document.body.classList.add("filters-open");
+  });
+  for (const btn of document.querySelectorAll(".filters-done")) {
+    btn.addEventListener("click", () =>
+      document.body.classList.remove("filters-open"),
+    );
+  }
+
+  // Leaving the mobile layout: drop sheet/overlay state so desktop is clean.
+  mobileLayout.addEventListener("change", () => {
+    if (!isMobileLayout()) {
+      sidebar.style.transform = "";
+      sidebar.classList.remove("dragging");
+      document.body.classList.remove("filters-open");
+    }
+  });
+}
+
+// Badge on the mobile Filters button showing how many filters are active
+// (i.e. differ from their default) in the current view.
+function updateFilterBadge() {
+  const badge = document.getElementById("filter-badge");
+  let count = 0;
+
+  if (currentView === "venues") {
+    if (parseInt(document.getElementById("slider-min").value) > 0) count++;
+    else if (parseInt(document.getElementById("slider-max").value) < 3) count++;
+    if (document.getElementById("district-filter").value) count++;
+    if (document.getElementById("activity-filter").value) count++;
+    if (document.getElementById("plus-filter").checked) count++;
+    if (document.getElementById("coords-filter").checked) count++;
+    if (document.getElementById("search-filter").value.trim()) count++;
+  } else {
+    const timeMin = parseInt(document.getElementById("time-slider-min").value);
+    const timeMax = parseInt(document.getElementById("time-slider-max").value);
+    if (timeMin > TIME_MIN_INDEX || timeMax < TIME_MAX_INDEX) count++;
+    if (courseStartDate && (courseStartDate !== todayIso() || courseEndDate !== courseStartDate)) count++;
+    if (document.getElementById("category-filter").value) count++;
+    if (document.getElementById("course-spots-filter").checked) count++;
+    if (document.getElementById("course-plus-filter").checked) count++;
+    if (document.getElementById("course-search-filter").value.trim()) count++;
+  }
+
+  badge.textContent = count;
+  badge.hidden = count === 0;
+}
+
+// Must stay at the end of the file: init() runs immediately and touches
+// top-level const bindings (e.g. mobileLayout) that only exist once the
+// whole script has been evaluated.
+init();
