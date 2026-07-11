@@ -12,6 +12,8 @@ USC API (api.urbansportsclub.com)  →  FastAPI backend (proxy + cache + transfo
 
 The backend (`server.py`) fetches venue, course, and city data from the USC API, transforms it into the frontend's expected format, and caches everything in a single SQLite database, `backend/cache/usc.db` (`storage.py`; TTLs: venues 24h, venue details 7d, courses 48h, cities/categories 7d). Venue details (visit limits) are enriched by a background task after a city's venues are first fetched. There is no static-data fallback — if the backend is down, the frontend shows an error.
 
+The frontend keeps its own in-memory cache of what it has loaded (`loadedVenueCities`, `loadedCourseCities` in `app.js`), with a soft TTL of 60 min (`CLIENT_CACHE_TTL_MS`): panning back to a city (or re-selecting a date) past the TTL re-fetches and *replaces* that city's (resp. that city+date's) data instead of appending. Design doc: `docs/superpowers/specs/2026-07-11-client-cache-ttl-design.md`.
+
 ## Linting & Testing
 
 A pre-commit hook (`.git/hooks/pre-commit`) runs all checks automatically before each commit.

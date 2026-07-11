@@ -6,32 +6,11 @@ intentionally **not** scheduled into the current multi-city viewport plan
 
 ---
 
-## Client-side cache TTL and reload
+_No open items._
 
-**Context:** The multi-city frontend tracks what it has already loaded with two
-add-only structures introduced in the viewport plan — `loadedVenueCities` (a
-`Set<city_id>`) and `loadedCourseCities` (a `Map<city_id, Set<date>>`). Once a
-city (venues) or a (city, date) pair (courses) is loaded, it is never requested
-again for the lifetime of the page.
+Resolved items (see git history for full context):
 
-**Problem:** These client caches have no TTL and no invalidation. The backend
-refreshes from USC after its own TTLs (`VENUES_TTL` = 24h, `COURSES_TTL` = 48h),
-but a long-lived browser session will keep displaying whatever it first fetched,
-with no way to pull the refreshed server-side data short of a full page reload.
-This is a behavior change from the pre-multi-city app, which re-fetched
-everything on every page load.
-
-**Proposed fix:**
-- Store a fetch timestamp alongside each loaded city (venues) and each
-  (city, date) (courses) instead of a bare membership Set.
-- Treat an entry as stale past a client TTL — either mirror the server TTLs or
-  use a shorter "soft" TTL — and allow a re-fetch when the viewport or date
-  selection next touches it.
-- Consider a lightweight background refresh, or a "data may be stale — reload"
-  affordance, so the user can opt into fresh data without losing map state
-  (center/zoom, active filters).
-
-**Acceptance:** Panning back to an already-loaded city after its TTL has elapsed
-issues a fresh `/api/venues` (resp. `/api/courses`) request and the merged view
-reflects the new data; within the TTL it stays a zero-request cache hit as it is
-today.
+- **Client-side cache TTL and reload** — done; see
+  `docs/superpowers/specs/2026-07-11-client-cache-ttl-design.md`. Deliberately
+  out of scope there and still open if ever needed: background/interval
+  refresh and a "data may be stale — reload" UI affordance.

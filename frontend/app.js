@@ -10,9 +10,14 @@ let map, markerCluster, allVenues, filteredVenues;
 // Multi-city state
 let allCities = [];
 let defaultCityId = 1;
-const loadedVenueCities = new Set();
+const loadedVenueCities = new Map(); // city_id -> fetchedAt (ms epoch)
 const venueCitiesInFlight = new Set();
-const loadedCourseCities = new Map(); // city_id -> Set<date-string>
+const loadedCourseCities = new Map(); // city_id -> Map<date-string, fetchedAt (ms epoch)>
+// Soft client-side TTL. Entries older than this are re-fetched the next time
+// the viewport or date selection touches them; the refetch is normally a cheap
+// hit on the backend's own cache (server TTLs: venues 24h, courses 48h), and a
+// short client TTL bounds how stale a long-lived tab can get.
+const CLIENT_CACHE_TTL_MS = 60 * 60 * 1000;
 const MIN_FETCH_ZOOM = 9;
 // Cap on concurrent API requests so a wide viewport doesn't hammer the slow
 // upstream USC API all at once. Per-city fetches fan out up to this many at a
@@ -401,17 +406,17 @@ async function fetchCourses(viewportOnly = false) {
     return;
   }
 
-  // Decide which (city_id, date) pairs still need fetching. Viewport-driven
-  // refreshes also skip pairs an in-flight load already covers — the early
-  // return below then leaves that load's token valid, so its results still
-  // render. User-driven changes (dates, tab) intentionally refetch and
-  // supersede instead.
+  // Decide which (city_id, date) pairs still need fetching — never loaded, or
+  // loaded longer than CLIENT_CACHE_TTL_MS ago. Viewport-driven refreshes also
+  // skip pairs an in-flight load already covers — the early return below then
+  // leaves that load's token valid, so its results still render. User-driven
+  // changes (dates, tab) intentionally refetch and supersede instead.
   const missingByCity = new Map();
   for (const cid of visible) {
-    const cached = loadedCourseCities.get(cid) ?? new Set();
+    const cached = loadedCourseCities.get(cid) ?? new Map();
     const missing = dateList.filter(
       (d) =>
-        !cached.has(d) &&
+        !isFresh(cached.get(d)) &&
         !(viewportOnly && courseFetchesInFlight.has(cid + "|" + d)),
     );
     if (missing.length > 0) missingByCity.set(cid, missing);
@@ -453,7 +458,6 @@ async function fetchCourses(viewportOnly = false) {
         const spanStart = missing[0];
         const spanEnd = missing[missing.length - 1];
         const spanDays = daysBetween(spanStart, spanEnd) + 1;
-        const missingSet = new Set(missing);
         const resp = await fetch(
           `${API_BASE}/api/courses?start_date=${spanStart}&days=${spanDays}&city_ids=${cid}`,
         );
@@ -468,15 +472,22 @@ async function fetchCourses(viewportOnly = false) {
         const failedDates = new Set(
           (data.errors || []).filter((e) => e.city_id === cid).map((e) => e.date),
         );
-        const cached = loadedCourseCities.get(cid) ?? new Set();
-        for (const d of missing) {
-          if (!failedDates.has(d)) cached.add(d);
-        }
+        // Dates this response actually refreshed: the ones we asked for minus
+        // the ones the backend failed on.
+        const refreshed = new Set(missing.filter((d) => !failedDates.has(d)));
+        const cached = loadedCourseCities.get(cid) ?? new Map();
+        for (const d of refreshed) cached.set(d, Date.now());
         loadedCourseCities.set(cid, cached);
+        // Replace, don't append: a TTL refetch re-covers (city, date) pairs
+        // already in allCourses. Failed dates keep their old courses (and
+        // their stale timestamp, so the next touch retries them).
+        allCourses = allCourses.filter(
+          (c) => !(c.city_id === cid && refreshed.has(c.date)),
+        );
         // `data.cities` is always length 1 (we queried a single city).
         for (const entry of data.cities || []) {
           for (const c of entry.courses || []) {
-            if (!missingSet.has(c.date)) continue; // already loaded — skip
+            if (!refreshed.has(c.date)) continue; // already fresh or failed — skip
             c.city_id = entry.city_id;
             allCourses.push(c);
           }
@@ -768,6 +779,13 @@ function citiesInViewport(viewport) {
   return matches.map((m) => m.id);
 }
 
+// A cache entry is fresh if it was fetched within CLIENT_CACHE_TTL_MS.
+// `fetchedAt` is undefined for never-loaded entries, so this covers both
+// "missing" and "stale" with one check.
+function isFresh(fetchedAt) {
+  return fetchedAt != null && Date.now() - fetchedAt < CLIENT_CACHE_TTL_MS;
+}
+
 async function fetchVenuesForCities(cityIds) {
   const query = cityIds.map((id) => `city_ids=${id}`).join("&");
   const resp = await fetch(`${API_BASE}/api/venues?${query}`);
@@ -781,7 +799,16 @@ function mergeVenuesResponse(data) {
     tierConfig = data.tier_config;
   }
   for (const cityEntry of data.cities || []) {
-    loadedVenueCities.add(cityEntry.city_id);
+    loadedVenueCities.set(cityEntry.city_id, Date.now());
+    // Replace, don't append: a TTL refetch re-covers a city that is already in
+    // allVenues. Dropping the old copies (and their lazily-fetched detail
+    // flags, so visit limits refetch on next popup open) keeps one venue
+    // object per (city, venue).
+    allVenues = allVenues.filter((v) => {
+      if (v.city_id !== cityEntry.city_id) return true;
+      venueDetailFetched.delete(v.address_id);
+      return false;
+    });
     for (const venue of cityEntry.venues || []) {
       // Venue ids are unique per city; tag with city_id for dedupe.
       venue.city_id = cityEntry.city_id;
@@ -819,7 +846,7 @@ async function onMapViewportChange() {
 
   const visible = citiesInViewport(map.getBounds());
   const needed = visible.filter(
-    (id) => !loadedVenueCities.has(id) && !venueCitiesInFlight.has(id),
+    (id) => !isFresh(loadedVenueCities.get(id)) && !venueCitiesInFlight.has(id),
   );
 
   if (needed.length > 0) {
