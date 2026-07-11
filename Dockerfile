@@ -2,9 +2,15 @@ FROM ghcr.io/astral-sh/uv:python3.11-bookworm-slim
 
 WORKDIR /app
 
+# Compile .pyc at install time for faster startup; copy (not hardlink)
+# out of the build-cache mount since it lives on a different filesystem
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy
+
 # Install dependencies first (layer caching)
 COPY backend/pyproject.toml backend/uv.lock ./backend/
-RUN cd backend && uv sync --frozen --no-dev
+RUN --mount=type=cache,target=/root/.cache/uv \
+    cd backend && uv sync --frozen --no-dev
 
 # Copy application code
 COPY backend/ ./backend/
