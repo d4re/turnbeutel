@@ -57,6 +57,8 @@ VENUE_PAGE_BATCH = 5
 MAX_CONCURRENT_VENUE_FETCHES = 3
 # Must cover the frontend's date strip (today .. today+13 = 14 days).
 MAX_COURSE_DAYS = 14
+COURSE_PAGE_BATCH = 5
+MAX_COURSE_PAGES = 50
 
 CACHE_DIR = Path(__file__).parent / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
@@ -414,10 +416,15 @@ async def fetch_courses_for_date(
     client: httpx.AsyncClient,
     semaphore: asyncio.Semaphore,
 ) -> list[Course]:
-    """Fetch all courses for a single date from USC (no caching — the caller handles storage)."""
-    all_raw: list[dict] = []
-    page = 1
-    while True:
+    """Fetch all courses for a single date from USC (no caching — the caller handles storage).
+
+    Pages are fetched speculatively COURSE_PAGE_BATCH at a time until a short
+    page signals the end (capped at MAX_COURSE_PAGES). The shared semaphore
+    still bounds total concurrency toward USC, so overlapping batches never
+    exceed the global request limit.
+    """
+
+    async def fetch_page(page: int) -> list[dict]:
         async with semaphore:
             resp = await client.get(
                 f"{USC_API}/courses",
@@ -431,15 +438,21 @@ async def fetch_courses_for_date(
             )
         resp.raise_for_status()
         data = resp.json().get("data") or {}
-        classes = data.get("classes") or []
-        if not classes:
+        return data.get("classes") or []
+
+    all_raw: list[dict] = []
+    page = 1
+    while page <= MAX_COURSE_PAGES:
+        batch = await asyncio.gather(*[fetch_page(p) for p in range(page, page + COURSE_PAGE_BATCH)])
+        done = False
+        for classes in batch:
+            all_raw.extend(classes)
+            if len(classes) < PAGE_SIZE:
+                done = True
+                break
+        if done:
             break
-        all_raw.extend(classes)
-        if len(classes) < PAGE_SIZE:
-            break
-        page += 1
-        if page > 50:
-            break
+        page += COURSE_PAGE_BATCH
 
     # USC occasionally returns the same course_id twice in a single day's payload
     # (observed: byte-identical duplicates). Dedupe at the source so both the

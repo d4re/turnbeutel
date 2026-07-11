@@ -358,6 +358,68 @@ def test_transform_course_plus_and_online_flags():
     assert result.is_plus is True
 
 
+# ── fetch_courses_for_date ──────────────────────────────────────────────────
+
+
+def test_fetch_courses_for_date_fetches_pages_concurrently():
+    """A day with many pages must be fetched in parallel batches, not one page
+    at a time — serial pagination made big cities take ~14 round trips."""
+    import asyncio
+
+    import httpx
+
+    in_flight = 0
+    max_in_flight = 0
+    # 6 full pages + 1 short page = 650 courses.
+    page_sizes = {1: 100, 2: 100, 3: 100, 4: 100, 5: 100, 6: 100, 7: 50}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal in_flight, max_in_flight
+        page = int(request.url.params["page"])
+        in_flight += 1
+        max_in_flight = max(max_in_flight, in_flight)
+        await asyncio.sleep(0.01)
+        in_flight -= 1
+        n = page_sizes.get(page, 0)
+        classes = [_make_raw_course(id=(page * 1000 + i)) for i in range(n)]
+        return httpx.Response(200, json={"data": {"classes": classes}})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await server.fetch_courses_for_date("2026-04-05", 1, client, asyncio.Semaphore(5))
+
+    courses = asyncio.run(run())
+
+    assert len(courses) == 650
+    assert len({c.id for c in courses}) == 650
+    # With serial pagination max_in_flight is 1; batched fetching overlaps pages.
+    assert max_in_flight > 1
+
+
+def test_fetch_courses_for_date_single_short_page():
+    """A single short page must not trigger extra page requests beyond the first batch."""
+    import asyncio
+
+    import httpx
+
+    requested_pages: list[int] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        requested_pages.append(page)
+        classes = [_make_raw_course(id=i) for i in range(3)] if page == 1 else []
+        return httpx.Response(200, json={"data": {"classes": classes}})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await server.fetch_courses_for_date("2026-04-05", 1, client, asyncio.Semaphore(5))
+
+    courses = asyncio.run(run())
+    assert len(courses) == 3
+    # Speculative fetching may cover the first batch, but must stop there.
+    assert max(requested_pages) <= 5
+
+
 # ── Server endpoint fixtures ───────────────────────────────────────────────
 
 
