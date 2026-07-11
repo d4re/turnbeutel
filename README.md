@@ -29,6 +29,13 @@ Build and run as a container:
 docker compose up --build
 ```
 
+Or run the prebuilt image published by CI (defaults to the `main` tag; override with `IMAGE_TAG`):
+
+```bash
+docker compose -f docker-compose.prod.yml up -d
+IMAGE_TAG=v1.0.0 docker compose -f docker-compose.prod.yml up -d
+```
+
 The app is available at **http://localhost:8000**. Venue cache is persisted in a Docker volume across restarts.
 
 ### Manual start (without make)
@@ -72,7 +79,8 @@ frontend/
 data/                   # Historical scraped snapshots (gitignored, not used by the app)
 
 Dockerfile              # Production container image
-docker-compose.yml      # Single-command container deployment
+docker-compose.yml      # Single-command container deployment (local build)
+docker-compose.prod.yml # Same, but pulls the CI-published image from ghcr.io
 Makefile                # Local dev shortcuts (serve, test, lint, clean)
 ```
 

@@ -10,7 +10,7 @@ data/
 docs/
 Makefile
 Dockerfile
-docker-compose.yml
+docker-compose*.yml
 .dockerignore
 **/__pycache__/
 **/.pytest_cache/
