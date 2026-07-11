@@ -11,6 +11,7 @@ let map, markerCluster, allVenues, filteredVenues;
 let allCities = [];
 let defaultCityId = 1;
 const loadedVenueCities = new Set();
+const venueCitiesInFlight = new Set();
 const loadedCourseCities = new Map(); // city_id -> Set<date-string>
 const MIN_FETCH_ZOOM = 9;
 // Cap on concurrent API requests so a wide viewport doesn't hammer the slow
@@ -695,6 +696,17 @@ function mergeVenuesResponse(data) {
   applyFilters();
 }
 
+function showVenueLoadingState() {
+  if (currentView !== "venues") return;
+  document.getElementById("stats").textContent = "Loading venues...";
+  // Don't wipe an already-populated list — only show the placeholder when
+  // there is nothing to display yet.
+  if (allVenues.length === 0) {
+    document.getElementById("venue-list").innerHTML =
+      '<div class="loading">Loading venues...</div>';
+  }
+}
+
 async function onMapViewportChange() {
   saveLastView();
   const zoom = map.getZoom();
@@ -707,15 +719,28 @@ async function onMapViewportChange() {
   hideCityPins();
 
   const visible = citiesInViewport(map.getBounds());
-  const needed = visible.filter((id) => !loadedVenueCities.has(id));
+  const needed = visible.filter(
+    (id) => !loadedVenueCities.has(id) && !venueCitiesInFlight.has(id),
+  );
 
   if (needed.length > 0) {
-    try {
-      const data = await fetchVenuesForCities(needed);
-      mergeVenuesResponse(data);
-    } catch (err) {
-      console.warn("Venue fetch failed", err);
-    }
+    for (const id of needed) venueCitiesInFlight.add(id);
+    showVenueLoadingState();
+    // One request per city so an already-cached city renders as soon as its
+    // response arrives instead of waiting on the slowest cold city in the
+    // viewport (each merge re-renders incrementally).
+    await mapWithConcurrency(needed, MAX_CONCURRENT_REQUESTS, async (cid) => {
+      try {
+        const data = await fetchVenuesForCities([cid]);
+        mergeVenuesResponse(data);
+      } catch (err) {
+        console.warn("Venue fetch failed for city", cid, err);
+      } finally {
+        venueCitiesInFlight.delete(cid);
+      }
+    });
+    // Re-render once more so a fully failed load clears the loading state.
+    if (currentView === "venues") applyFilters();
   } else if (currentView === "venues") {
     applyFilters();
   }
