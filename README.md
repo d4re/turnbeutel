@@ -79,7 +79,8 @@ frontend/
 data/                   # Historical scraped snapshots (gitignored, not used by the app)
 
 Dockerfile              # Production container image
-docker-compose.yml      # Single-command container deployment
+docker-compose.yml      # Single-command container deployment (local build)
+docker-compose.prod.yml # Same, but pulls the CI-published image from ghcr.io
 Makefile                # Local dev shortcuts (serve, test, lint, clean)
 ```
 
