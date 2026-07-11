@@ -331,12 +331,15 @@ async def fetch_all_cities() -> list[dict]:
     return data or []
 
 
-async def fetch_all_venue_pages(usc_city_id: int) -> list[dict]:
+async def fetch_all_venue_pages(usc_city_id: int, expected_count: int | None = None) -> list[dict]:
     """Fetch all venue pages from the USC API in bounded batches.
 
-    Pages are fetched VENUE_PAGE_BATCH at a time until a short page signals the
-    end (capped at MAX_VENUE_PAGES as a runaway guard). A failed page raises so
-    a venue list with a silent gap is never cached.
+    When `expected_count` (the city's venueAddressCount from /cities) is known,
+    exactly the expected pages are enqueued upfront — page 1 no longer costs a
+    lone discovery round trip. Discovery batches of VENUE_PAGE_BATCH still
+    follow if the city grew past the cached count (or when the count is
+    unknown), capped at MAX_VENUE_PAGES as a runaway guard. A failed page
+    raises so a venue list with a silent gap is never cached.
     """
     async with httpx.AsyncClient(headers=USC_HEADERS, timeout=30) as client:
 
@@ -348,11 +351,27 @@ async def fetch_all_venue_pages(usc_city_id: int) -> list[dict]:
             resp.raise_for_status()
             return resp.json().get("data", [])
 
-        all_venues = await fetch_page(1)
-        if len(all_venues) < PAGE_SIZE:
-            return all_venues
+        all_venues: list[dict] = []
 
-        page = 2
+        if expected_count and expected_count > 0:
+            expected_pages = min(-(-expected_count // PAGE_SIZE), MAX_VENUE_PAGES)
+            page = 1
+            while page <= expected_pages:
+                batch_end = min(page + VENUE_PAGE_BATCH, expected_pages + 1)
+                batch = await asyncio.gather(*[fetch_page(p) for p in range(page, batch_end)])
+                for data in batch:
+                    all_venues.extend(data)
+                    if len(data) < PAGE_SIZE:
+                        return all_venues
+                page = batch_end
+        else:
+            all_venues = await fetch_page(1)
+            if len(all_venues) < PAGE_SIZE:
+                return all_venues
+            page = 2
+
+        # Discovery: the expected count was stale (or unknown) — keep fetching
+        # batches until a short page appears.
         while page <= MAX_VENUE_PAGES:
             batch = await asyncio.gather(*[fetch_page(p) for p in range(page, page + VENUE_PAGE_BATCH)])
             for data in batch:
@@ -554,7 +573,7 @@ async def _load_venues_for_city(city_id: int) -> CityVenuesEntry | None:
             # were queued on the semaphore.
             payload = _fresh_cached_payload(city_id)
             if payload is None:
-                raw_venues = await fetch_all_venue_pages(usc_city_id=city_id)
+                raw_venues = await fetch_all_venue_pages(usc_city_id=city_id, expected_count=city.venue_address_count)
                 venues = [transform_venue(v) for v in raw_venues]
                 venues = [v for v in venues if v.name and (v.tiers_private or v.tiers_corporate)]
                 venues.sort(key=lambda v: v.name)

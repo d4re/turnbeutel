@@ -358,6 +358,83 @@ def test_transform_course_plus_and_online_flags():
     assert result.is_plus is True
 
 
+# ── fetch_all_venue_pages ───────────────────────────────────────────────────
+
+
+def _raw_venue_page(page: int, n: int) -> list[dict]:
+    return [
+        {
+            "name": f"Venue {page}-{i}",
+            "urlSlug": f"venue-{page}-{i}",
+            "planTypes": ["S"],
+            "planTypesB2B": ["S"],
+            "categories": [],
+            "ratings": {},
+            "id": page * 1000 + i,
+            "location": {"latitude": 52.5, "longitude": 13.4},
+            "isOnline": 0,
+            "isPlusCheckin": 0,
+        }
+        for i in range(n)
+    ]
+
+
+def _run_fetch_all_venue_pages(page_sizes: dict[int, int], expected_count=None, record=None):
+    """Drive fetch_all_venue_pages against a mock USC with the given page sizes."""
+    import asyncio
+
+    import httpx
+
+    state = {"in_flight": 0, "max_in_flight": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        if record is not None:
+            record.append(page)
+        state["in_flight"] += 1
+        state["max_in_flight"] = max(state["max_in_flight"], state["in_flight"])
+        await asyncio.sleep(0.01)
+        state["in_flight"] -= 1
+        return httpx.Response(200, json={"data": _raw_venue_page(page, page_sizes.get(page, 0))})
+
+    async def run():
+        transport = httpx.MockTransport(handler)
+        real_client = httpx.AsyncClient
+
+        def patched_client(**kwargs):
+            kwargs["transport"] = transport
+            return real_client(**kwargs)
+
+        import unittest.mock
+
+        with unittest.mock.patch.object(httpx, "AsyncClient", patched_client):
+            return await server.fetch_all_venue_pages(1, expected_count=expected_count)
+
+    venues = asyncio.run(run())
+    return venues, state["max_in_flight"]
+
+
+def test_fetch_all_venue_pages_known_count_fetches_exact_pages_in_one_round():
+    """With venueAddressCount known (230 -> 3 pages), all pages are requested
+    together and no speculative pages beyond the expected ones are fetched."""
+    record: list[int] = []
+    venues, max_in_flight = _run_fetch_all_venue_pages({1: 100, 2: 100, 3: 30}, expected_count=230, record=record)
+    assert len(venues) == 230
+    assert sorted(record) == [1, 2, 3]  # no wasted requests past page 3
+    assert max_in_flight == 3  # page 1 fetched together with 2 and 3
+
+
+def test_fetch_all_venue_pages_stale_count_still_fetches_everything():
+    """If the city grew past the cached venueAddressCount, discovery continues."""
+    venues, _ = _run_fetch_all_venue_pages({1: 100, 2: 20}, expected_count=100)
+    assert len(venues) == 120
+
+
+def test_fetch_all_venue_pages_no_count_falls_back_to_discovery():
+    venues, _ = _run_fetch_all_venue_pages({1: 100, 2: 50}, expected_count=None)
+    assert len(venues) == 150
+
+
 # ── fetch_courses_for_date ──────────────────────────────────────────────────
 
 
@@ -541,7 +618,7 @@ def test_get_venues_requires_city_ids(seeded_client):
 def test_get_venues_multi_city_grouped(seeded_client, monkeypatch):
     calls: list[int] = []
 
-    async def fake_fetch(usc_city_id: int):
+    async def fake_fetch(usc_city_id: int, expected_count=None):
         calls.append(usc_city_id)
         if usc_city_id == 1:
             return [
@@ -595,7 +672,7 @@ def test_get_venues_multi_city_grouped(seeded_client, monkeypatch):
 def test_get_venues_second_call_is_cached(seeded_client, monkeypatch):
     calls: list[int] = []
 
-    async def fake_fetch(usc_city_id: int):
+    async def fake_fetch(usc_city_id: int, expected_count=None):
         calls.append(usc_city_id)
         return [
             {
@@ -628,7 +705,7 @@ def test_get_venues_second_call_is_cached(seeded_client, monkeypatch):
 def test_large_responses_are_gzip_compressed(seeded_client, monkeypatch):
     """Venue payloads run to megabytes; the server must honor Accept-Encoding: gzip."""
 
-    async def fake_fetch(usc_city_id: int):
+    async def fake_fetch(usc_city_id: int, expected_count=None):
         return [
             {
                 "name": f"Studio {i}",
