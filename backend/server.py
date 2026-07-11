@@ -131,7 +131,7 @@ async def lifespan(app: FastAPI):
     storage.close()
 
 
-app = FastAPI(title="USC Venue Explorer API", lifespan=lifespan)
+app = FastAPI(title="Turnbeutel API", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 

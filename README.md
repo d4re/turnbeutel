@@ -1,4 +1,4 @@
-# USC Venue Explorer
+# Turnbeutel
 
 An interactive map app that shows Urban Sports Club venues and courses, filterable by membership type (Corporate / Private) and tier level. Built to answer: *"What venues would I gain or lose by changing my membership tier?"* Venues load per city as you pan the map — any USC city works, Berlin is just the default view.
 
@@ -92,3 +92,7 @@ The backend exposes:
 All fetched data (cities, venues, venue details, courses, categories) is cached in a single SQLite database, `backend/cache/usc.db`. The cache survives server restarts. To force a refresh, delete the database (`make clean` or `rm backend/cache/usc.db*`) and restart the backend.
 
 When running via Docker, the cache is stored in a named volume (`venue-cache`) and persists across container rebuilds.
+
+## License
+
+[MIT](LICENSE)

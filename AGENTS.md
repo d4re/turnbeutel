@@ -1,4 +1,4 @@
-# Agent Guide: USC Venue Explorer
+# Agent Guide: Turnbeutel
 
 Design decisions and things to know when working on this project.
 
