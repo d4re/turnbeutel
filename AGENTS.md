@@ -4,13 +4,13 @@ Design decisions and things to know when working on this project.
 
 ## Architecture Overview
 
-This is a two-part app: a Python FastAPI backend that proxies the USC API, and a vanilla JS frontend that displays venues on a map.
+This is a two-part app: a Python FastAPI backend that proxies the USC API, and a vanilla JS frontend that displays venues and courses on a map. The app is multi-city: the frontend loads whichever cities intersect the current map viewport.
 
 ```
 USC API (api.urbansportsclub.com)  →  FastAPI backend (proxy + cache + transform)  →  Vanilla JS frontend (Leaflet map)
 ```
 
-The backend fetches venue data from the USC API, transforms it into the frontend's expected format, and caches results to disk (24h for venues, 7 days for details). The frontend falls back to a static `data/venues_final.json` if the backend is unavailable.
+The backend (`server.py`) fetches venue, course, and city data from the USC API, transforms it into the frontend's expected format, and caches everything in a single SQLite database, `backend/cache/usc.db` (`storage.py`; TTLs: venues 24h, venue details 7d, courses 48h, cities/categories 7d). Venue details (visit limits) are enriched by a background task after a city's venues are first fetched. There is no static-data fallback — if the backend is down, the frontend shows an error.
 
 ## Linting & Testing
 
@@ -18,14 +18,14 @@ A pre-commit hook (`.git/hooks/pre-commit`) runs all checks automatically before
 
 ### Backend (Python)
 - **Linter/formatter**: Ruff — configured in `backend/pyproject.toml`
-- **Tests**: Pytest — outcome-based tests in `backend/test_server.py`
+- **Tests**: Pytest — outcome-based tests in `backend/test_server.py` (pure functions + endpoints) and `backend/test_storage.py` (SQLite layer)
 - Install dev dependencies: `cd backend && uv sync --group dev`
 - Run manually:
   ```bash
   cd backend
   uv run ruff check .
   uv run ruff format --check .
-  uv run pytest test_server.py -v
+  uv run pytest -v
   ```
 
 ### Frontend (JavaScript)
@@ -68,7 +68,10 @@ Vanilla HTML + JS + CSS. Leaflet.js and MarkerCluster loaded from CDN. No bundle
 
 ### Rate limiting
 
-The backend uses `asyncio.Semaphore(5)` for concurrent API calls and fetches details in batches of 50. Don't increase concurrency — USC could start blocking.
+All concurrency toward USC is deliberately bounded — don't increase it, USC could start blocking:
+- Venue pages are fetched in batches of `VENUE_PAGE_BATCH` (5) per city, and at most `MAX_CONCURRENT_VENUE_FETCHES` (3) cities fetch live at once.
+- Background detail enrichment and course fetches each use `asyncio.Semaphore(5)`.
+- The frontend caps its own fan-out at `MAX_CONCURRENT_REQUESTS` (5) per-city requests.
 
 ### Coordinate gaps
 
@@ -76,7 +79,18 @@ The backend uses `asyncio.Semaphore(5)` for concurrent API calls and fetches det
 
 ## Data Schema
 
-Each venue (as returned by `GET /api/venues`) has:
+`GET /api/venues?city_ids=1&city_ids=2` returns a city-grouped payload:
+
+```json
+{
+  "tier_config": { "private": { "..." : "..." }, "corporate": { "..." : "..." } },
+  "cities": [
+    { "city_id": 1, "city_name": "Berlin", "total": 1931, "venues": ["..."] }
+  ]
+}
+```
+
+Each venue in `venues` has:
 
 ```json
 {
@@ -114,8 +128,8 @@ Run these steps before committing any changes:
    - Project structure (new top-level files or directories)
    - Quick start / deployment instructions
    - Environment requirements
-3. **Update agents.md** — If your change affects architecture, design decisions, data schema, or development workflows, update the relevant section in `agents.md` so future contributors have accurate context.
-4. **Check documentation consistency** — Ensure the README, agents.md, and any inline code comments agree with each other and with the actual code.
+3. **Update AGENTS.md** — If your change affects architecture, design decisions, data schema, or development workflows, update the relevant section in `AGENTS.md` (which `CLAUDE.md` symlinks to) so future contributors have accurate context.
+4. **Check documentation consistency** — Ensure the README, AGENTS.md, and any inline code comments agree with each other and with the actual code.
 
 ## Common Tasks
 
