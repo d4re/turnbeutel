@@ -92,16 +92,6 @@ class CourseFetchError(BaseModel):
     city_id: int | None = None
 
 
-class CoursesResponse(BaseModel):
-    """Response shape for /api/courses."""
-
-    courses: list[Course]
-    date_from: str
-    date_to: str
-    total: int
-    errors: list[CourseFetchError]
-
-
 class City(BaseModel):
     """Row in the cities table, populated from USC /cities."""
 

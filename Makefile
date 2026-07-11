@@ -15,7 +15,7 @@ serve: install
 
 ## Run backend tests
 test: install
-	cd backend && $(UV) run pytest test_server.py
+	cd backend && $(UV) run pytest
 
 ## Run all linters
 lint: install
@@ -24,4 +24,4 @@ lint: install
 
 ## Remove caches and virtual environment
 clean:
-	rm -rf backend/.venv backend/__pycache__ backend/cache/*.json
+	rm -rf backend/.venv backend/__pycache__ backend/cache/*
