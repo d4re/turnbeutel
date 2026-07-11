@@ -14,6 +14,7 @@ export default [
         setTimeout: "readonly",
         clearTimeout: "readonly",
         localStorage: "readonly",
+        getComputedStyle: "readonly",
         L: "readonly",
       },
     },
