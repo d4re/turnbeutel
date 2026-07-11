@@ -85,8 +85,13 @@ Default on load: `half`.
 - On mobile, tapping a venue/course list item first drops the sheet to `peek`,
   then pans/zooms to the marker and opens its popup; on mobile the popup's
   auto-pan padding keeps it above the peeked sheet.
-- Tapping a map pin leaves the sheet state unchanged (at peek the map is nearly
-  fully visible).
+- Any popup opening (including a direct pin tap with the sheet at half/full)
+  also drops the sheet to `peek` via a `popupopen` listener — otherwise the
+  auto-panned popup could open behind the sheet, and `half` is the default
+  state on load.
+- JS mirrors the CSS snap positions including the bottom safe-area inset,
+  which lives in a single `--safe-area-bottom` custom property that
+  `safeAreaBottom()` reads — keep both sides on it.
 
 Two pre-existing bugs made "open the popup after a list click" unreliable and
 were fixed as part of this work (they affect desktop too):
