@@ -402,10 +402,16 @@ select:focus, input[type="text"]:focus {
 }
 
 /* View tabs */
+#header-controls {
+    display: flex;
+    gap: 8px;
+    margin-top: 10px;
+}
+
 .view-tabs {
     display: flex;
+    flex: 1;
     gap: 0;
-    margin-top: 10px;
     border-radius: 6px;
     overflow: hidden;
     border: 1px solid rgba(255,255,255,0.2);
@@ -656,3 +662,190 @@ select:focus, input[type="text"]:focus {
     color: #999;
 }
 .time-slider-ticks span:first-child { color: #7d8a9a; font-style: italic; }
+
+/* ── Mobile bottom sheet (see docs/superpowers/specs/2026-07-11-mobile-bottom-sheet-design.md) ── */
+
+/* Mobile-only elements, hidden on desktop */
+#sheet-handle,
+#filters-button,
+.filters-overlay-bar {
+    display: none;
+}
+
+@media (max-width: 768px) {
+    #app {
+        display: block;
+        position: relative;
+        height: 100vh;
+        height: 100dvh;
+    }
+
+    #map-container {
+        height: 100%;
+    }
+
+    /* Keep the OSM attribution visible above the peeked sheet */
+    .leaflet-bottom {
+        margin-bottom: calc(110px + env(safe-area-inset-bottom));
+    }
+
+    /* The sidebar becomes a bottom sheet: fixed at its "full" position
+       (top 8dvh), then translated down per snap state. JS sets an inline
+       transform while dragging and a data-sheet attribute on release. */
+    #sidebar {
+        position: fixed;
+        left: 0;
+        right: 0;
+        top: 8dvh;
+        height: 92dvh;
+        width: auto;
+        min-width: 0;
+        z-index: 1100;
+        border-right: none;
+        border-radius: 14px 14px 0 0;
+        box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.25);
+        transform: translateY(var(--sheet-offset));
+        transition: transform 0.25s ease;
+        will-change: transform;
+        padding-bottom: env(safe-area-inset-bottom);
+    }
+
+    #sidebar.dragging {
+        transition: none;
+        user-select: none;
+        -webkit-user-select: none;
+    }
+
+    #sidebar[data-sheet="full"] { --sheet-offset: 0px; }
+    #sidebar[data-sheet="half"] { --sheet-offset: 42dvh; }
+    #sidebar[data-sheet="peek"] {
+        --sheet-offset: calc(92dvh - 110px - env(safe-area-inset-bottom));
+    }
+
+    /* At half, the sheet's lower part hangs below the viewport; pad the
+       lists so every item can still be scrolled into view. */
+    #sidebar[data-sheet="half"] #venue-list,
+    #sidebar[data-sheet="half"] #course-list {
+        padding-bottom: 42dvh;
+    }
+
+    #sheet-handle {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        height: 22px;
+        background: #1a1a2e;
+        border-radius: 14px 14px 0 0;
+        touch-action: none;
+        cursor: grab;
+    }
+
+    #sheet-handle span {
+        width: 36px;
+        height: 4px;
+        border-radius: 2px;
+        background: rgba(255, 255, 255, 0.45);
+    }
+
+    #sidebar-header {
+        touch-action: none;
+        padding-top: 8px;
+        user-select: none;
+        -webkit-user-select: none;
+    }
+
+    #sidebar-header h1 {
+        display: none;
+    }
+
+    #filters-button {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 12px;
+        border: 1px solid rgba(255, 255, 255, 0.35);
+        border-radius: 6px;
+        background: transparent;
+        color: white;
+        font-size: 13px;
+        font-weight: 600;
+        font-family: inherit;
+        cursor: pointer;
+    }
+
+    #filter-badge[hidden] {
+        display: none;
+    }
+
+    #filter-badge {
+        display: inline-block;
+        min-width: 18px;
+        padding: 1px 5px;
+        border-radius: 9px;
+        background: #4a90d9;
+        color: white;
+        font-size: 11px;
+        text-align: center;
+    }
+
+    /* Filter panels are hidden on mobile; opening the Filters overlay shows
+       the active view's panel full-screen. switchView() keeps the inactive
+       panel's inline display:none, which always wins over these rules. */
+    #filters,
+    #courses-filters {
+        display: none;
+    }
+
+    /* The sidebar's transform makes it the containing block, so the overlay
+       fills the sheet (JS snaps the sheet to "full" when opening filters). */
+    body.filters-open #filters,
+    body.filters-open #courses-filters {
+        display: block;
+        position: absolute;
+        inset: 0;
+        z-index: 1200;
+        overflow-y: auto;
+        border-bottom: none;
+        border-radius: 14px 14px 0 0;
+        padding: 0 16px calc(24px + env(safe-area-inset-bottom));
+    }
+
+    body.filters-open .filters-overlay-bar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin: 0 -16px 12px;
+        padding: 14px 16px;
+        background: #1a1a2e;
+        color: white;
+        font-size: 16px;
+        font-weight: 700;
+        border-radius: 14px 14px 0 0;
+        position: sticky;
+        top: 0;
+        z-index: 1;
+    }
+
+    .filters-done {
+        padding: 6px 14px;
+        border: none;
+        border-radius: 6px;
+        background: #4a90d9;
+        color: white;
+        font-size: 13px;
+        font-weight: 600;
+        font-family: inherit;
+        cursor: pointer;
+    }
+
+    /* Comfortable touch targets; 16px stops iOS from zooming into inputs */
+    select,
+    input[type="text"] {
+        padding: 10px 8px;
+        font-size: 16px;
+    }
+
+    .filter-group {
+        margin-bottom: 14px;
+    }
+}

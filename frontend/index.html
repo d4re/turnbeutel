@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>Turnbeutel</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
@@ -11,17 +11,25 @@
 </head>
 <body>
     <div id="app">
-        <aside id="sidebar">
+        <aside id="sidebar" data-sheet="half">
+            <div id="sheet-handle" aria-hidden="true"><span></span></div>
             <header id="sidebar-header">
                 <h1>Turnbeutel</h1>
-                <div class="view-tabs" id="view-tabs">
-                    <button class="view-tab active" data-view="venues">Venues</button>
-                    <button class="view-tab" data-view="courses">Courses</button>
+                <div id="header-controls">
+                    <div class="view-tabs" id="view-tabs">
+                        <button class="view-tab active" data-view="venues">Venues</button>
+                        <button class="view-tab" data-view="courses">Courses</button>
+                    </div>
+                    <button id="filters-button" type="button">Filters<span id="filter-badge" hidden></span></button>
                 </div>
                 <p id="stats"></p>
             </header>
 
             <div id="filters">
+                <div class="filters-overlay-bar">
+                    <span>Filters</span>
+                    <button type="button" class="filters-done">Done</button>
+                </div>
                 <div class="filter-group">
                     <label class="filter-label">Membership Type</label>
                     <div class="toggle-group" id="membership-toggle">
@@ -79,6 +87,10 @@
             </div>
 
             <div id="courses-filters" style="display:none">
+                <div class="filters-overlay-bar">
+                    <span>Filters</span>
+                    <button type="button" class="filters-done">Done</button>
+                </div>
                 <div class="filter-group">
                     <label class="filter-label">Date</label>
                     <div id="date-strip" class="date-strip"></div>
