@@ -20,6 +20,9 @@ const MIN_FETCH_ZOOM = 9;
 const MAX_CONCURRENT_REQUESTS = 5;
 const CENTROID_BBOX_HALF_DEG = 0.18; // ~20 km fallback until real bbox is known
 const VIEWPORT_DEBOUNCE_MS = 200;
+// List rendering is chunked: building thousands of DOM nodes at once janks the
+// main thread, so render this many items and add a "Show more" button.
+const LIST_RENDER_CHUNK = 300;
 const LAST_VIEW_KEY = "usc.lastView";
 // Time-of-day slider value domain: 0 = "Any" (no lower bound),
 // 33 = "24:00" (no upper bound), 1..32 = 08:00..23:30 in 30-min steps.
@@ -152,6 +155,8 @@ async function init() {
     maxClusterRadius: 50,
     spiderfyOnMaxZoom: true,
     disableClusteringAtZoom: 15,
+    // Insert big marker batches without blocking the main thread.
+    chunkedLoading: true,
   });
   map.addLayer(markerCluster);
 
@@ -514,9 +519,14 @@ function renderCourseList(courses) {
     container.innerHTML = '<div class="loading">No courses match your filters.</div>';
     return;
   }
+  renderCourseListChunk(container, courses, 0, "");
+}
 
-  let currentDate = "";
-  for (const course of courses) {
+function renderCourseListChunk(container, courses, start, prevDate) {
+  const end = Math.min(courses.length, start + LIST_RENDER_CHUNK);
+
+  let currentDate = prevDate;
+  for (const course of courses.slice(start, end)) {
     if (course.date !== currentDate) {
       currentDate = course.date;
       const header = document.createElement("div");
@@ -556,6 +566,12 @@ function renderCourseList(courses) {
 
     container.appendChild(item);
   }
+
+  if (end < courses.length) {
+    appendShowMore(container, courses.length - end, () =>
+      renderCourseListChunk(container, courses, end, currentDate),
+    );
+  }
 }
 
 function focusCourseVenueOnMap(course) {
@@ -586,6 +602,7 @@ function renderCourseMap(courses) {
     venueMap.get(c.venue_id).courses.push(c);
   }
 
+  const markers = [];
   for (const venueData of venueMap.values()) {
     const marker = L.circleMarker([venueData.lat, venueData.lng], {
       radius: 7,
@@ -597,8 +614,11 @@ function renderCourseMap(courses) {
     });
     marker.bindPopup(() => buildCoursePopup(venueData));
     courseMarkers.set(venueData.venue_id, marker);
-    markerCluster.addLayer(marker);
+    markers.push(marker);
   }
+  // Bulk insert: addLayers() is far faster than per-marker addLayer() because
+  // the cluster tree is rebuilt once instead of per insertion.
+  markerCluster.addLayers(markers);
 }
 
 function buildCoursePopup(venueData) {
@@ -940,12 +960,29 @@ function tierBadgeHtml(tierName) {
   return `<span class="tier-badge tier-${idx >= 0 ? idx : 0}">${esc(display)}</span>`;
 }
 
+// Append a "Show N more" button that renders the next chunk on click.
+function appendShowMore(container, remaining, renderNext) {
+  const btn = document.createElement("button");
+  btn.className = "show-more";
+  btn.textContent = `Show ${remaining} more`;
+  btn.addEventListener("click", () => {
+    btn.remove();
+    renderNext();
+  });
+  container.appendChild(btn);
+}
+
 function renderList(venues) {
   const container = document.getElementById("venue-list");
   container.innerHTML = "";
+  renderVenueListChunk(container, venues, 0);
+}
+
+function renderVenueListChunk(container, venues, start) {
+  const end = Math.min(venues.length, start + LIST_RENDER_CHUNK);
   const type = getMembershipType();
 
-  for (const venue of venues) {
+  for (const venue of venues.slice(start, end)) {
     const item = document.createElement("div");
     item.className = "venue-item";
     item.dataset.slug = venue.slug;
@@ -987,12 +1024,19 @@ function renderList(venues) {
 
     container.appendChild(item);
   }
+
+  if (end < venues.length) {
+    appendShowMore(container, venues.length - end, () =>
+      renderVenueListChunk(container, venues, end),
+    );
+  }
 }
 
 function renderMap(venues) {
   if (currentView !== "venues") return;
   markerCluster.clearLayers();
   const colors = getTierColors();
+  const markers = [];
   for (const venue of venues) {
     if (!venue.has_coordinates) continue;
 
@@ -1018,8 +1062,9 @@ function renderMap(venues) {
     });
 
     venueMarkers.set(venue, marker);
-    markerCluster.addLayer(marker);
+    markers.push(marker);
   }
+  markerCluster.addLayers(markers);
 }
 
 function buildPopup(venue) {
