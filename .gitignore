@@ -3,6 +3,7 @@ data/
 __pycache__/
 *.pyc
 .claude/
+.local/
 backend/cache/
 backend/.venv/
 frontend/node_modules/
