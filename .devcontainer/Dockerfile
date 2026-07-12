@@ -54,6 +54,14 @@ RUN ARCH=$(dpkg --print-architecture) && \
   sudo dpkg -i "git-delta_${GIT_DELTA_VERSION}_${ARCH}.deb" && \
   rm "git-delta_${GIT_DELTA_VERSION}_${ARCH}.deb"
 
+# Headless Chromium for in-sandbox verification (see .claude/skills/verify).
+# Must happen at build time: the runtime firewall blocks cdn.playwright.dev and
+# Debian mirrors. Fixed system path so any playwright-core install finds it;
+# the playwright version here must match the one used by verify scripts.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
+RUN npx --yes playwright@1.61.1 install --with-deps chromium && \
+  chmod -R a+rX /opt/pw-browsers
+
 # Set up non-root user
 USER node
 

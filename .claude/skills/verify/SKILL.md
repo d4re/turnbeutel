@@ -19,39 +19,25 @@ The USC upstream API is reachable from this sandbox, so live venue/course data
 works. First venue fetch per city takes a few seconds; cached in
 `backend/cache/usc.db` afterwards.
 
-## Headless browser (sandbox has no browser and blocks the Playwright CDN)
+## Headless browser
 
-Egress allowlist: npm registry and USC API work; `cdn.playwright.dev`,
-`unpkg.com`, Debian mirrors, and OSM tiles are all BLOCKED. Recipe that works:
+Chromium is baked into the devcontainer image at `$PLAYWRIGHT_BROWSERS_PATH`
+(/opt/pw-browsers). Install the matching client in the scratchpad and launch —
+the version must match the image's pinned browser build:
 
 ```bash
-cd <scratchpad>
-npm i playwright-core @sparticuz/chromium leaflet@1.9.4 leaflet.markercluster@1.5.3
-# @sparticuz/chromium ships the browser inside the npm tarball, but its
-# NSS libs only auto-extract on Amazon Linux. Extract them manually:
-mkdir al2023 && cd al2023
-node -e "const fs=require('fs'),z=require('zlib');fs.writeFileSync('al2023.tar',z.brotliDecompressSync(fs.readFileSync('../node_modules/@sparticuz/chromium/bin/al2023.tar.br')))"
-tar xf al2023.tar   # yields lib/libnss3.so etc.
+cd <scratchpad> && npm i playwright-core@1.61.1
 ```
-
-Launch from Node with:
 
 ```js
-const { chromium: pw } = require("playwright-core");
-const chromium = require("@sparticuz/chromium");
-const browser = await pw.launch({
-  executablePath: await chromium.executablePath(), // extracts to /tmp/chromium
-  args: chromium.args,
-});
+const { chromium } = require("playwright-core");
+const browser = await chromium.launch(); // finds the preinstalled browser
 ```
 
-and run the script with `LD_LIBRARY_PATH=<scratchpad>/al2023/lib node script.js`.
-
-Because unpkg + OSM are blocked, intercept in Playwright: serve
-`https://unpkg.com/leaflet@.../dist/*` and `leaflet.markercluster@.../dist/*`
-from the locally installed npm packages via `page.route`, and fulfill
-`https://*.tile.openstreetmap.org/**` with a 1px PNG (map background renders
-gray — markers/clusters still work).
+Leaflet and markercluster are served locally from `frontend/vendor/`, so no
+request interception is needed for them. Only OSM tiles are firewalled:
+fulfill `https://*.tile.openstreetmap.org/**` with a 1px PNG via `page.route`
+(map background renders gray — markers/clusters still work).
 
 ## Flows worth driving
 
@@ -66,5 +52,6 @@ gray — markers/clusters still work).
 ## Gotchas
 
 - `init()` must stay the last statement in `app.js` (TDZ on top-level consts).
-- `frontend/` needs `npm install` once before `npx eslint app.js`.
+- `frontend/node_modules` (eslint) is installed by the devcontainer
+  postCreateCommand; if missing, `npm ci --prefix frontend`.
 - The pre-commit hook runs backend tests + lint via `make`.
