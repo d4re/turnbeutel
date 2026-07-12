@@ -225,6 +225,7 @@ function initCoursesView() {
   document.getElementById("category-filter").addEventListener("change", applyCourseFilters);
   document.getElementById("course-spots-filter").addEventListener("change", applyCourseFilters);
   document.getElementById("course-plus-filter").addEventListener("change", applyCourseFilters);
+  document.getElementById("course-online-filter").addEventListener("change", applyCourseFilters);
   document.getElementById("course-search-filter").addEventListener("input", applyCourseFilters);
 
   initTimeSlider();
@@ -533,16 +534,25 @@ function applyCourseFilters() {
   const category = document.getElementById("category-filter").value;
   const spotsOnly = document.getElementById("course-spots-filter").checked;
   const plusOnly = document.getElementById("course-plus-filter").checked;
+  const showOnline = document.getElementById("course-online-filter").checked;
   const search = document.getElementById("course-search-filter").value.toLowerCase();
   // Only show courses within the currently selected date range.
   const startDate = courseStartDate;
   const endDate = courseEndDate || courseStartDate;
+  // Courses that already started are hidden; a course starting this exact
+  // minute is still shown. Re-runs on every interaction, so the cutoff
+  // moves forward with the clock.
+  const today = todayIso();
+  const now = new Date();
+  const nowMinutes = now.getHours() * 60 + now.getMinutes();
 
   filteredCourses = allCourses.filter((c) => {
     if (c.date < startDate || c.date > endDate) return false;
 
     const startMin = startTimeToMinutes(c.start_time);
     if (startMin === null || startMin < timeLower || startMin > timeUpper) return false;
+    if (c.date < today || (c.date === today && startMin < nowMinutes)) return false;
+    if (!showOnline && c.is_online) return false;
     if (category && c.category !== category) return false;
     if (spotsOnly && !(c.free_spots && c.free_spots > 0)) return false;
     if (plusOnly && !c.is_plus) return false;
@@ -1561,6 +1571,7 @@ function updateFilterBadge() {
     if (document.getElementById("category-filter").value) count++;
     if (document.getElementById("course-spots-filter").checked) count++;
     if (document.getElementById("course-plus-filter").checked) count++;
+    if (document.getElementById("course-online-filter").checked) count++;
     if (document.getElementById("course-search-filter").value.trim()) count++;
   }
 
