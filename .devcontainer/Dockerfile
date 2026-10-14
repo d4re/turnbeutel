@@ -1,4 +1,4 @@
-FROM node:20
+FROM node:24-bookworm
 
 ARG TZ
 ENV TZ="$TZ"
@@ -59,7 +59,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
 # Debian mirrors. Fixed system path so any playwright-core install finds it;
 # the playwright version here must match the one used by verify scripts.
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
-RUN npx --yes playwright@1.61.1 install --with-deps chromium && \
+RUN npx --yes playwright@1.64.0 install --with-deps chromium && \
   chmod -R a+rX /opt/pw-browsers
 
 # Set up non-root user

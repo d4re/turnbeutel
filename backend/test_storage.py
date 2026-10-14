@@ -379,6 +379,36 @@ def test_concurrent_writes_do_not_corrupt(db):
         assert detail.description == f"desc-{i}"
 
 
+def test_concurrent_reads_do_not_raise(db):
+    # The connection is shared across threadpool workers; unserialized reads
+    # raised sqlite3.InterfaceError ("bad parameter or other API misuse") on
+    # Python 3.14.
+    db.upsert_cities([make_city(1)], fetched_at=1000.0)
+    venues = [make_venue(f"v{i}") for i in range(50)]
+    db.upsert_venues(city_id=1, venues=venues, fetched_at=1000.0, total=50, with_coords=50)
+    db.upsert_courses_for_date(1, "2026-04-10", [make_course(i) for i in range(50)], fetched_at=1000.0)
+
+    errors: list[Exception] = []
+
+    def worker() -> None:
+        try:
+            for _ in range(100):
+                assert db.get_venues_payload(1) is not None
+                assert len(db.get_courses_for_dates(1, ["2026-04-10"])["2026-04-10"]) == 50
+                db.get_course_fetches(1, ["2026-04-10"])
+                db.get_venues_fetched_at(1)
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+
+
 # ── 18. Pydantic rehydration ────────────────────────────────────────────────
 
 

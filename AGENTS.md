@@ -81,6 +81,10 @@ All concurrency toward USC is deliberately bounded — don't increase it, USC co
 - Background detail enrichment and course fetches each use `asyncio.Semaphore(5)`.
 - The frontend caps its own fan-out at `MAX_CONCURRENT_REQUESTS` (5) per-city requests.
 
+### SQLite access is serialized
+
+`storage.py` shares one connection across all threadpool workers, so every access — reads included — must hold `storage._lock` (use the `_fetchone` / `_fetchall` helpers). Unlocked concurrent reads raised `sqlite3.InterfaceError: bad parameter or other API misuse` on Python 3.14.
+
 ### Coordinate gaps
 
 ~13 out of 1,931 venues had no coordinates. These show in the venue list but not on the map. The `has_coordinates` field tracks this.

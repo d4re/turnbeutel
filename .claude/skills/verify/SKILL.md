@@ -26,7 +26,7 @@ Chromium is baked into the devcontainer image at `$PLAYWRIGHT_BROWSERS_PATH`
 the version must match the image's pinned browser build:
 
 ```bash
-cd <scratchpad> && npm i playwright-core@1.61.1
+cd <scratchpad> && npm i playwright-core@1.64.0
 ```
 
 ```js

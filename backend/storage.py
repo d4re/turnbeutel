@@ -2,7 +2,8 @@
 
 All public functions are synchronous. FastAPI handlers wrap them in
 `fastapi.concurrency.run_in_threadpool`. A single process-wide connection is
-used (WAL mode), with a `threading.Lock` guarding writes.
+used (WAL mode); every access goes through one `threading.Lock`, since a
+sqlite3 connection must not be used from several threads at once.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from models import City, Course, Venue, VenueAddress, VenueDetail, VenuesPayload
 # ── Module state ────────────────────────────────────────────────────────────
 
 _conn: sqlite3.Connection | None = None
-_write_lock = threading.Lock()
+_lock = threading.Lock()
 
 
 # ── Lifecycle ───────────────────────────────────────────────────────────────
@@ -51,6 +52,16 @@ def _c() -> sqlite3.Connection:
     if _conn is None:
         raise RuntimeError("storage.init() has not been called")
     return _conn
+
+
+def _fetchone(sql: str, params: tuple = ()) -> sqlite3.Row | None:
+    with _lock:
+        return _c().execute(sql, params).fetchone()
+
+
+def _fetchall(sql: str, params: tuple = ()) -> list[sqlite3.Row]:
+    with _lock:
+        return _c().execute(sql, params).fetchall()
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -169,7 +180,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
 def upsert_cities(cities: list[City], fetched_at: float) -> None:
     """Bulk UPSERT cities from USC /cities. Preserves any existing bbox columns."""
-    with _write_lock:
+    with _lock:
         conn = _c()
         conn.execute("BEGIN")
         try:
@@ -210,17 +221,17 @@ def upsert_cities(cities: list[City], fetched_at: float) -> None:
 
 
 def get_cities_fetched_at() -> float | None:
-    row = _c().execute("SELECT cities_fetched_at FROM global_state WHERE id = 1").fetchone()
+    row = _fetchone("SELECT cities_fetched_at FROM global_state WHERE id = 1")
     return row["cities_fetched_at"] if row else None
 
 
 def list_cities() -> list[City]:
-    rows = _c().execute("SELECT * FROM cities ORDER BY id").fetchall()
+    rows = _fetchall("SELECT * FROM cities ORDER BY id")
     return [_row_to_city(r) for r in rows]
 
 
 def get_city(city_id: int) -> City | None:
-    row = _c().execute("SELECT * FROM cities WHERE id = ?", (city_id,)).fetchone()
+    row = _fetchone("SELECT * FROM cities WHERE id = ?", (city_id,))
     return _row_to_city(row) if row else None
 
 
@@ -250,7 +261,7 @@ def upsert_venues(
     with_coords: int,
 ) -> None:
     """Replace all venues for a city, update snapshot meta, derive city bbox."""
-    with _write_lock:
+    with _lock:
         conn = _c()
         conn.execute("BEGIN")
         try:
@@ -336,13 +347,9 @@ def _venue_to_row(city_id: int, v: Venue, fetched_at: float) -> tuple:
 
 
 def get_venues_fetched_at(city_id: int) -> float | None:
-    row = (
-        _c()
-        .execute(
-            "SELECT venues_fetched_at FROM city_state WHERE city_id = ?",
-            (city_id,),
-        )
-        .fetchone()
+    row = _fetchone(
+        "SELECT venues_fetched_at FROM city_state WHERE city_id = ?",
+        (city_id,),
     )
     return row["venues_fetched_at"] if row else None
 
@@ -353,28 +360,30 @@ def get_venues_payload(city_id: int) -> VenuesPayload | None:
     `tier_config` on the returned payload is a placeholder; the handler
     overwrites it with the hardcoded global TIER_CONFIG before responding.
     """
-    conn = _c()
-    meta = conn.execute(
-        """
-        SELECT venues_fetched_at, total_venues, venues_with_coords
-        FROM city_state WHERE city_id = ?
-        """,
-        (city_id,),
-    ).fetchone()
-    if not meta or meta["venues_fetched_at"] is None:
-        return None
-    rows = conn.execute(
-        """
-        SELECT v.*,
-               d.visit_limits_json AS d_visit_limits_json,
-               d.booking_limits_text AS d_booking_limits_text
-        FROM venues v
-        LEFT JOIN venue_details d ON d.venue_id = v.venue_id
-        WHERE v.city_id = ?
-        ORDER BY v.name
-        """,
-        (city_id,),
-    ).fetchall()
+    # One lock hold for both queries so meta and rows are a consistent snapshot.
+    with _lock:
+        conn = _c()
+        meta = conn.execute(
+            """
+            SELECT venues_fetched_at, total_venues, venues_with_coords
+            FROM city_state WHERE city_id = ?
+            """,
+            (city_id,),
+        ).fetchone()
+        if not meta or meta["venues_fetched_at"] is None:
+            return None
+        rows = conn.execute(
+            """
+            SELECT v.*,
+                   d.visit_limits_json AS d_visit_limits_json,
+                   d.booking_limits_text AS d_booking_limits_text
+            FROM venues v
+            LEFT JOIN venue_details d ON d.venue_id = v.venue_id
+            WHERE v.city_id = ?
+            ORDER BY v.name
+            """,
+            (city_id,),
+        ).fetchall()
     venues = [_row_to_venue(r) for r in rows]
     return VenuesPayload(
         fetched_at=meta["venues_fetched_at"],
@@ -422,13 +431,9 @@ def _row_to_venue(row: sqlite3.Row) -> Venue:
 
 
 def get_venue_detail(venue_id: str) -> VenueDetail | None:
-    row = (
-        _c()
-        .execute(
-            "SELECT * FROM venue_details WHERE venue_id = ?",
-            (venue_id,),
-        )
-        .fetchone()
+    row = _fetchone(
+        "SELECT * FROM venue_details WHERE venue_id = ?",
+        (venue_id,),
     )
     return _row_to_venue_detail(row) if row else None
 
@@ -449,7 +454,7 @@ def _row_to_venue_detail(row: sqlite3.Row) -> VenueDetail:
 
 
 def upsert_venue_detail(venue_id: str, detail: VenueDetail) -> None:
-    with _write_lock:
+    with _lock:
         _c().execute(
             """
             INSERT INTO venue_details (
@@ -484,9 +489,9 @@ def reparse_visit_limits(parse_fn) -> int:
     booking_limits_text using the provided parser. Used when the parser logic
     changes so we don't need to re-fetch from USC. Returns row count updated.
     """
-    conn = _c()
-    rows = conn.execute("SELECT venue_id, booking_limits_text FROM venue_details").fetchall()
-    with _write_lock:
+    with _lock:
+        conn = _c()
+        rows = conn.execute("SELECT venue_id, booking_limits_text FROM venue_details").fetchall()
         conn.execute("BEGIN")
         try:
             for r in rows:
@@ -507,19 +512,15 @@ def reparse_visit_limits(parse_fn) -> int:
 
 def list_venue_ids_needing_details(city_id: int, max_age_seconds: float) -> list[str]:
     cutoff = time.time() - max_age_seconds
-    rows = (
-        _c()
-        .execute(
-            """
+    rows = _fetchall(
+        """
         SELECT v.venue_id
         FROM venues v
         LEFT JOIN venue_details d ON d.venue_id = v.venue_id
         WHERE v.city_id = ?
           AND (d.venue_id IS NULL OR d.fetched_at < ?)
         """,
-            (city_id, cutoff),
-        )
-        .fetchall()
+        (city_id, cutoff),
     )
     return [r["venue_id"] for r in rows]
 
@@ -531,16 +532,12 @@ def get_course_fetches(city_id: int, dates: list[str]) -> dict[str, float]:
     if not dates:
         return {}
     placeholders = ",".join("?" * len(dates))
-    rows = (
-        _c()
-        .execute(
-            f"""
+    rows = _fetchall(
+        f"""
         SELECT date, fetched_at FROM course_fetches
         WHERE city_id = ? AND date IN ({placeholders})
         """,
-            (city_id, *dates),
-        )
-        .fetchall()
+        (city_id, *dates),
     )
     return {r["date"]: r["fetched_at"] for r in rows}
 
@@ -549,17 +546,13 @@ def get_courses_for_dates(city_id: int, dates: list[str]) -> dict[str, list[Cour
     if not dates:
         return {}
     placeholders = ",".join("?" * len(dates))
-    rows = (
-        _c()
-        .execute(
-            f"""
+    rows = _fetchall(
+        f"""
         SELECT * FROM courses
         WHERE city_id = ? AND date IN ({placeholders})
         ORDER BY date, start_time
         """,
-            (city_id, *dates),
-        )
-        .fetchall()
+        (city_id, *dates),
     )
     out: dict[str, list[Course]] = {d: [] for d in dates}
     for r in rows:
@@ -610,7 +603,7 @@ def upsert_courses_for_date(
         deduped.append(c)
     courses = deduped
 
-    with _write_lock:
+    with _lock:
         conn = _c()
         conn.execute("BEGIN")
         try:
@@ -672,7 +665,7 @@ def upsert_courses_for_date(
 def purge_stale_courses(max_age_seconds: float) -> int:
     """Delete course rows + fetch ledger entries older than max_age_seconds."""
     cutoff = time.time() - max_age_seconds
-    with _write_lock:
+    with _lock:
         conn = _c()
         conn.execute("BEGIN")
         try:
@@ -701,9 +694,7 @@ def purge_stale_courses(max_age_seconds: float) -> int:
 
 
 def get_categories(max_age_seconds: float) -> dict | None:
-    row = (
-        _c().execute("SELECT categories_fetched_at, categories_payload_json FROM global_state WHERE id = 1").fetchone()
-    )
+    row = _fetchone("SELECT categories_fetched_at, categories_payload_json FROM global_state WHERE id = 1")
     if not row or row["categories_fetched_at"] is None:
         return None
     if (time.time() - row["categories_fetched_at"]) > max_age_seconds:
@@ -712,7 +703,7 @@ def get_categories(max_age_seconds: float) -> dict | None:
 
 
 def set_categories(payload: dict, fetched_at: float) -> None:
-    with _write_lock:
+    with _lock:
         _c().execute(
             """
             UPDATE global_state

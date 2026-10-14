@@ -63,8 +63,13 @@ while read -r cidr; do
     ipset add allowed-domains "$cidr"
 done < <(echo "$gh_ranges" | jq -r '(.web + .api + .git)[]' | aggregate -q)
 
-# Resolve and add other allowed domains
+# Resolve and add other allowed domains. GitHub hosts are resolved too because
+# DNS can return edge IPs that are missing from the meta ranges above.
 for domain in \
+    "github.com" \
+    "api.github.com" \
+    "codeload.github.com" \
+    "objects.githubusercontent.com" \
     "registry.npmjs.org" \
     "api.anthropic.com" \
     "sentry.io" \
