@@ -33,8 +33,18 @@ Or run the prebuilt image published by CI (defaults to the `main` tag; override 
 
 ```bash
 docker compose -f docker-compose.prod.yml up -d
-IMAGE_TAG=v1.0.0 docker compose -f docker-compose.prod.yml up -d
+IMAGE_TAG=1.1.0 docker compose -f docker-compose.prod.yml up -d
 ```
+
+#### Releases & image tags
+
+Releases are cut automatically: when a push to `main` contains [Conventional Commits](https://www.conventionalcommits.org/) that warrant one, CI bumps the version (`feat` → minor, `fix`/`perf` → patch, `!` / `BREAKING CHANGE` → major), publishes the image and creates the matching `vX.Y.Z` GitHub release. Commits like `chore`, `docs` or `ci` don't release on their own.
+
+| Image tag | Tracks |
+|-----------|--------|
+| `1.2.3`, `1.2`, `1` | Releases — pin these (ideally with a digest) for Renovate / auto-updates |
+| `main`, `latest` | Every push to `main` |
+| `sha-<commit>` | A single commit |
 
 The app is available at **http://localhost:8000**. Venue cache is persisted in a Docker volume across restarts.
 
