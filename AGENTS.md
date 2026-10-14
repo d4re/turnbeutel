@@ -72,6 +72,10 @@ Below `max-width: 768px` (one CSS media query, mirrored by `matchMedia` in JS) t
 
 Related invariant: don't re-render markers on viewport changes unless new data arrived or the zoom-out branch cleared the layer (`mapMarkersCleared` in `app.js`) — rebuilding markers destroys open popups and made list-tap → popup flaky. Also, `init()` must stay the last statement in `app.js`: it runs immediately and reads top-level `const` bindings that only exist once the whole script has evaluated.
 
+### Releases are derived from commit messages
+
+There is no manual release step. On every push to `main`, the CI `docker` job runs `.github/scripts/next-version.sh`, which bumps the latest `v*` tag based on the Conventional Commit messages since it (`feat` → minor, `fix`/`perf` → patch, `!`/`BREAKING CHANGE` → major, everything else → no release). If there's a bump, the image is also tagged `X.Y.Z`, `X.Y` and `X`, and a GitHub release `vX.Y.Z` is created after the push succeeds. Downstream deployments (Renovate) track these version tags, so **PR titles (= squash commit subjects) must use the right Conventional Commit type**.
+
 ## Things to Watch Out For
 
 ### Rate limiting
