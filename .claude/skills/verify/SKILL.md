@@ -21,7 +21,7 @@ works. First venue fetch per city takes a few seconds; cached in
 
 ## Headless browser
 
-Chromium is baked into the devcontainer image at `$PLAYWRIGHT_BROWSERS_PATH`
+Chromium is installed into the sandbox by the sbx kit (`.sbx/kit`) at `$PLAYWRIGHT_BROWSERS_PATH`
 (/opt/pw-browsers). Install the matching client in the scratchpad and launch —
 the version must match the image's pinned browser build:
 
@@ -35,7 +35,8 @@ const browser = await chromium.launch(); // finds the preinstalled browser
 ```
 
 Leaflet and markercluster are served locally from `frontend/vendor/`, so no
-request interception is needed for them. Only OSM tiles are firewalled:
+request interception is needed for them. Only OSM tiles are outside the
+sandbox egress allowlist:
 fulfill `https://*.tile.openstreetmap.org/**` with a 1px PNG via `page.route`
 (map background renders gray — markers/clusters still work).
 
@@ -52,6 +53,6 @@ fulfill `https://*.tile.openstreetmap.org/**` with a 1px PNG via `page.route`
 ## Gotchas
 
 - `init()` must stay the last statement in `app.js` (TDZ on top-level consts).
-- `frontend/node_modules` (eslint) is installed by the devcontainer
-  postCreateCommand; if missing, `npm ci --prefix frontend`.
+- `frontend/node_modules` (eslint) is installed by the sbx kit's startup
+  command; if missing, `npm ci --prefix frontend`.
 - The pre-commit hook runs backend tests + lint via `make`.

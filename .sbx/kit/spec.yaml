@@ -1,0 +1,67 @@
+# Docker Sandboxes (sbx) mixin for Turnbeutel, layered on the built-in claude
+# agent:  sbx create --kit ./.sbx/kit claude .
+# Replaces the old .devcontainer: the toolchain is installed by
+# files/home/.turnbeutel-kit/install.sh, and egress is the host-enforced
+# allowlist below instead of an in-container iptables firewall.
+schemaVersion: "2"
+kind: mixin
+name: turnbeutel
+displayName: Turnbeutel dev environment
+description: Node 24, Playwright Chromium, zsh, and egress for the USC API, package registries and VS Code.
+requires:
+  agent: claude
+
+permissions:
+  network:
+    allow:
+      # Urban Sports Club (the upstream API this app proxies)
+      - urbansportsclub.com
+      - "*.urbansportsclub.com"
+      # GitHub (git, gh, release downloads)
+      - github.com
+      - api.github.com
+      - codeload.github.com
+      - objects.githubusercontent.com
+      - release-assets.githubusercontent.com
+      - raw.githubusercontent.com
+      # Package registries / toolchains
+      - registry.npmjs.org
+      - nodejs.org
+      - pypi.org
+      - files.pythonhosted.org
+      - astral.sh
+      - archive.ubuntu.com
+      - security.ubuntu.com
+      - ports.ubuntu.com
+      - download.docker.com
+      # Playwright browser downloads
+      - cdn.playwright.dev
+      - playwright.download.prss.microsoft.com
+      # VS Code server (Remote-SSH installs it from inside the sandbox) + extensions
+      - update.code.visualstudio.com
+      - vscode.download.prss.microsoft.com
+      - "*.vscode-cdn.net"
+      - marketplace.visualstudio.com
+      - "*.gallery.vsassets.io"
+      - vscode.blob.core.windows.net
+
+environment:
+  variables:
+    NODE_OPTIONS: "--max-old-space-size=4096"
+    PLAYWRIGHT_BROWSERS_PATH: /opt/pw-browsers
+    EDITOR: nano
+    VISUAL: nano
+    POWERLEVEL9K_DISABLE_GITSTATUS: "true"
+
+setup:
+  install:
+    - command: sh /home/agent/.turnbeutel-kit/install.sh
+      user: "0"
+      description: Install Node 24, Playwright Chromium, zsh and dev tools
+  startup:
+    - command:
+        - sh
+        - -c
+        - 'cd "$WORKSPACE_DIR" || exit 0; [ -d frontend/node_modules ] || npm ci --prefix frontend --no-audit --no-fund'
+      background: true
+      description: Install frontend dev dependencies (ESLint) if missing

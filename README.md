@@ -38,6 +38,17 @@ IMAGE_TAG=v1.0.0 docker compose -f docker-compose.prod.yml up -d
 
 The app is available at **http://localhost:8000**. Venue cache is persisted in a Docker volume across restarts.
 
+### Agent sandbox (Docker Sandboxes)
+
+The development environment for coding agents is a [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) mixin kit in `.sbx/kit/`, layered on the built-in `claude` agent:
+
+```bash
+sbx create --name turnbeutel --kit ./.sbx/kit claude .
+sbx run turnbeutel
+```
+
+The kit installs Node 24, headless Chromium (Playwright), zsh and dev tools on top of the stock template (Python 3.14, uv, gh, Docker), and declares the network egress the project needs (USC API, GitHub, npm/PyPI/uv, Ubuntu/Node/Playwright downloads, VS Code server). Kit changes take effect on sandbox re-creation.
+
 ### Manual start (without make)
 
 ```bash
@@ -83,6 +94,7 @@ Dockerfile              # Production container image
 docker-compose.yml      # Single-command container deployment (local build)
 docker-compose.prod.yml # Same, but pulls the CI-published image from ghcr.io
 Makefile                # Local dev shortcuts (serve, test, lint, clean)
+.sbx/kit/               # Docker Sandboxes kit for the agent dev environment
 ```
 
 ## API Endpoints
