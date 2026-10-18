@@ -1,6 +1,8 @@
 """Outcome-based tests for server pure functions."""
 
+import asyncio
 import time
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -539,6 +541,8 @@ def seeded_client(tmp_path: Path, monkeypatch):
     storage.close()
 
     monkeypatch.setattr(server, "DB_PATH", db_path)
+    # Never start the background prefetch loop from the fixture's lifespan.
+    monkeypatch.setattr(server, "PREFETCH_CITIES", "")
 
     # Reset module-level caches so state doesn't leak between tests.
     server._venues_response_cache.clear()
@@ -826,6 +830,145 @@ def test_get_courses_stale_cache_served_immediately_then_refreshed(seeded_client
     assert _wait_until(lambda: (storage.get_course_fetches(1, ["2026-04-11"]).get("2026-04-11") or 0) > stale_at)
     refreshed = storage.get_courses_for_dates(1, ["2026-04-11"])["2026-04-11"]
     assert [c.title for c in refreshed] == ["New Class"]
+
+
+# ── Background prefetch ──
+
+
+def test_resolve_prefetch_cities_accepts_ids_and_names():
+    cities = [City(id=1, name="Berlin"), City(id=2, name="Hamburg")]
+    resolved = server.resolve_prefetch_cities(" berlin, 2,1, Atlantis ,", cities)
+    assert [c.id for c in resolved] == [1, 2]
+    assert server.resolve_prefetch_cities("", cities) == []
+
+
+def test_resolve_prefetch_cities_includes_nearby_cities():
+    cities = [
+        City(id=1, name="Berlin", centroid_lat=52.5167, centroid_lng=13.3833),
+        City(id=10, name="Potsdam", centroid_lat=52.3989, centroid_lng=13.0657),  # ~25 km
+        City(id=6448, name="Glienicke/Nordbahn", centroid_lat=52.6333, centroid_lng=13.3167),  # ~14 km
+        City(id=2, name="Hamburg", centroid_lat=53.55, centroid_lng=9.99),
+        City(id=99, name="Nowhere"),  # no centroid
+    ]
+    assert [c.id for c in server.resolve_prefetch_cities("Berlin", cities, radius_km=30)] == [1, 6448, 10]
+    assert [c.id for c in server.resolve_prefetch_cities("Berlin", cities, radius_km=20)] == [1, 6448]
+    assert [c.id for c in server.resolve_prefetch_cities("Berlin", cities)] == [1]
+
+
+def _fake_raw_venue(venue_id: str, name: str) -> dict:
+    return {
+        "name": name,
+        "urlSlug": name.lower(),
+        "planTypes": ["S"],
+        "planTypesB2B": ["S"],
+        "categories": [],
+        "ratings": {},
+        "id": venue_id,
+        "location": {"latitude": 52.52, "longitude": 13.4},
+        "isOnline": 0,
+        "isPlusCheckin": 0,
+    }
+
+
+def test_prefetch_cycle_warms_empty_cache(seeded_client, monkeypatch):
+    """A cold city gets its venues and the whole date strip fetched."""
+    venue_calls: list[int] = []
+    course_calls: list[tuple[str, int]] = []
+
+    async def fake_venues(usc_city_id: int, expected_count=None):
+        venue_calls.append(usc_city_id)
+        return [_fake_raw_venue("v1", "Studio")]
+
+    async def fake_courses(date_str, usc_city_id, client, semaphore):
+        course_calls.append((date_str, usc_city_id))
+        return [_make_course(1, date_str, "Class")]
+
+    monkeypatch.setattr(server, "fetch_all_venue_pages", fake_venues)
+    monkeypatch.setattr(server, "fetch_courses_for_date", fake_courses)
+
+    berlin = next(c for c in server._cities_index if c.id == 1)
+    asyncio.run(server.prefetch_cycle([berlin], interval=3600))
+
+    assert venue_calls == [1]
+    today = date.today()
+    expected_dates = [(today + timedelta(days=i)).isoformat() for i in range(server.MAX_COURSE_DAYS)]
+    assert sorted(course_calls) == [(d, 1) for d in expected_dates]
+    assert set(storage.get_course_fetches(1, expected_dates)) == set(expected_dates)
+
+    # Requests are now served entirely from the warm cache.
+    monkeypatch.setattr(server, "fetch_all_venue_pages", None)
+    monkeypatch.setattr(server, "fetch_courses_for_date", None)
+    resp = seeded_client.get(f"/api/courses?start_date={expected_dates[0]}&days=14&city_ids=1")
+    assert resp.status_code == 200
+    assert resp.json()["cities"][0]["total"] == server.MAX_COURSE_DAYS
+    resp = seeded_client.get("/api/venues?city_ids=1")
+    assert [v["name"] for v in resp.json()["cities"][0]["venues"]] == ["Studio"]
+
+
+def test_prefetch_cycle_only_refreshes_what_expires_before_next_cycle(seeded_client, monkeypatch):
+    now = time.time()
+    interval = 3600
+    today = date.today()
+    dates = [(today + timedelta(days=i)).isoformat() for i in range(server.MAX_COURSE_DAYS)]
+    # Venues fresh well beyond the next cycle; courses fresh except two days:
+    # one that will expire before the next cycle and one never fetched.
+    storage.upsert_venues(1, [_make_venue("v1", "Studio", 52.5, 13.4)], now, 1, 1)
+    expiring = dates[3]
+    for d in dates[:-1]:
+        fetched_at = now - server.COURSES_TTL + interval / 2 if d == expiring else now
+        storage.upsert_courses_for_date(1, d, [], fetched_at)
+
+    venue_calls: list[int] = []
+    course_calls: list[str] = []
+
+    async def fake_venues(usc_city_id: int, expected_count=None):
+        venue_calls.append(usc_city_id)
+        return []
+
+    async def fake_courses(date_str, usc_city_id, client, semaphore):
+        course_calls.append(date_str)
+        return []
+
+    monkeypatch.setattr(server, "fetch_all_venue_pages", fake_venues)
+    monkeypatch.setattr(server, "fetch_courses_for_date", fake_courses)
+
+    berlin = next(c for c in server._cities_index if c.id == 1)
+    asyncio.run(server.prefetch_cycle([berlin], interval=interval))
+
+    assert venue_calls == []
+    assert sorted(course_calls) == sorted([expiring, dates[-1]])
+
+
+def test_course_refresh_due_staggers_days_and_respects_ttl():
+    """Simulate hourly cycles over 3 weeks for a fixed strip that was cold-
+    fetched all at once: refreshes spread out to at most one day per cycle,
+    each day is refreshed about every 2 days, and nothing outlives the TTL."""
+    interval = 3600.0
+    days = [date(2026, 10, 18) + timedelta(days=i) for i in range(server.MAX_COURSE_DAYS)]
+    t0 = 1_800_000_000.0
+    fetched = dict.fromkeys(days, t0)
+    refresh_times: dict[date, list[float]] = {d: [] for d in days}
+    per_cycle: list[int] = []
+
+    now = t0
+    while now < t0 + 21 * 24 * 3600:
+        now += interval
+        due = [d for d in days if server.course_refresh_due(d, fetched[d], now, interval)]
+        per_cycle.append(len(due))
+        for d in due:
+            assert now - fetched[d] <= server.COURSES_TTL
+            fetched[d] = now
+            refresh_times[d].append(now)
+
+    # After the first period (one catch-up refresh per day), never more than one day per cycle.
+    assert max(per_cycle[48:]) == 1
+    for times in refresh_times.values():
+        gaps = [b - a for a, b in zip(times[1:], times[2:], strict=False)]
+        assert gaps and all(server.COURSES_TTL - 2 * interval <= g <= server.COURSES_TTL for g in gaps)
+
+
+def test_course_refresh_due_when_never_fetched():
+    assert server.course_refresh_due(date(2026, 10, 18), None, time.time(), 3600)
 
 
 def test_get_courses_requires_city_ids(seeded_client):
