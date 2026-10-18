@@ -7,7 +7,10 @@ single SQLite database (see storage.py).
 """
 
 import asyncio
+import contextlib
 import logging
+import math
+import os
 import re
 import time
 from contextlib import asynccontextmanager
@@ -71,6 +74,16 @@ COURSES_TTL = 48 * 3600
 COURSES_STALE = 3 * 24 * 3600
 CITIES_TTL = 7 * 24 * 3600
 
+# Background prefetch ("warming"): cities listed here (comma-separated USC city
+# ids or names, e.g. "Berlin" or "1,Hamburg") have their venues and the full
+# course date strip refreshed periodically, so visitors never wait on a live
+# USC pull or see expired data. Empty disables prefetching.
+PREFETCH_CITIES = os.environ.get("PREFETCH_CITIES", "")
+PREFETCH_INTERVAL = float(os.environ.get("PREFETCH_INTERVAL_MINUTES", "60")) * 60
+# Also prefetch every city whose centroid lies within this many km of a listed
+# one — the map's default Berlin view pulls in ~20 small Brandenburg towns.
+PREFETCH_RADIUS_KM = float(os.environ.get("PREFETCH_RADIUS_KM", "0"))
+
 # ── Tier mappings ──
 
 PRIVATE_TIER_ORDER = ["Essential", "Classic", "Premium", "Max"]
@@ -132,8 +145,15 @@ async def lifespan(app: FastAPI):
     if reparsed:
         logger.info("Re-parsed visit limits for %d cached venue_details rows", reparsed)
 
+    prefetch_cities = resolve_prefetch_cities(PREFETCH_CITIES, _cities_index, PREFETCH_RADIUS_KM)
+    prefetch_task = asyncio.create_task(prefetch_loop(prefetch_cities)) if prefetch_cities else None
+
     yield
 
+    if prefetch_task is not None:
+        prefetch_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await prefetch_task
     storage.close()
 
 
@@ -549,14 +569,20 @@ def _fresh_cached_payload(city_id: int) -> VenuesPayload | None:
     return None
 
 
-async def _fetch_and_cache_venues(city: City) -> VenuesPayload:
-    """Live-fetch a city's venues from USC, persist them, and prime the caches."""
+async def _fetch_and_cache_venues(city: City, force: bool = False, enrich: bool = True) -> VenuesPayload:
+    """Live-fetch a city's venues from USC, persist them, and prime the caches.
+
+    `force` skips the in-memory freshness re-check (prefetch refreshes a city
+    shortly *before* it expires, while the memory cache still counts as fresh).
+    `enrich=False` leaves detail enrichment to the caller (prefetch awaits it,
+    so enrichment runs one city at a time).
+    """
     # Bound concurrent live USC pulls globally. Cache reads elsewhere are
     # unthrottled; only live fetches acquire the semaphore.
     async with _venue_fetch_semaphore:
         # Re-check: another request may have fetched this same city while we
         # were queued on the semaphore.
-        payload = _fresh_cached_payload(city.id)
+        payload = None if force else _fresh_cached_payload(city.id)
         if payload is not None:
             return payload
 
@@ -574,17 +600,18 @@ async def _fetch_and_cache_venues(city: City) -> VenuesPayload:
         assert payload is not None
         payload.tier_config = TIER_CONFIG
         _venues_response_cache[city.id] = (now, payload)
-        asyncio.create_task(enrich_venue_details(city.id))
+        if enrich:
+            asyncio.create_task(enrich_venue_details(city.id))
         return payload
 
 
-async def _refresh_venues_in_background(city: City) -> None:
+async def _refresh_venues_in_background(city: City, force: bool = False, enrich: bool = True) -> None:
     """Stale-while-revalidate worker: refetch a city whose snapshot expired."""
     if city.id in _venue_refresh_cities:
         return
     _venue_refresh_cities.add(city.id)
     try:
-        await _fetch_and_cache_venues(city)
+        await _fetch_and_cache_venues(city, force=force, enrich=enrich)
     except Exception:
         logger.warning("Background venue refresh failed for city=%s", city.id, exc_info=True)
     finally:
@@ -700,18 +727,128 @@ async def _refresh_courses_in_background(pairs: list[tuple[int, str]]) -> None:
     _course_refresh_keys.update(work)
     try:
         semaphore = asyncio.Semaphore(5)
+
+        # Persist each day as soon as it lands: a big city's full date strip
+        # takes minutes (Berlin: ~30 s per day), and finished days shouldn't
+        # wait on the slowest one.
+        async def refresh_one(cid: int, d: str, client: httpx.AsyncClient) -> None:
+            try:
+                courses = await fetch_courses_for_date(d, cid, client, semaphore)
+            except Exception as e:
+                logger.warning("Background course refresh failed for city=%s %s: %r", cid, d, e)
+                return
+            await run_in_threadpool(storage.upsert_courses_for_date, cid, d, courses, time.time())
+
         async with httpx.AsyncClient(headers=USC_HEADERS, timeout=30) as client:
-            results = await asyncio.gather(
-                *[fetch_courses_for_date(d, cid, client, semaphore) for (cid, d) in work],
-                return_exceptions=True,
-            )
-        for (cid, d), r in zip(work, results, strict=True):
-            if isinstance(r, Exception):
-                logger.warning("Background course refresh failed for city=%s %s: %r", cid, d, r)
-                continue
-            await run_in_threadpool(storage.upsert_courses_for_date, cid, d, r, time.time())
+            await asyncio.gather(*[refresh_one(cid, d, client) for (cid, d) in work])
     finally:
         _course_refresh_keys.difference_update(work)
+
+
+# ── Background prefetch ──
+
+
+def _distance_km(a: City, b: City) -> float:
+    """Great-circle distance between two city centroids."""
+    lat1, lng1, lat2, lng2 = map(math.radians, (a.centroid_lat, a.centroid_lng, b.centroid_lat, b.centroid_lng))
+    h = math.sin((lat2 - lat1) / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin((lng2 - lng1) / 2) ** 2
+    return 6371 * 2 * math.asin(math.sqrt(h))
+
+
+def resolve_prefetch_cities(spec: str, cities: list[City], radius_km: float = 0) -> list[City]:
+    """Resolve a PREFETCH_CITIES spec (comma-separated ids or names) to cities.
+
+    With `radius_km`, cities whose centroid lies within that distance of a
+    listed city are appended (nearest first), after the listed ones.
+    """
+    by_id = {c.id: c for c in cities}
+    by_name = {c.name.casefold(): c for c in cities}
+    resolved: list[City] = []
+    for token in (t.strip() for t in spec.split(",")):
+        if not token:
+            continue
+        city = by_id.get(int(token)) if token.isdigit() else by_name.get(token.casefold())
+        if city is None:
+            logger.warning("PREFETCH_CITIES: unknown city %r, skipping", token)
+        elif city not in resolved:
+            resolved.append(city)
+
+    if radius_km > 0:
+        centers = [c for c in resolved if c.centroid_lat is not None and c.centroid_lng is not None]
+        nearby: list[tuple[float, City]] = []
+        for city in cities:
+            if city in resolved or city.centroid_lat is None or city.centroid_lng is None:
+                continue
+            dist = min((_distance_km(center, city) for center in centers), default=math.inf)
+            if dist <= radius_km:
+                nearby.append((dist, city))
+        resolved.extend(city for _, city in sorted(nearby, key=lambda x: x[0]))
+    return resolved
+
+
+def course_refresh_due(day: date, fetched_at: float | None, now: float, interval: float) -> bool:
+    """Whether a prefetched course day should be re-fetched in this cycle.
+
+    Every date gets a fixed slot in a refresh period of COURSES_TTL - interval
+    (so data never outlives its TTL between cycles), offset by its ordinal:
+    the 14 days of the strip fall into 14 evenly spaced slots (~3.4 h apart
+    with the defaults) instead of all expiring together after a cold start.
+    A day is due if it was never fetched or not since its most recent slot.
+    """
+    if fetched_at is None:
+        return True
+    period = max(COURSES_TTL - interval, interval)
+    phase = (day.toordinal() % MAX_COURSE_DAYS) * period / MAX_COURSE_DAYS
+    last_slot = (now + phase) // period * period - phase
+    return fetched_at < last_slot or now - fetched_at + interval >= COURSES_TTL
+
+
+async def prefetch_cycle(cities: list[City], interval: float) -> None:
+    """Refresh whatever of `cities`' data is due this cycle.
+
+    Covers each city's venues snapshot and venue details, and every day of the
+    frontend's date strip — today's new last day included, so no date ever
+    needs a blocking live fetch. Course days are refreshed on staggered slots
+    (see `course_refresh_due`) to spread load on USC.
+    """
+    now = time.time()
+    for city in cities:
+        try:
+            fetched_at = await run_in_threadpool(storage.get_venues_fetched_at, city.id)
+            if fetched_at is None or now - fetched_at + interval >= VENUES_TTL:
+                await _refresh_venues_in_background(city, force=True, enrich=False)
+            # Details have their own (longer) TTL; this is a no-op when all are fresh.
+            await enrich_venue_details(city.id)
+        except Exception:
+            logger.warning("Venue prefetch failed for city=%s", city.id, exc_info=True)
+
+    today = date.today()
+    days = [today + timedelta(days=i) for i in range(MAX_COURSE_DAYS)]
+    due_by_day: dict[str, list[tuple[int, str]]] = {d.isoformat(): [] for d in days}
+    for city in cities:
+        fetches = await run_in_threadpool(storage.get_course_fetches, city.id, list(due_by_day))
+        for d in days:
+            if course_refresh_due(d, fetches.get(d.isoformat()), now, interval):
+                due_by_day[d.isoformat()].append((city.id, d.isoformat()))
+    # One day at a time, nearest first, all cities of that day sharing one
+    # concurrency limit: a big city's day already saturates it, small towns
+    # fill the gaps, and today is usable long before day 14.
+    for pairs in due_by_day.values():
+        if pairs:
+            await _refresh_courses_in_background(pairs)
+
+
+async def prefetch_loop(cities: list[City], interval: float | None = None) -> None:
+    """Keep `cities` warm forever: one prefetch cycle every `interval` seconds."""
+    interval = PREFETCH_INTERVAL if interval is None else interval
+    logger.info("Prefetching %s every %.0f min", ", ".join(c.name for c in cities), interval / 60)
+    while True:
+        try:
+            await prefetch_cycle(cities, interval)
+            await run_in_threadpool(storage.purge_stale_courses, float(COURSES_STALE))
+        except Exception:
+            logger.warning("Prefetch cycle failed", exc_info=True)
+        await asyncio.sleep(interval)
 
 
 @app.get("/api/courses", response_model=MultiCityCoursesResponse)

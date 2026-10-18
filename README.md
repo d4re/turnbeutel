@@ -124,6 +124,14 @@ All fetched data (cities, venues, venue details, courses, categories) is cached 
 
 When running via Docker, the cache is stored in a named volume (`venue-cache`) and persists across container rebuilds.
 
+### Background prefetch
+
+Set `PREFETCH_CITIES` (comma-separated city names or USC ids, e.g. `Berlin` or `1,Hamburg`) to keep those cities warm: the backend refreshes their venues, venue details and courses for the full 14-day date strip in the background, so visitors never wait on a live USC fetch or see expired data. `PREFETCH_RADIUS_KM` additionally warms every USC city whose centre lies within that distance of a listed one (Berlin's default map view also loads ~20 small surrounding towns such as Teltow or Bernau). A cycle runs at startup and then every `PREFETCH_INTERVAL_MINUTES` (default 60); each cycle only re-fetches what would expire before the next one. Every course day is re-fetched about every 2 days (picking up classes added at short notice), with the 14 days staggered ~3.4 h apart so USC sees a steady trickle instead of one big burst. Unset (the default for `make serve`) disables it; both Docker Compose files default to `Berlin` with a 30 km radius.
+
+```bash
+PREFETCH_CITIES=Berlin PREFETCH_RADIUS_KM=30 make serve
+```
+
 The frontend additionally keeps an in-memory cache of loaded cities and dates with a soft 60-minute TTL: panning back to already-loaded data within the TTL makes no requests, while stale data is transparently re-fetched (and replaced) the next time the viewport or date selection touches it. A page reload always re-fetches.
 
 ## License

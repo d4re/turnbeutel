@@ -7,6 +7,12 @@ services:
     image: ghcr.io/d4re/turnbeutel:${IMAGE_TAG:-main}
     ports:
       - "8000:8000"
+    environment:
+      # Cities kept warm in the background (comma-separated names or USC ids),
+      # plus every city within PREFETCH_RADIUS_KM of them; set PREFETCH_CITIES
+      # to "" to disable. PREFETCH_INTERVAL_MINUTES tunes the cycle (default 60).
+      PREFETCH_CITIES: ${PREFETCH_CITIES-Berlin}
+      PREFETCH_RADIUS_KM: ${PREFETCH_RADIUS_KM-30}
     volumes:
       - venue-cache:/app/backend/cache
     restart: unless-stopped
