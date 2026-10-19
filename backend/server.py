@@ -26,6 +26,8 @@ from fastapi.staticfiles import StaticFiles
 
 import storage
 from models import (
+    CORPORATE_TIER_ORDER,
+    PRIVATE_TIER_ORDER,
     CitiesResponse,
     City,
     CityCoursesEntry,
@@ -35,6 +37,7 @@ from models import (
     CourseFetchError,
     MultiCityCoursesResponse,
     MultiCityVenuesPayload,
+    Settings,
     TierConfig,
     Venue,
     VenueAddress,
@@ -88,8 +91,6 @@ PREFETCH_RADIUS_KM = float(os.environ.get("PREFETCH_RADIUS_KM", "0"))
 
 # ── Tier mappings ──
 
-PRIVATE_TIER_ORDER = ["Essential", "Classic", "Premium", "Max"]
-CORPORATE_TIER_ORDER = ["S", "M", "L", "XL"]
 CORP_TO_PRIVATE = {"S": "Essential", "M": "Classic", "L": "Premium", "XL": "Max"}
 
 TIER_CONFIG = TierConfig(
@@ -989,6 +990,18 @@ async def get_course_detail(course_id: int):
         raise HTTPException(status_code=502, detail="USC unavailable") from e
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail="USC unavailable") from e
+
+
+@app.get("/api/settings", response_model=Settings)
+async def get_settings():
+    return await run_in_threadpool(storage.get_settings)
+
+
+@app.put("/api/settings", response_model=Settings)
+async def put_settings(settings: Settings):
+    """Replace the stored settings (single user, last write wins)."""
+    await run_in_threadpool(storage.put_settings, settings)
+    return settings
 
 
 @app.get("/api/cities", response_model=CitiesResponse)

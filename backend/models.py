@@ -1,6 +1,11 @@
 """Pydantic domain models shared between transformation, storage, and handlers."""
 
-from pydantic import BaseModel
+from typing import Literal, Self
+
+from pydantic import BaseModel, model_validator
+
+PRIVATE_TIER_ORDER = ["Essential", "Classic", "Premium", "Max"]
+CORPORATE_TIER_ORDER = ["S", "M", "L", "XL"]
 
 
 class VenueAddress(BaseModel):
@@ -168,3 +173,23 @@ class MultiCityCoursesResponse(BaseModel):
     date_from: str
     date_to: str
     errors: list[CourseFetchError]
+
+
+class Plan(BaseModel):
+    """The user's own USC membership; drives badges, independent of the tier filter."""
+
+    type: Literal["corporate", "private"]
+    tier: str
+
+    @model_validator(mode="after")
+    def _tier_matches_type(self) -> Self:
+        order = CORPORATE_TIER_ORDER if self.type == "corporate" else PRIVATE_TIER_ORDER
+        if self.tier not in order:
+            raise ValueError(f"tier must be one of {order} for a {self.type} plan")
+        return self
+
+
+class Settings(BaseModel):
+    """Single-user settings stored server-side (see AGENTS.md: single-user assumption)."""
+
+    plan: Plan | None = None

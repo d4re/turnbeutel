@@ -1119,3 +1119,30 @@ def test_get_course_detail_upstream_error_is_502(seeded_client, monkeypatch):
 
     monkeypatch.setattr(server, "fetch_course_detail", fake)
     assert seeded_client.get("/api/courses/7").status_code == 502
+
+
+# ── /api/settings ──────────────────────────────────────────────────────────
+
+
+def test_settings_default_empty(seeded_client):
+    resp = seeded_client.get("/api/settings")
+    assert resp.status_code == 200
+    assert resp.json()["plan"] is None
+
+
+def test_settings_put_then_get(seeded_client):
+    plan = {"type": "corporate", "tier": "M"}
+    assert seeded_client.put("/api/settings", json={"plan": plan}).status_code == 200
+    assert seeded_client.get("/api/settings").json()["plan"] == plan
+
+
+def test_settings_rejects_tier_of_other_type(seeded_client):
+    resp = seeded_client.put("/api/settings", json={"plan": {"type": "private", "tier": "M"}})
+    assert resp.status_code == 422
+    assert seeded_client.get("/api/settings").json()["plan"] is None
+
+
+def test_settings_put_replaces_whole_object(seeded_client):
+    seeded_client.put("/api/settings", json={"plan": {"type": "private", "tier": "Classic"}})
+    seeded_client.put("/api/settings", json={})
+    assert seeded_client.get("/api/settings").json()["plan"] is None

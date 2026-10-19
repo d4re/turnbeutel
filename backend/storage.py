@@ -14,7 +14,7 @@ import threading
 import time
 from pathlib import Path
 
-from models import City, Course, CourseDetail, Venue, VenueAddress, VenueDetail, VenuesPayload, VisitLimits
+from models import City, Course, CourseDetail, Settings, Venue, VenueAddress, VenueDetail, VenuesPayload, VisitLimits
 
 # ── Module state ────────────────────────────────────────────────────────────
 
@@ -174,6 +174,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (city_id, course_id, date)
         );
         CREATE INDEX IF NOT EXISTS idx_courses_city_date ON courses(city_id, date);
+
+        CREATE TABLE IF NOT EXISTS settings (
+            id           INTEGER PRIMARY KEY CHECK (id = 1),
+            payload_json TEXT NOT NULL,
+            updated_at   REAL NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS course_details (
             course_id    INTEGER PRIMARY KEY,
@@ -728,4 +734,25 @@ def set_categories(payload: dict, fetched_at: float) -> None:
             WHERE id = 1
             """,
             (json.dumps(payload, ensure_ascii=False), fetched_at),
+        )
+
+
+# ── Settings (single row) ──────────────────────────────────────────────────
+
+
+def get_settings() -> Settings:
+    row = _fetchone("SELECT payload_json FROM settings WHERE id = 1")
+    return Settings.model_validate_json(row["payload_json"]) if row else Settings()
+
+
+def put_settings(settings: Settings) -> None:
+    with _lock:
+        _c().execute(
+            """
+            INSERT INTO settings (id, payload_json, updated_at) VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                updated_at   = excluded.updated_at
+            """,
+            (settings.model_dump_json(), time.time()),
         )

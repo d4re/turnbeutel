@@ -8,7 +8,7 @@ import time
 import pytest
 
 import storage
-from models import City, Course, CourseDetail, Venue, VenueAddress, VenueDetail, VisitLimits
+from models import City, Course, CourseDetail, Plan, Settings, Venue, VenueAddress, VenueDetail, VisitLimits
 
 
 @pytest.fixture
@@ -498,3 +498,10 @@ def test_course_detail_roundtrip(db):
     db.upsert_course_detail(7, detail)
     assert db.get_course_detail(7) == detail
     assert db.get_course_detail(8) is None
+
+
+def test_settings_roundtrip(db):
+    assert db.get_settings() == Settings()
+    s = Settings(plan=Plan(type="corporate", tier="L"))
+    db.put_settings(s)
+    assert db.get_settings() == s
