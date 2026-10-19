@@ -79,7 +79,8 @@ uv run uvicorn server:app --reload --host 0.0.0.0 --port 8000
 - **Click a venue** on the map or in the list to see visit limits per tier (loaded on demand from the API).
 - **Courses tab** — switch to browse classes/courses in the visible cities for a specific day or range (tap a date chip, or drag across chips for a range). Filter by time of day, category, free text, free-spots-only, and PLUS-only. The sidebar shows courses sorted by time; the map shows a marker per venue hosting matching courses, with the full schedule in each popup.
 - **Click a course** to expand it in place: description, rating, free-cancellation window, which tiers the class is included in, and a link to the venue on USC (loaded on demand). Badges flag on-site fees (`+15 € on site`, parsed from USC's text or the title) and classes your plan doesn't cover (`⬆ L Pro`).
-- **You** (sidebar header) — set your own plan (corporate/private + tier). It drives the `⬆` badges and the default Corporate/Private toggle; without one, the badge marks classes that need a higher tier than their venue.
+- **You** (sidebar header) — set your own plan (corporate/private + tier), your home and your bike speed. The plan drives the `⬆` badges and the default Corporate/Private toggle; without one, the badge marks classes that need a higher tier than their venue. Set home by address search, "Pick on map", right-click/long-press on the map, or by dragging the 🏠 pin.
+- **Travel times** — with a home set, venues and courses show `🚲 14 min · 🚆 22 min (M4 → U8)`. Bike minutes come from the route distance at your chosen speed; transit is a typical weekday-evening journey (Berlin/Brandenburg only). An expanded course shows the exact connection that gets you there 5 minutes before it starts, including when to leave. Times fill in gradually in the background.
 - **Zoom out** to see pins for every USC city; click one to fly there and load its venues.
 - **On a phone** the sidebar becomes a bottom sheet over a full-screen map: drag the handle (or tap it) to switch between peek, half, and full height, and open filters via the **Filters** button in the sheet header (the badge shows how many filters are active).
 
@@ -89,10 +90,12 @@ uv run uvicorn server:app --reload --host 0.0.0.0 --port 8000
 backend/
   server.py             # FastAPI app — proxies USC API, transforms, caches, serves frontend
   storage.py            # SQLite persistence layer (venues, courses, cities, categories, settings)
+  travel.py             # Travel times: OSRM bike distances, VBB transit, Nominatim, background worker
   models.py             # Pydantic domain models
   pyproject.toml        # Python dependencies (managed by uv)
   test_server.py        # Backend tests: pure functions + endpoints (pytest)
   test_storage.py       # Backend tests: SQLite layer (pytest)
+  test_travel.py        # Backend tests: travel helpers, clients and worker (pytest)
   cache/                # Persistent SQLite cache, usc.db (gitignored)
 
 frontend/
@@ -119,12 +122,17 @@ The backend exposes:
 - `GET /api/categories` — Activity categories (cached 7 days)
 - `GET /api/courses?start_date=YYYY-MM-DD&days=N&city_ids=1` — Courses for a date or range (1–14 days) in one or more cities, including class-level tiers and on-site fees. Cached per (city, day) with a 2-day TTL so overlapping queries hit the cache.
 - `GET /api/courses/{id}` — One course's description, rating, free-cancellation hours and booking type (fetched on demand, cached 7 days)
-- `GET /api/settings` / `PUT /api/settings` — The user's settings (currently their plan). Stored server-side for a single user.
+- `GET /api/settings` / `PUT /api/settings` — The user's settings: plan, home and bike speed. Stored server-side for a single user.
+- `GET /api/geocode?q=...&viewbox=...` — Address search via Nominatim (cached 30 days)
+- `POST /api/travel` `{"venue_ids": [...], "origin"?: {"lat", "lng"}}` — Cached bike distance and typical transit time per venue from home (or `origin`), plus the ids still being computed in the background (`pending`)
+- `GET /api/travel/exact?venue_id=...&date=YYYY-MM-DD&start=HH:MM` — The transit connection arriving 5 minutes before a class starts (waits up to 10 s; cached 24 h)
 - `GET /api/health` — Health check (used by Docker HEALTHCHECK and load balancers)
 
 ## Cache
 
-All fetched data (cities, venues, venue details, courses, course details, categories) is cached in a single SQLite database, `backend/cache/usc.db`. The cache survives server restarts. To force a refresh, delete the database (`make clean` or `rm backend/cache/usc.db*`) and restart the backend.
+All fetched data (cities, venues, venue details, courses, course details, categories, travel times, geocoding results) and your settings are stored in a single SQLite database, `backend/cache/usc.db`. The cache survives server restarts. To force a refresh, delete the database (`make clean` or `rm backend/cache/usc.db*`) and restart the backend — this also clears your settings (plan, home, bike speed).
+
+Travel times and address search need outbound access to `routing.openstreetmap.de` (OSRM), `v6.vbb.transport.rest` (VBB) and `nominatim.openstreetmap.org`. Your home coordinate is sent only to those services and is never logged.
 
 When running via Docker, the cache is stored in a named volume (`venue-cache`) and persists across container rebuilds.
 
