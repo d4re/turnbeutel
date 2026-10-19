@@ -113,7 +113,7 @@ The backend exposes:
 
 - `GET /api/cities` — Index of all USC cities with centroids/bounding boxes (cached 7 days)
 - `GET /api/venues?city_ids=1&city_ids=2` — Venues for one or more cities, grouped per city (cached 24h per city)
-- `GET /api/venues/{id}` — Single venue detail with parsed visit limits (cached 7 days)
+- `GET /api/venues/{id}` — Single venue detail with visit limits per tier (cached 7 days)
 - `GET /api/categories` — Activity categories (cached 7 days)
 - `GET /api/courses?start_date=YYYY-MM-DD&days=N&city_ids=1` — Courses for a date or range (1–14 days) in one or more cities. Cached per (city, day) with a 2-day TTL so overlapping queries hit the cache.
 - `GET /api/health` — Health check (used by Docker HEALTHCHECK and load balancers)

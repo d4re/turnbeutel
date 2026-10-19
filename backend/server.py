@@ -11,7 +11,6 @@ import contextlib
 import logging
 import math
 import os
-import re
 import time
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
@@ -139,12 +138,6 @@ async def lifespan(app: FastAPI):
     _cities_index = await run_in_threadpool(storage.list_cities)
     await run_in_threadpool(storage.purge_stale_courses, float(COURSES_STALE))
 
-    # Re-derive visit_limits from cached booking_limits_text on every startup.
-    # Cheap (~ms per row) and ensures parser changes take effect without a refetch.
-    reparsed = await run_in_threadpool(storage.reparse_visit_limits, parse_visit_limits)
-    if reparsed:
-        logger.info("Re-parsed visit limits for %d cached venue_details rows", reparsed)
-
     prefetch_cities = resolve_prefetch_cities(PREFETCH_CITIES, _cities_index, PREFETCH_RADIUS_KM)
     prefetch_task = asyncio.create_task(prefetch_loop(prefetch_cities)) if prefetch_cities else None
 
@@ -165,97 +158,52 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # ── Visit limits parsing ──
 
-# Matches the body of a "<tiers>-Mitglieder können|dürfen ... N x/Mal pro/im/am (Monat|Tag)" sentence.
-# Tier names live in the prefix immediately before "Mitglieder" — extracted separately
-# so we can handle grouped forms like "L- & XL-Mitglieder" or "M, L und XL-Mitglieder".
-# Per-day limits are converted to a 30-day month equivalent.
-#
-# Filler words may appear both before the count ("im Rahmen ihres Kontingents von insgesamt 4 x")
-# and between the count and the preposition ("4 x Sport im Monat", "8x Padel pro Monat"), so the
-# pattern allows lazy non-period stretches on either side. Requiring `x|Mal` after the digit biases
-# the capture toward genuine visit counts rather than incidental numbers in the same sentence.
-VISIT_LIMIT_SEGMENT_RE = re.compile(
-    r"Mitglieder\s+(?:können|dürfen)[^.]*?(\d+)\s*-?\s*(?:x|mal)\b[^.]*?\b(?:pro|im|am|/)\s*(Monat|Tag)",
-    re.IGNORECASE,
-)
-CORPORATE_TIER_TOKEN_RE = re.compile(r"\b(XL|S|M|L)\b", re.IGNORECASE)
-PRIVATE_TIER_TOKEN_RE = re.compile(r"\b(Essential|Classic|Premium|Max)\b", re.IGNORECASE)
-PRIVATE_TO_CORP = {v: k for k, v in CORP_TO_PRIVATE.items()}
+# USC's /venues/{id}/limits returns one entry per plan the venue is available on,
+# `b2c` for private and `b2e` for corporate memberships, keyed by the corporate
+# letter (S/M/L/XL). Each has a per-location limit (`monthlyLimitVenueAddress`)
+# and a venue-wide one (`monthlyLimitVenue`, e.g. across a chain); -1 means
+# "no limit at that level". A plan with no monthly limit at all is still capped
+# at one visit per day, which we express as a 30-day month equivalent.
 DAYS_PER_MONTH = 30
 
 
-def parse_visit_limits(text: str | None) -> VisitLimits | None:
-    """Parse bookingLimitsText into a structured VisitLimits model.
+def _plan_monthly_limit(plan: dict) -> int | None:
+    values = [v for v in (plan.get("monthlyLimitVenueAddress"), plan.get("monthlyLimitVenue")) if v is not None]
+    if not values:
+        return None
+    positive = [v for v in values if v > 0]
+    if positive:
+        return min(positive)
+    if all(v == -1 for v in values):
+        return DAYS_PER_MONTH
+    return None
 
-    Both corporate (S/M/L/XL) and private (Essential/Classic/Premium/Max) tier
-    names in the source text are matched directly. Whichever side is parsed gets
-    the other side derived via the CORP_TO_PRIVATE mapping.
 
-    "pro Monat" is taken at face value; "pro Tag" is converted to a monthly
-    figure assuming a 30-day month (e.g. "1 Mal pro Tag" → 30 / month).
+def parse_venue_limits(data: dict | None) -> VisitLimits | None:
+    """Turn a /venues/{id}/limits payload into a VisitLimits model.
+
+    Tiers the venue isn't available on are absent from the payload and map to
+    None. Private and corporate are read independently (they don't always match).
     """
-    if not text:
+    if not data:
         return None
 
-    corporate: dict[str, int | None] = {}
-    private: dict[str, int | None] = {}
-    saw_segment = False
+    corporate: dict[str, int | None] = dict.fromkeys(CORPORATE_TIER_ORDER)
+    private: dict[str, int | None] = dict.fromkeys(PRIVATE_TIER_ORDER)
+    found = False
+    for plan in data.get("b2c") or []:
+        tier = CORP_TO_PRIVATE.get(plan.get("name"))
+        if tier:
+            private[tier] = _plan_monthly_limit(plan)
+            found = True
+    for plan in data.get("b2e") or []:
+        tier = plan.get("name")
+        if tier in corporate:
+            corporate[tier] = _plan_monthly_limit(plan)
+            found = True
 
-    for m in VISIT_LIMIT_SEGMENT_RE.finditer(text):
-        saw_segment = True
-        count = int(m.group(1))
-        if m.group(2).lower() == "tag":
-            count *= DAYS_PER_MONTH
-        # Look at the text just before "Mitglieder" for the tier prefix.
-        # Trim to the most recent sentence/line break so we don't pick up
-        # tier names belonging to a previous sentence.
-        prefix = text[max(0, m.start() - 80) : m.start()]
-        for sep in (".", "\n", "\r"):
-            idx = prefix.rfind(sep)
-            if idx >= 0:
-                prefix = prefix[idx + 1 :]
-        for tier in CORPORATE_TIER_TOKEN_RE.findall(prefix):
-            tier = tier.upper()
-            if tier in CORPORATE_TIER_ORDER and tier not in corporate:
-                corporate[tier] = count
-        for tier in PRIVATE_TIER_TOKEN_RE.findall(prefix):
-            tier = tier.capitalize()
-            if tier in PRIVATE_TIER_ORDER and tier not in private:
-                private[tier] = count
-
-    if not corporate and not private:
-        logger.warning(
-            "parse_visit_limits: could not extract any tier limits from text: %r",
-            text,
-        )
+    if not found:
         return None
-
-    # In practice USC's text always uses corporate-style letters, so a missing
-    # direct private match is the norm — log at debug, not warning.
-    if saw_segment and not corporate:
-        logger.debug(
-            "parse_visit_limits: no corporate tiers parsed (only private) from text: %r",
-            text,
-        )
-    if saw_segment and not private:
-        logger.debug(
-            "parse_visit_limits: no private tiers parsed (only corporate) from text: %r",
-            text,
-        )
-
-    # Cross-fill: USC almost always uses corporate-style letters, but if either
-    # side is populated, derive the other via the 1:1 mapping.
-    for corp, priv in CORP_TO_PRIVATE.items():
-        if corp in corporate and priv not in private:
-            private[priv] = corporate[corp]
-        if priv in private and corp not in corporate:
-            corporate[corp] = private[priv]
-
-    for t in CORPORATE_TIER_ORDER:
-        corporate.setdefault(t, None)
-    for t in PRIVATE_TIER_ORDER:
-        private.setdefault(t, None)
-
     return VisitLimits(private=private, corporate=corporate)
 
 
@@ -314,7 +262,6 @@ def transform_venue(raw: dict, detail: VenueDetail | None = None) -> Venue:
         rating=ratings.get("averageScore"),
         review_count=ratings.get("totalRatings"),
         visit_limits=detail.visit_limits if detail else None,
-        bookingLimitsText=detail.bookingLimitsText if detail else None,
         is_online=raw.get("isOnline", 0) == 1,
         has_coordinates=bool(lat and lng),
     )
@@ -418,6 +365,28 @@ async def fetch_venue_detail(venue_id: int, client: httpx.AsyncClient | None = N
     resp = await client.get(f"{USC_API}/venues/{venue_id}")
     resp.raise_for_status()
     return resp.json().get("data", {})
+
+
+async def fetch_venue_limits(venue_id: int, client: httpx.AsyncClient | None = None) -> dict:
+    """Fetch a venue's per-plan visit limits from the USC API (see parse_venue_limits)."""
+    if client is None:
+        async with httpx.AsyncClient(headers=USC_HEADERS, timeout=30) as one_shot:
+            return await fetch_venue_limits(venue_id, one_shot)
+    resp = await client.get(f"{USC_API}/venues/{venue_id}/limits")
+    resp.raise_for_status()
+    return resp.json().get("data", {})
+
+
+def build_venue_detail(raw: dict, limits: dict) -> VenueDetail:
+    """Combine /venues/{id} and /venues/{id}/limits payloads into a VenueDetail."""
+    return VenueDetail(
+        visit_limits=parse_venue_limits(limits),
+        importantInfo=raw.get("importantInfo"),
+        phone=raw.get("phone"),
+        website=raw.get("website"),
+        description=raw.get("description"),
+        fetched_at=time.time(),
+    )
 
 
 # ── Course transformation and fetching ──
@@ -532,17 +501,10 @@ async def enrich_venue_details(city_id: int) -> None:
             nonlocal processed
             async with semaphore:
                 try:
+                    # Sequential on purpose: keeps at most 5 requests in flight.
                     raw = await fetch_venue_detail(int(vid), client)
-                    limits_text = raw.get("bookingLimitsText")
-                    detail = VenueDetail(
-                        visit_limits=parse_visit_limits(limits_text),
-                        bookingLimitsText=limits_text,
-                        importantInfo=raw.get("importantInfo"),
-                        phone=raw.get("phone"),
-                        website=raw.get("website"),
-                        description=raw.get("description"),
-                        fetched_at=time.time(),
-                    )
+                    limits = await fetch_venue_limits(int(vid), client)
+                    detail = build_venue_detail(raw, limits)
                     await run_in_threadpool(storage.upsert_venue_detail, vid, detail)
                     processed += 1
                     if processed % 50 == 0:
@@ -685,20 +647,12 @@ async def get_venue_detail(venue_id: int):
 
     try:
         raw = await fetch_venue_detail(venue_id)
+        limits = await fetch_venue_limits(venue_id)
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
             raise HTTPException(status_code=404, detail=f"Venue {venue_id} not found") from e
         raise
-    limits_text = raw.get("bookingLimitsText")
-    detail = VenueDetail(
-        visit_limits=parse_visit_limits(limits_text),
-        bookingLimitsText=limits_text,
-        importantInfo=raw.get("importantInfo"),
-        phone=raw.get("phone"),
-        website=raw.get("website"),
-        description=raw.get("description"),
-        fetched_at=time.time(),
-    )
+    detail = build_venue_detail(raw, limits)
     await run_in_threadpool(storage.upsert_venue_detail, vid, detail)
     _venues_response_cache.clear()
     return detail

@@ -134,7 +134,6 @@ def _migrate(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS venue_details (
             venue_id             TEXT PRIMARY KEY,
             visit_limits_json    TEXT,
-            booking_limits_text  TEXT,
             important_info       TEXT,
             phone                TEXT,
             website              TEXT,
@@ -375,8 +374,7 @@ def get_venues_payload(city_id: int) -> VenuesPayload | None:
         rows = conn.execute(
             """
             SELECT v.*,
-                   d.visit_limits_json AS d_visit_limits_json,
-                   d.booking_limits_text AS d_booking_limits_text
+                   d.visit_limits_json AS d_visit_limits_json
             FROM venues v
             LEFT JOIN venue_details d ON d.venue_id = v.venue_id
             WHERE v.city_id = ?
@@ -423,7 +421,6 @@ def _row_to_venue(row: sqlite3.Row) -> Venue:
         is_online=bool(row["is_online"]),
         has_coordinates=bool(row["has_coordinates"]),
         visit_limits=visit_limits,
-        bookingLimitsText=row["d_booking_limits_text"],
     )
 
 
@@ -444,7 +441,6 @@ def _row_to_venue_detail(row: sqlite3.Row) -> VenueDetail:
         visit_limits = VisitLimits.model_validate_json(row["visit_limits_json"])
     return VenueDetail(
         visit_limits=visit_limits,
-        bookingLimitsText=row["booking_limits_text"],
         importantInfo=row["important_info"],
         phone=row["phone"],
         website=row["website"],
@@ -458,13 +454,12 @@ def upsert_venue_detail(venue_id: str, detail: VenueDetail) -> None:
         _c().execute(
             """
             INSERT INTO venue_details (
-                venue_id, visit_limits_json, booking_limits_text,
+                venue_id, visit_limits_json,
                 important_info, phone, website, description, fetched_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(venue_id) DO UPDATE SET
                 visit_limits_json   = excluded.visit_limits_json,
-                booking_limits_text = excluded.booking_limits_text,
                 important_info      = excluded.important_info,
                 phone               = excluded.phone,
                 website             = excluded.website,
@@ -474,7 +469,6 @@ def upsert_venue_detail(venue_id: str, detail: VenueDetail) -> None:
             (
                 venue_id,
                 detail.visit_limits.model_dump_json() if detail.visit_limits else None,
-                detail.bookingLimitsText,
                 detail.importantInfo,
                 detail.phone,
                 detail.website,
@@ -482,32 +476,6 @@ def upsert_venue_detail(venue_id: str, detail: VenueDetail) -> None:
                 detail.fetched_at,
             ),
         )
-
-
-def reparse_visit_limits(parse_fn) -> int:
-    """Re-derive visit_limits_json for every venue_details row from its cached
-    booking_limits_text using the provided parser. Used when the parser logic
-    changes so we don't need to re-fetch from USC. Returns row count updated.
-    """
-    with _lock:
-        conn = _c()
-        rows = conn.execute("SELECT venue_id, booking_limits_text FROM venue_details").fetchall()
-        conn.execute("BEGIN")
-        try:
-            for r in rows:
-                limits = parse_fn(r["booking_limits_text"])
-                conn.execute(
-                    "UPDATE venue_details SET visit_limits_json = ? WHERE venue_id = ?",
-                    (
-                        limits.model_dump_json() if limits else None,
-                        r["venue_id"],
-                    ),
-                )
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
-    return len(rows)
 
 
 def list_venue_ids_needing_details(city_id: int, max_age_seconds: float) -> list[str]:

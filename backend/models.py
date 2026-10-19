@@ -36,14 +36,12 @@ class Venue(BaseModel):
     has_coordinates: bool
     # Enrichment fields (nullable until filled by the background task)
     visit_limits: VisitLimits | None = None
-    bookingLimitsText: str | None = None
 
 
 class VenueDetail(BaseModel):
     """Enrichment payload returned by /api/venues/{id}."""
 
     visit_limits: VisitLimits | None = None
-    bookingLimitsText: str | None = None
     importantInfo: str | None = None
     phone: str | None = None
     website: str | None = None
