@@ -565,3 +565,14 @@ def test_venue_points_skip_missing_coordinates(db):
     assert db.get_venue_points(["a", "b", "zz"]) == {"a": (52.5, 13.4)}
     assert sorted(db.list_city_venue_points([1, 2])) == [("a", 52.5, 13.4), ("c", 52.4, 13.06)]
     assert db.list_city_venue_points([]) == []
+
+
+def test_find_courses_across_cities(db):
+    db.upsert_cities([make_city(1), make_city(2, "Hamburg")], fetched_at=time.time())
+    db.upsert_courses_for_date(1, "2026-04-10", [make_course(10)], fetched_at=time.time())
+    db.upsert_courses_for_date(2, "2026-04-10", [make_course(20, title="HH")], fetched_at=time.time())
+    found = db.find_courses([(10, "2026-04-10"), (20, "2026-04-10"), (10, "2026-04-11")])
+    assert set(found) == {(10, "2026-04-10"), (20, "2026-04-10")}
+    assert found[(20, "2026-04-10")][0] == 2
+    assert found[(20, "2026-04-10")][1].title == "HH"
+    assert db.find_courses([]) == {}

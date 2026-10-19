@@ -925,6 +925,338 @@ select:focus, input[type="text"]:focus {
     display: none;
 }
 
+/* ── Plan view ── */
+#plan-view {
+    flex: 1;
+    overflow-y: auto;
+}
+
+#plan-view .loading,
+.plan-empty {
+    padding: 32px 16px;
+    text-align: center;
+    color: #777;
+}
+
+.plan-empty p + p,
+.plan-empty p + button {
+    margin-top: 10px;
+}
+
+.plan-hint code {
+    background: #eef3fb;
+    padding: 1px 4px;
+    border-radius: 3px;
+}
+
+.plan-banner {
+    padding: 10px 16px;
+    background: #fff6e0;
+    border-bottom: 1px solid #f0d9a0;
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.plan-toolbar {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 10px 16px 6px;
+    background: white;
+}
+
+.plan-chips {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.plan-chip,
+.plan-chip-radio span {
+    display: inline-block;
+    padding: 4px 10px;
+    border: 1px solid #ccd6e3;
+    border-radius: 14px;
+    background: white;
+    color: #444;
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.plan-chip.on,
+.plan-chip-radio input:checked + span {
+    background: #4a90d9;
+    border-color: #4a90d9;
+    color: white;
+}
+
+.plan-chip-radio input,
+.plan-star input {
+    position: absolute;
+    opacity: 0;
+    pointer-events: none;
+}
+
+.plan-chip-radio input:focus-visible + span,
+.plan-star input:focus-visible + span {
+    outline: 2px solid #4a90d9;
+    outline-offset: 1px;
+}
+
+.plan-days {
+    display: flex;
+    gap: 6px;
+    overflow-x: auto;
+    padding: 6px 16px 12px;
+    background: white;
+    border-bottom: 1px solid #ddd;
+}
+
+.plan-day {
+    flex: 0 0 auto;
+    width: 84px;
+    padding: 6px;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    background: white;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.plan-day .dow {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    color: #888;
+}
+
+.plan-day .num {
+    display: block;
+    font-size: 13px;
+    font-weight: 700;
+}
+
+.plan-day .what {
+    display: block;
+    font-size: 11px;
+    color: #666;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.plan-day.past { opacity: 0.7; }
+.plan-day.today .dow { color: #d98e04; }
+.plan-day.has-pick { border-color: #27ae60; }
+.plan-day.has-pick .what { color: #1e8449; font-weight: 600; }
+
+.plan-day.selected {
+    border-color: #4a90d9;
+    box-shadow: 0 0 0 2px #4a90d9 inset;
+    opacity: 1;
+}
+
+.plan-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #e67e22;
+}
+
+.plan-card {
+    padding: 10px 16px 12px;
+    border-bottom: 1px solid #eee;
+    background: white;
+    cursor: pointer;
+}
+
+.plan-card:hover { background: #f7faff; }
+.plan-card.picked { background: #eefaf1; box-shadow: 3px 0 0 #27ae60 inset; }
+.plan-card.dismissed { opacity: 0.55; }
+
+.plan-card-head {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 12px;
+}
+
+.plan-card-head .course-time { margin-bottom: 0; }
+
+.plan-rank {
+    font-weight: 700;
+    color: #888;
+}
+
+.plan-reason {
+    margin-top: 4px;
+    font-size: 12px;
+    color: #444;
+    line-height: 1.4;
+}
+
+.plan-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-top: 6px;
+}
+
+.plan-tag {
+    padding: 1px 7px;
+    border-radius: 9px;
+    background: #eef3fb;
+    color: #2471a3;
+    font-size: 11px;
+}
+
+.plan-visit-note {
+    margin-top: 6px;
+    font-size: 11px;
+    color: #b9770e;
+}
+
+.plan-visit-note.over {
+    color: #c0392b;
+    font-weight: 600;
+}
+
+.plan-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+}
+
+.plan-button {
+    padding: 5px 12px;
+    border: 1px solid #ccd6e3;
+    border-radius: 6px;
+    background: white;
+    color: #333;
+    font: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.plan-button.primary {
+    background: #27ae60;
+    border-color: #27ae60;
+    color: white;
+}
+
+.plan-button:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+.plan-link {
+    border: none;
+    background: none;
+    padding: 0;
+    color: #2471a3;
+    font: inherit;
+    text-decoration: underline;
+    cursor: pointer;
+}
+
+.plan-feedback,
+.plan-feedback-summary {
+    margin-top: 10px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    background: #f7f7f7;
+    font-size: 12px;
+    cursor: default;
+}
+
+.plan-feedback-summary {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 10px;
+    align-items: baseline;
+}
+
+.plan-feedback-summary .plan-reason { flex-basis: 100%; }
+
+.plan-field {
+    display: block;
+    margin-bottom: 8px;
+    font-weight: 600;
+    color: #444;
+}
+
+.plan-field[hidden] { display: none; }
+
+.plan-radios {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 4px;
+    font-weight: normal;
+}
+
+.plan-chip-radio,
+.plan-star {
+    position: relative;
+}
+
+.plan-stars {
+    display: flex;
+    flex-direction: row-reverse;
+    justify-content: flex-end;
+    margin-top: 2px;
+}
+
+.plan-star span {
+    font-size: 22px;
+    color: #ccc;
+    cursor: pointer;
+    padding: 0 1px;
+}
+
+/* Stars are in reverse DOM order so ~ can light up every star up to the checked one. */
+.plan-star input:checked + span,
+.plan-star:has(input:checked) ~ .plan-star span {
+    color: #f1c40f;
+}
+
+.plan-feedback textarea {
+    display: block;
+    width: 100%;
+    margin-top: 4px;
+    padding: 6px 8px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    font: inherit;
+    font-weight: normal;
+    resize: vertical;
+}
+
+.plan-marker {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    background: #4a90d9;
+    border: 2px solid white;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+    color: white;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.plan-marker.picked { background: #27ae60; }
+
+body.plan-active #filters-button { display: none; }
+
 @media (max-width: 768px) {
     #app {
         display: block;
@@ -978,7 +1310,8 @@ select:focus, input[type="text"]:focus {
     /* At half, the sheet's lower part hangs below the viewport; pad the
        lists so every item can still be scrolled into view. */
     #sidebar[data-sheet="half"] #venue-list,
-    #sidebar[data-sheet="half"] #course-list {
+    #sidebar[data-sheet="half"] #course-list,
+    #sidebar[data-sheet="half"] #plan-view {
         padding-bottom: 42dvh;
     }
 

@@ -590,6 +590,26 @@ def get_courses_for_dates(city_id: int, dates: list[str]) -> dict[str, list[Cour
     return out
 
 
+def find_courses(pairs: list[tuple[int, str]]) -> dict[tuple[int, str], tuple[int, Course]]:
+    """Look up cached courses by (course_id, date) across all cities.
+
+    Returns {(course_id, date): (city_id, Course)}; pairs not in the cache are absent.
+    """
+    out: dict[tuple[int, str], tuple[int, Course]] = {}
+    unique = list(dict.fromkeys(pairs))
+    # Stay well below SQLite's bound-parameter limit (2 params per pair).
+    for i in range(0, len(unique), 400):
+        chunk = unique[i : i + 400]
+        values = ",".join("(?, ?)" for _ in chunk)
+        rows = _fetchall(
+            f"SELECT * FROM courses WHERE (course_id, date) IN (VALUES {values})",
+            tuple(x for pair in chunk for x in pair),
+        )
+        for r in rows:
+            out[(r["course_id"], r["date"])] = (r["city_id"], _row_to_course(r))
+    return out
+
+
 def _row_to_course(row: sqlite3.Row) -> Course:
     return Course(
         id=row["course_id"],

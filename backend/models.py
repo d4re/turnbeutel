@@ -1,8 +1,8 @@
 """Pydantic domain models shared between transformation, storage, and handlers."""
 
-from typing import Literal, Self
+from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, StringConstraints, model_validator
 
 PRIVATE_TIER_ORDER = ["Essential", "Classic", "Premium", "Max"]
 CORPORATE_TIER_ORDER = ["S", "M", "L", "XL"]
@@ -250,3 +250,129 @@ class ExactTransit(BaseModel):
     arrive_at: str
     lines: list[str]
     walk_m: int
+
+
+# ── Planner ──
+
+IsoDate = Annotated[str, StringConstraints(pattern=r"^\d{4}-\d{2}-\d{2}$")]
+
+
+class Feedback(BaseModel):
+    """How a picked course went. Fields only apply in the combinations below."""
+
+    went: Literal["yes", "no", "came_up"]
+    no_reason: Literal["cancelled", "full", "didnt_feel_like_it", "other"] | None = None
+    rating: int | None = Field(None, ge=1, le=5)
+    again: Literal["no", "maybe", "yes"] | None = None
+    again_after: Literal["1w", "2-4w", "1-3m", "someday"] | None = None
+    note: str = ""
+    updated_at: float | None = None
+
+    @model_validator(mode="after")
+    def _check_combinations(self) -> Self:
+        if self.rating is not None and self.went != "yes":
+            raise ValueError("rating only applies when went is 'yes'")
+        if self.no_reason is not None and self.went != "no":
+            raise ValueError("no_reason only applies when went is 'no'")
+        if self.again_after is not None and self.again not in ("maybe", "yes"):
+            raise ValueError("again_after only applies when again is 'maybe' or 'yes'")
+        return self
+
+
+class NewSuggestion(BaseModel):
+    course_id: int
+    date: IsoDate
+    rank: int = Field(ge=1)
+    reason: str = ""
+    tags: list[str] = []
+
+
+class RunCreate(BaseModel):
+    """Body of POST /api/planner/runs."""
+
+    date_from: IsoDate
+    date_to: IsoDate
+    summary: str = ""
+    suggestions: list[NewSuggestion]
+
+    @model_validator(mode="after")
+    def _check_window(self) -> Self:
+        if self.date_from > self.date_to:
+            raise ValueError("date_from must not be after date_to")
+        outside = [s.date for s in self.suggestions if not self.date_from <= s.date <= self.date_to]
+        if outside:
+            raise ValueError(f"suggestion dates outside the run window: {sorted(set(outside))}")
+        return self
+
+
+class Run(BaseModel):
+    id: int
+    created_at: float
+    date_from: str
+    date_to: str
+    summary: str
+
+
+class Suggestion(BaseModel):
+    """A ranked suggestion with a snapshot of its course (the course cache gets purged)."""
+
+    id: int
+    run_id: int
+    course_id: int
+    date: str
+    rank: int
+    reason: str
+    tags: list[str]
+    title: str
+    start_time: str
+    end_time: str
+    venue_id: str
+    venue_name: str
+    district: str
+    category: str
+    city_id: int
+    lat: float | None
+    lng: float | None
+    # Class-level plan coverage and on-site fee, as on Course.
+    tiers_private: list[str] = []
+    tiers_corporate: list[str] = []
+    min_tier_private: str | None = None
+    min_tier_corporate: str | None = None
+    extra_fee_text: str | None = None
+    extra_fee_eur: int | None = None
+    picked: bool
+    not_interested: bool
+    created_at: float
+    feedback: Feedback | None = None
+    # Live values joined from the course cache; None once the course is purged.
+    free_spots: int | None = None
+    max_spots: int | None = None
+
+
+class SuggestionPatch(BaseModel):
+    rank: int | None = Field(None, ge=1)
+    reason: str | None = None
+    tags: list[str] | None = None
+    picked: bool | None = None
+    not_interested: bool | None = None
+
+
+class Profile(BaseModel):
+    text: str
+    updated_at: float | None = None
+
+
+class ProfileUpdate(BaseModel):
+    text: str
+
+
+class PlannerSuggestionsResponse(BaseModel):
+    """Response shape for GET /api/planner/suggestions and /history."""
+
+    runs: list[Run]
+    suggestions: list[Suggestion]
+
+
+class RunCreated(BaseModel):
+    run: Run
+    suggestions: list[Suggestion]

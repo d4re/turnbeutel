@@ -240,6 +240,22 @@ async function init() {
 
   // Courses view is independent from the venues fetch — always wire it up.
   initCoursesView();
+
+  planner.init({
+    map,
+    esc,
+    todayIso,
+    addDaysIso,
+    popupOptions,
+    collapseSheetForMap,
+    isMobileLayout,
+    courseBadgesHtml,
+    travelChipsHtml,
+    requestTravel,
+    expandCourseDetails,
+    collapseCourseItem,
+    planVisitLimit,
+  });
 }
 
 function scheduleViewportUpdate() {
@@ -383,8 +399,17 @@ function switchView(view) {
   document.getElementById("courses-filters").style.display = view === "courses" ? "" : "none";
   document.getElementById("venue-list").style.display = view === "venues" ? "" : "none";
   document.getElementById("course-list").style.display = view === "courses" ? "" : "none";
+  document.getElementById("plan-view").style.display = view === "plan" ? "" : "none";
+  document.body.classList.toggle("plan-active", view === "plan");
 
-  if (view === "venues") {
+  if (view !== "plan") planner.hide();
+
+  if (view === "plan") {
+    // The planner draws its own markers; venues/courses re-render on return.
+    markerCluster.clearLayers();
+    mapMarkersCleared = true;
+    planner.show();
+  } else if (view === "venues") {
     applyFilters();
   } else if (!coursesLoaded) {
     fetchCourses();
@@ -785,6 +810,24 @@ function courseBadgesHtml(course) {
     html += ` <span class="upgrade-badge" title="Needs ${label} or higher">\u2b06 ${label}</span>`;
   }
   return html;
+}
+
+// Open `course`'s details block inside `item`, closing any other open one.
+// The Plan view uses this for its cards (course-like suggestion objects).
+function expandCourseDetails(item, course) {
+  if (expandedCourse && expandedCourse.item !== item) collapseCourseItem(expandedCourse.item);
+  item.classList.add("expanded");
+  expandedCourse = { item, course };
+  renderCourseDetails(item, course);
+}
+
+// The plan's monthly visit limit at a venue, or null when unknown or only the
+// one-visit-per-day cap applies (stored as 30, see parse_venue_limits).
+function planVisitLimit(venueId) {
+  const plan = settings.plan;
+  const venue = plan && findVenue(venueId);
+  const limit = venue?.visit_limits?.[plan.type]?.[plan.tier];
+  return limit == null || limit >= 30 ? null : limit;
 }
 
 const BOOKING_TYPE_LABELS = {
@@ -1702,6 +1745,7 @@ function applyFilters() {
 }
 
 function updateStats() {
+  if (currentView === "plan") return; // the planner owns the stats line there
   const total = filteredVenues.length;
   const withCoords = filteredVenues.filter((v) => v.has_coordinates).length;
   const statsEl = document.getElementById("stats");
@@ -2200,7 +2244,9 @@ function updateFilterBadge() {
   const badge = document.getElementById("filter-badge");
   let count = 0;
 
-  if (currentView === "venues") {
+  if (currentView === "plan") {
+    // The Plan view has no filter overlay.
+  } else if (currentView === "venues") {
     const sliderMax = document.getElementById("slider-max");
     if (parseInt(document.getElementById("slider-min").value) > 0) count++;
     else if (parseInt(sliderMax.value) < parseInt(sliderMax.max)) count++;

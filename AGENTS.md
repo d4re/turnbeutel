@@ -20,13 +20,15 @@ Travel times from home live in `backend/travel.py`. Bike uses only OSRM's *dista
 
 The frontend keeps its own in-memory cache of what it has loaded (`loadedVenueCities`, `loadedCourseCities` in `app.js`), with a soft TTL of 60 min (`CLIENT_CACHE_TTL_MS`): panning back to a city (or re-selecting a date) past the TTL re-fetches and *replaces* that city's (resp. that city+date's) data instead of appending. Design doc: `docs/superpowers/specs/2026-07-11-client-cache-ttl-design.md`.
 
+The **planner** is a separate, single-user feature: Claude (project skill `.claude/skills/plan-courses/`) writes ranked per-day course suggestions through `/api/planner/*`, and the Plan view (`frontend/planner.js`) shows them and records picks and feedback, which the next run reads. Its data lives in `planner_store.py` → `backend/data/planner.db` (`PLANNER_DB`), never in the cache. Disabled unless `PLANNER_TOKEN` is set. Design doc: `docs/superpowers/specs/2026-10-19-course-planner-design.md`.
+
 ## Linting & Testing
 
 A pre-commit hook (`.git/hooks/pre-commit`) runs all checks automatically before each commit.
 
 ### Backend (Python)
 - **Linter/formatter**: Ruff — configured in `backend/pyproject.toml`
-- **Tests**: Pytest — outcome-based tests in `backend/test_server.py` (pure functions + endpoints) and `backend/test_storage.py` (SQLite layer)
+- **Tests**: Pytest — outcome-based tests in `backend/test_server.py` (pure functions + endpoints), `backend/test_storage.py` (SQLite layer) and `backend/test_planner_store.py` (planner store)
 - Install dev dependencies: `cd backend && uv sync --group dev`
 - Run manually:
   ```bash
@@ -81,6 +83,17 @@ Vanilla HTML + JS + CSS. Leaflet.js and MarkerCluster loaded from CDN. No bundle
 Below `max-width: 768px` (one CSS media query, mirrored by `matchMedia` in JS) the sidebar becomes a draggable bottom sheet with three snap states (`data-sheet="peek|half|full"` on `#sidebar`); the map always fills the viewport, so sheet moves never resize the map. Filter panels open as an overlay filling the sheet — the sheet's `transform` makes it the containing block for positioned descendants, so `position: fixed` inside it does NOT reach the viewport. Desktop layout is untouched. On mobile, the tap that expands a course does not focus the map (that would drop the sheet to peek and hide the details); tapping it again collapses it and focuses the venue. The "You" panel opens as the same kind of overlay (`body.you-open`). Design doc: `docs/superpowers/specs/2026-07-11-mobile-bottom-sheet-design.md`.
 
 Related invariant: don't re-render markers on viewport changes unless new data arrived or the zoom-out branch cleared the layer (`mapMarkersCleared` in `app.js`) — rebuilding markers destroys open popups and made list-tap → popup flaky. Also, `init()` must stay the last statement in `app.js`: it runs immediately and reads top-level `const` bindings that only exist once the whole script has evaluated.
+
+### The planner: Claude ranks, the app stores
+
+The app does no recommending. `POST /api/planner/runs` stores Claude's per-day ranks, reasons and tags; the Plan view sorts by rank and filters by time of day. Key rules:
+
+- **Separate database.** `usc.db` is disposable cache (`purge_stale_courses`, `make clean`), so planner data is in `planner.db`. Each suggestion keeps a **snapshot** of its course (title, venue, time, coordinates) because the cached course disappears after a few days; live free spots are joined from the cache while it still has them.
+- **The server snapshots, not the client.** A run only sends `(course_id, date)`; unknown pairs fail the whole run with 422.
+- **Re-runs replace only untouched suggestions** in their date window. Picked, not-interested or reviewed suggestions are history and stay; a re-suggested kept course is updated in place (`UNIQUE (course_id, date)`).
+- **One pick per date** (partial unique index); picking another suggestion that day unpicks the first.
+- **Auth is one shared token** (`PLANNER_TOKEN`, Bearer, `secrets.compare_digest`): 503 when unset, 401 when wrong. The frontend keeps it in localStorage. Single user per instance; no accounts.
+- **Reuses course details and travel times.** Suggestions also snapshot the class tiers and on-site fee, so the Plan cards render with app.js's `courseBadgesHtml`, `travelChipsHtml` and the expandable details block (`expandCourseDetails`); `planner.init()` receives these helpers. `POST /api/planner/runs` queues travel for the suggested venues (`travel_worker.request`), so chips are usually ready when the Plan view opens. The run's plan, home and bike speed come from `/api/settings`, not the profile.
 
 ### Releases are derived from commit messages
 

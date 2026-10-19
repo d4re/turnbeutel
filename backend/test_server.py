@@ -502,6 +502,7 @@ def seeded_client(tmp_path: Path, monkeypatch):
     storage.close()
 
     monkeypatch.setattr(server, "DB_PATH", db_path)
+    monkeypatch.setattr(server, "PLANNER_DB", tmp_path / "planner.db")
     # Never start the background prefetch loop from the fixture's lifespan.
     monkeypatch.setattr(server, "PREFETCH_CITIES", "")
     # Never start the travel worker either; tests inject fakes via server.travel_worker.
@@ -1412,3 +1413,186 @@ def test_travel_exact_rejects_bad_date(travel_client):
     client, _ = travel_client
     _set_home(client)
     assert _exact(client, date_="22.10.2026").status_code == 422
+
+
+# ── Planner API ────────────────────────────────────────────────────────────
+
+PLANNER_AUTH = {"Authorization": "Bearer t"}
+
+
+def _planner_course(course_id: int, day: str, title: str) -> Course:
+    return Course(
+        id=course_id,
+        date=day,
+        title=title,
+        start_time="18:00",
+        end_time="19:00",
+        venue_id="v1",
+        venue_name="Studio One",
+        lat=52.5,
+        lng=13.4,
+        district="Mitte",
+        category="Dance",
+        category_id=3,
+        teacher="",
+        free_spots=3,
+        max_spots=10,
+        is_online=False,
+        is_plus=False,
+    )
+
+
+@pytest.fixture
+def planner_days():
+    today = date.today()
+    return {
+        "yesterday": (today - timedelta(days=1)).isoformat(),
+        "tomorrow": (today + timedelta(days=1)).isoformat(),
+    }
+
+
+@pytest.fixture
+def planner_client(seeded_client, monkeypatch, planner_days):
+    """seeded_client with the planner enabled (token "t") and three cached courses."""
+    monkeypatch.setattr(server, "PLANNER_TOKEN", "t")
+    y, t = planner_days["yesterday"], planner_days["tomorrow"]
+    storage.upsert_courses_for_date(1, y, [_planner_course(100, y, "Past Salsa")], fetched_at=time.time())
+    storage.upsert_courses_for_date(
+        1, t, [_planner_course(200, t, "Aerial Hoop"), _planner_course(201, t, "Contact Jam")], fetched_at=time.time()
+    )
+    return seeded_client
+
+
+def _post_run(client, days, pairs):
+    return client.post(
+        "/api/planner/runs",
+        headers=PLANNER_AUTH,
+        json={
+            "date_from": days["yesterday"],
+            "date_to": days["tomorrow"],
+            "summary": "first run",
+            "suggestions": [
+                {"course_id": cid, "date": d, "rank": i + 1, "reason": "why", "tags": ["new"]}
+                for i, (cid, d) in enumerate(pairs)
+            ],
+        },
+    )
+
+
+def _all_suggestions(client, days):
+    r = client.get(
+        "/api/planner/suggestions",
+        params={"from": days["yesterday"], "to": days["tomorrow"]},
+        headers=PLANNER_AUTH,
+    )
+    assert r.status_code == 200
+    return r.json()["suggestions"]
+
+
+def test_planner_status_reports_enabled(planner_client, monkeypatch):
+    assert planner_client.get("/api/planner/status").json() == {"enabled": True}
+    monkeypatch.setattr(server, "PLANNER_TOKEN", "")
+    assert planner_client.get("/api/planner/status").json() == {"enabled": False}
+
+
+def test_planner_disabled_returns_503(planner_client, monkeypatch):
+    monkeypatch.setattr(server, "PLANNER_TOKEN", "")
+    r = planner_client.get("/api/planner/profile", headers=PLANNER_AUTH)
+    assert r.status_code == 503
+    assert r.json() == {"detail": "planner disabled: PLANNER_TOKEN not set"}
+
+
+def test_planner_requires_bearer(planner_client):
+    assert planner_client.get("/api/planner/profile").status_code == 401
+    assert planner_client.get("/api/planner/profile", headers={"Authorization": "Bearer nope"}).status_code == 401
+    assert planner_client.get("/api/planner/profile", headers=PLANNER_AUTH).status_code == 200
+
+
+def test_planner_profile_roundtrip(planner_client):
+    r = planner_client.put("/api/planner/profile", headers=PLANNER_AUTH, json={"text": "likes dance"})
+    assert r.status_code == 200
+    assert planner_client.get("/api/planner/profile", headers=PLANNER_AUTH).json()["text"] == "likes dance"
+
+
+def test_post_run_builds_snapshots_from_cache(planner_client, planner_days):
+    r = _post_run(planner_client, planner_days, [(200, planner_days["tomorrow"])])
+    assert r.status_code == 200
+    body = r.json()
+    assert body["run"]["summary"] == "first run"
+    s = body["suggestions"][0]
+    assert (s["title"], s["venue_name"], s["city_id"]) == ("Aerial Hoop", "Studio One", 1)
+
+
+def test_post_run_unknown_course_422_writes_nothing(planner_client, planner_days):
+    t = planner_days["tomorrow"]
+    r = _post_run(planner_client, planner_days, [(200, t), (999, t)])
+    assert r.status_code == 422
+    assert r.json()["detail"]["missing"] == [{"course_id": 999, "date": t}]
+    assert _all_suggestions(planner_client, planner_days) == []
+    assert planner_client.get("/api/planner/history", headers=PLANNER_AUTH).json()["runs"] == []
+
+
+def test_suggestions_join_live_spots_and_survive_purge(planner_client, planner_days):
+    t = planner_days["tomorrow"]
+    _post_run(planner_client, planner_days, [(200, t)])
+    assert _all_suggestions(planner_client, planner_days)[0]["free_spots"] == 3
+    storage.upsert_courses_for_date(1, t, [], fetched_at=time.time())
+    s = _all_suggestions(planner_client, planner_days)[0]
+    assert s["title"] == "Aerial Hoop"
+    assert s["free_spots"] is None
+
+
+def test_pick_and_feedback_flow(planner_client, planner_days):
+    _post_run(planner_client, planner_days, [(100, planner_days["yesterday"])])
+    sid = _all_suggestions(planner_client, planner_days)[0]["id"]
+    r = planner_client.patch(f"/api/planner/suggestions/{sid}", headers=PLANNER_AUTH, json={"picked": True})
+    assert r.json()["picked"] is True
+    r = planner_client.put(
+        f"/api/planner/suggestions/{sid}/feedback",
+        headers=PLANNER_AUTH,
+        json={"went": "yes", "rating": 5, "again": "yes", "again_after": "2-4w", "note": "loved it"},
+    )
+    assert r.status_code == 200
+    history = planner_client.get("/api/planner/history", headers=PLANNER_AUTH).json()
+    assert history["suggestions"][0]["feedback"]["note"] == "loved it"
+    assert history["runs"][0]["summary"] == "first run"
+
+
+def test_feedback_conflicts_and_validation(planner_client, planner_days):
+    _post_run(planner_client, planner_days, [(100, planner_days["yesterday"]), (200, planner_days["tomorrow"])])
+    by_id = {s["course_id"]: s["id"] for s in _all_suggestions(planner_client, planner_days)}
+    for sid in by_id.values():
+        planner_client.patch(f"/api/planner/suggestions/{sid}", headers=PLANNER_AUTH, json={"picked": True})
+    r = planner_client.put(
+        f"/api/planner/suggestions/{by_id[200]}/feedback", headers=PLANNER_AUTH, json={"went": "yes"}
+    )
+    assert r.status_code == 409
+    r = planner_client.put(
+        f"/api/planner/suggestions/{by_id[100]}/feedback", headers=PLANNER_AUTH, json={"went": "no", "rating": 4}
+    )
+    assert r.status_code == 422
+
+
+def test_delete_picked_is_409(planner_client, planner_days):
+    _post_run(planner_client, planner_days, [(200, planner_days["tomorrow"]), (201, planner_days["tomorrow"])])
+    s1, s2 = (s["id"] for s in _all_suggestions(planner_client, planner_days))
+    planner_client.patch(f"/api/planner/suggestions/{s1}", headers=PLANNER_AUTH, json={"picked": True})
+    assert planner_client.delete(f"/api/planner/suggestions/{s1}", headers=PLANNER_AUTH).status_code == 409
+    assert planner_client.delete(f"/api/planner/suggestions/{s2}", headers=PLANNER_AUTH).status_code == 204
+
+
+def test_unknown_suggestion_404(planner_client):
+    r = planner_client.patch("/api/planner/suggestions/999", headers=PLANNER_AUTH, json={"rank": 1})
+    assert r.status_code == 404
+
+
+def test_post_run_warms_travel_for_suggested_venues(planner_client, planner_days, monkeypatch):
+    fake = _FakeWorker()
+    monkeypatch.setattr(server, "travel_worker", fake)
+    t = planner_days["tomorrow"]
+    _post_run(planner_client, planner_days, [(200, t)])
+    assert fake.requested == []  # no home set: nothing to warm
+
+    fake.set_origin((52.55, 13.48))
+    _post_run(planner_client, planner_days, [(200, t), (201, t)])
+    assert fake.requested == [(["v1"], None)]  # once per venue, following the stored home
