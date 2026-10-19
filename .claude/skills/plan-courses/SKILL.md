@@ -18,7 +18,13 @@ user for them. Don't guess the URL. Check that the planner is enabled:
 
 ```bash
 curl -s "$TURNBEUTEL_URL/api/planner/status"          # {"enabled": true}
+curl -s "$TURNBEUTEL_URL/api/settings"                # plan, home, bike_kmh (the app's "You" panel)
 ```
+
+The user's membership plan, home and bike speed come from `/api/settings`,
+not from the profile. If `plan` or `home` is missing, ask the user to set it
+in the app's **You** panel before continuing: tier checks and travel times
+depend on it.
 
 All planner calls below need `-H "Authorization: Bearer $PLANNER_TOKEN"`.
 Keep large responses out of the conversation: save them to the scratchpad
@@ -68,21 +74,24 @@ profile.
 
 ### 4. Candidates
 
-Use the helper. It downloads `/api/courses` and `/api/venues`, joins venue
-tiers and visit limits, and by default drops online, Plus, full and
-above-tier courses:
+Use the helper. It downloads `/api/courses` and `/api/venues`, takes the
+plan from `/api/settings`, and by default drops online, Plus, full courses
+and courses the plan doesn't cover. The check uses the class's own tiers,
+which can be stricter than the venue's. `--travel` adds travel minutes from
+home:
 
 ```bash
 python3 -I .claude/skills/plan-courses/candidates.py --from <date_from> --days <n> \
-  --tier M --exclude '<profile exclusion regex>' --out <scratchpad>/candidates.json
+  --exclude '<profile exclusion regex>' --out <scratchpad>/candidates.json
 python3 -I .claude/skills/plan-courses/candidates.py --from <date_from> --days <n> \
-  --tier M --exclude '<…>' --list --category Dance --grep 'tango|forró'
+  --exclude '<…>' --list --travel --category Dance --grep 'tango|forró'
 ```
 
 Without `--list` it prints category counts. Use them to decide where to
 look, then list narrowly. Rows show `course id | time | title | venue
-(venue id) | district | category | free/max spots | venue rating | visit
-limit for the tier`.
+(venue id) | district | category | free/max spots | venue rating | bike /
+transit minutes | flags` (visit limit for the plan, `+N€ on site`, and
+`needs L` with `--all`).
 
 Watch out for:
 - **Hard rules from the profile** apply to every course. The exclusion
@@ -96,15 +105,17 @@ Watch out for:
   venue on the user's tier. Count the user's picks there this month
   (history) plus your own top-ranked suggestions, and don't plan past the
   limit.
-- **Class-level restrictions and on-site fees:** some classes need a higher
-  tier than the venue does, or charge extra at the door ("USC Checkin +
-  15 €"). Fees are often only in the title. Tag such courses (`+15 € on
-  site`, `needs L`) and rank them lower. If `GET /api/courses/{id}` exists
-  (course-details feature), use it for descriptions and class tiers on
-  courses you're unsure about.
-- **Travel:** if the travel-times feature exists (`POST /api/travel`), warm
-  it for your shortlisted venues and use the minutes in the ranking.
-  Otherwise use district and distance from home as a rough guide.
+- **On-site fees** are parsed into `extra_fee_eur` (flag `+N€ on site`).
+  Rank them lower unless the course is worth it, and mention the fee in
+  the reason. The Plan view shows fee and upgrade badges itself, so tags
+  don't need to repeat them.
+- **Descriptions:** `GET /api/courses/{id}` returns the description, rating
+  and cancellation window. Use it for courses whose title doesn't tell you
+  enough (level, partner needed, language). It's one USC request per
+  course, so only use it for shortlisted ones.
+- **Travel:** use `--travel` minutes in the ranking. Prefer short trips on
+  weekdays, and accept longer ones for something special. Transit can be
+  `-` when VBB is down; then fall back to bike minutes.
 
 ### 5. Rank per day
 
@@ -122,7 +133,7 @@ For every day in the window, choose up to N suggestions (profile, default 6):
   course ("Absolute-beginner WCS, the thing you wanted to try; small
   studio, 15 min by tram"). No filler.
 - `tags`: short badges such as `new`, `repeat`, `beginner`, `book early`,
-  `+15 € on site`, `needs L`, `outdoor`, `social`.
+  `outdoor`, `social` (fees and upgrades get their own badges).
 
 ### 6. Write the run
 
@@ -143,7 +154,8 @@ curl -s -X POST -H "Authorization: Bearer $PLANNER_TOKEN" -H "Content-Type: appl
 A 422 lists courses that aren't in the cache (wrong id/date pair, or the
 day isn't cached yet); fix them and post again. Nothing is written on a
 422. Earlier untouched suggestions in the window are replaced. Picked,
-dismissed and reviewed ones stay.
+dismissed and reviewed ones stay. Posting a run also queues travel times for
+all suggested venues, so the Plan view has them ready.
 
 To adjust one suggestion afterwards: `PATCH /api/planner/suggestions/{id}`
 with `rank`, `reason` or `tags`, or `DELETE` it if it's untouched.
@@ -178,9 +190,9 @@ then PUT it.
 
 ## Basics
 - Cities: Berlin (USC city id 1)
-- Membership: corporate, tier M (Pro). Exclude Plus check-ins and courses above M.
+- Membership, home and bike speed: from /api/settings (currently corporate M Pro; home in Weißensee, tram M4 is the main line).
+- Exclude Plus check-ins and courses the plan doesn't cover.
 - One check-in per day.
-- Home: Falkenberger Str. 143G, 13088 Berlin-Weißensee (52.5579, 13.4857). Main transit line: tram M4.
 - Suggestions per day: 6
 
 ## Hard rules

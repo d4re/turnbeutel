@@ -74,6 +74,12 @@ def init(db_path: Path) -> None:
             city_id         INTEGER NOT NULL,
             lat             REAL,
             lng             REAL,
+            tiers_private       TEXT NOT NULL DEFAULT '[]',
+            tiers_corporate     TEXT NOT NULL DEFAULT '[]',
+            min_tier_private    TEXT,
+            min_tier_corporate  TEXT,
+            extra_fee_text      TEXT,
+            extra_fee_eur       INTEGER,
             picked          INTEGER NOT NULL DEFAULT 0,
             not_interested  INTEGER NOT NULL DEFAULT 0,
             created_at      REAL NOT NULL,
@@ -165,6 +171,12 @@ def _row_to_suggestion(row: sqlite3.Row) -> Suggestion:
         city_id=row["city_id"],
         lat=row["lat"],
         lng=row["lng"],
+        tiers_private=json.loads(row["tiers_private"]),
+        tiers_corporate=json.loads(row["tiers_corporate"]),
+        min_tier_private=row["min_tier_private"],
+        min_tier_corporate=row["min_tier_corporate"],
+        extra_fee_text=row["extra_fee_text"],
+        extra_fee_eur=row["extra_fee_eur"],
         picked=bool(row["picked"]),
         not_interested=bool(row["not_interested"]),
         created_at=row["created_at"],
@@ -248,8 +260,10 @@ def create_run(
                 """
                 INSERT INTO suggestions (
                     run_id, course_id, date, rank, reason, tags, title, start_time, end_time,
-                    venue_id, venue_name, district, category, city_id, lat, lng, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    venue_id, venue_name, district, category, city_id, lat, lng,
+                    tiers_private, tiers_corporate, min_tier_private, min_tier_corporate,
+                    extra_fee_text, extra_fee_eur, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(course_id, date) DO UPDATE SET
                     run_id = excluded.run_id, rank = excluded.rank,
                     reason = excluded.reason, tags = excluded.tags
@@ -271,6 +285,12 @@ def create_run(
                     city_id,
                     c.lat,
                     c.lng,
+                    json.dumps(c.tiers_private),
+                    json.dumps(c.tiers_corporate),
+                    c.min_tier_private,
+                    c.min_tier_corporate,
+                    c.extra_fee_text,
+                    c.extra_fee_eur,
                     now,
                 ),
             )

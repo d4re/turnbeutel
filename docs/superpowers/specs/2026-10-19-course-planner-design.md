@@ -188,6 +188,26 @@ Weißensee.
   "No suggestions yet — run /plan-courses".
 - **Mobile:** lives in the bottom sheet like the other views.
 
+## Integration with course details and travel times
+
+Added after rebasing onto #19 (course details) and #20 (travel times):
+
+- Suggestions also snapshot `tiers_private`, `tiers_corporate`,
+  `min_tier_private`, `min_tier_corporate`, `extra_fee_text` and
+  `extra_fee_eur` from the course.
+- Plan cards show app.js's fee and upgrade badges and travel chips. Tapping a
+  card opens the same details block as in the Courses list: description,
+  rating, exact connection. On mobile, the first tap only expands it. The
+  "n-th visit" note includes the plan's monthly limit at that venue and is
+  highlighted when a pick exceeds it.
+- `POST /api/planner/runs` queues travel times for all suggested venues
+  (priority "request") when a home is set, so they're precomputed by the
+  time the Plan view opens.
+- The skill reads plan, home and bike speed from `/api/settings`.
+  `candidates.py` checks the class's own tiers, flags on-site fees, and with
+  `--travel` adds bike and transit minutes (only for listed rows with
+  `--list`, since transit lookups are paced).
+
 ## Testing
 
 - `backend/test_planner_store.py`: replacement rule, one pick per date,

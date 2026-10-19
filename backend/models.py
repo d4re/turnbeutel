@@ -333,6 +333,13 @@ class Suggestion(BaseModel):
     city_id: int
     lat: float | None
     lng: float | None
+    # Class-level plan coverage and on-site fee, as on Course.
+    tiers_private: list[str] = []
+    tiers_corporate: list[str] = []
+    min_tier_private: str | None = None
+    min_tier_corporate: str | None = None
+    extra_fee_text: str | None = None
+    extra_fee_eur: int | None = None
     picked: bool
     not_interested: bool
     created_at: float

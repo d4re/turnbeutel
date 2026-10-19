@@ -39,6 +39,12 @@ def course(course_id: int, date: str = D1, venue_id: str = "v1") -> Course:
         max_spots=12,
         is_online=False,
         is_plus=False,
+        tiers_private=["Premium", "Max"],
+        tiers_corporate=["L", "XL"],
+        min_tier_private="Premium",
+        min_tier_corporate="L",
+        extra_fee_text="USC Checkin + 15 €",
+        extra_fee_eur=15,
     )
 
 
@@ -75,6 +81,13 @@ def test_create_run_snapshots_course_fields(store):
     assert s.run_id == r.id
     assert (s.title, s.venue_name, s.start_time, s.city_id) == ("Course 1", "Venue v1", "18:00", 1)
     assert s.tags == ["new"]
+    assert (s.tiers_corporate, s.min_tier_corporate, s.tiers_private, s.min_tier_private) == (
+        ["L", "XL"],
+        "L",
+        ["Premium", "Max"],
+        "Premium",
+    )
+    assert (s.extra_fee_eur, s.extra_fee_text) == (15, "USC Checkin + 15 €")
     assert store.list_suggestions(D1, D1)[0].tags == ["new"]
     assert store.list_runs()[0].summary == "s"
 

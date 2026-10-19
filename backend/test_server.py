@@ -1584,3 +1584,15 @@ def test_delete_picked_is_409(planner_client, planner_days):
 def test_unknown_suggestion_404(planner_client):
     r = planner_client.patch("/api/planner/suggestions/999", headers=PLANNER_AUTH, json={"rank": 1})
     assert r.status_code == 404
+
+
+def test_post_run_warms_travel_for_suggested_venues(planner_client, planner_days, monkeypatch):
+    fake = _FakeWorker()
+    monkeypatch.setattr(server, "travel_worker", fake)
+    t = planner_days["tomorrow"]
+    _post_run(planner_client, planner_days, [(200, t)])
+    assert fake.requested == []  # no home set: nothing to warm
+
+    fake.set_origin((52.55, 13.48))
+    _post_run(planner_client, planner_days, [(200, t), (201, t)])
+    assert fake.requested == [(["v1"], None)]  # once per venue, following the stored home

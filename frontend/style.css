@@ -1123,6 +1123,11 @@ select:focus, input[type="text"]:focus {
     color: #b9770e;
 }
 
+.plan-visit-note.over {
+    color: #c0392b;
+    font-weight: 600;
+}
+
 .plan-actions {
     display: flex;
     gap: 8px;

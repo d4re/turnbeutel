@@ -168,10 +168,10 @@ The frontend additionally keeps an in-memory cache of loaded cities and dates wi
 A single-user loop for finding courses worth trying:
 
 1. Every week or two, run `/plan-courses` in Claude Code (project skill in `.claude/skills/plan-courses/`). Claude reads your profile and feedback history, goes through the cached courses for the next two weeks, and writes ranked suggestions per day.
-2. In the **Plan** tab, pick at most one course per day, hide what doesn't appeal, and after a course leave feedback: did you go, how was it, would you go again and when.
+2. In the **Plan** tab, pick at most one course per day, hide what doesn't appeal, and after a course leave feedback: did you go, how was it, would you go again and when. Cards show fee/upgrade badges and travel times from your home (precomputed when the run is written); tap one for its details and exact connection.
 3. The next run uses that feedback.
 
-Enable it by setting `PLANNER_TOKEN` to a random secret on the server (the Plan tab asks for it once and remembers it in the browser). For runs, export `TURNBEUTEL_URL` (e.g. `http://localhost:8000`) and `PLANNER_TOKEN` in the shell you start Claude Code from.
+Set your plan and home in the **You** panel first: runs use them for tier checks and travel times. Enable the planner by setting `PLANNER_TOKEN` to a random secret on the server (the Plan tab asks for it once and remembers it in the browser). For runs, export `TURNBEUTEL_URL` (e.g. `http://localhost:8000`) and `PLANNER_TOKEN` in the shell you start Claude Code from.
 
 ```bash
 PLANNER_TOKEN=$(openssl rand -hex 16) PREFETCH_CITIES=Berlin make serve

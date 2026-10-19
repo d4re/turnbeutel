@@ -1222,6 +1222,9 @@ async def planner_create_run(body: RunCreate):
     if missing:
         raise HTTPException(status_code=422, detail={"message": "unknown courses", "missing": missing})
     run, suggestions = await _planner_call(planner_store.create_run, body, snapshots, time.time())
+    # Precompute travel times for the Plan view (the worker follows the stored home).
+    if travel_worker is not None and travel_worker.origin is not None:
+        await travel_worker.request(list(dict.fromkeys(s.venue_id for s in suggestions)))
     return RunCreated(run=run, suggestions=await _with_live_spots(suggestions))
 
 

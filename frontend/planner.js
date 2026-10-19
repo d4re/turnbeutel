@@ -46,6 +46,7 @@ const planner = (() => {
   let selectedDate = null;
   let showDismissed = false;
   let openFeedbackId = null; // suggestion whose feedback form is expanded
+  let expandedId = null; // suggestion whose course details are open
   let state = "idle"; // idle | loading | ready | error | token
   let errorMessage = "";
   const markers = new Map(); // suggestion id -> Leaflet marker
@@ -146,6 +147,11 @@ const planner = (() => {
   }
 
   // ── Derived data ──
+
+  // The shape app.js's course helpers (badges, details block) expect.
+  function asCourse(s) {
+    return { ...s, id: s.course_id };
+  }
 
   function minutesOf(startTime) {
     const [h, m] = (startTime || "0:0").split(":").map(Number);
@@ -310,6 +316,12 @@ const planner = (() => {
       ${dismissedHtml}`;
 
     container.querySelectorAll("form.plan-feedback").forEach(syncFeedbackForm);
+    // Travel times for every suggestion: precomputed when the run was written,
+    // so this is normally a cache hit; chips fill in place.
+    ctx.requestTravel(suggestions.map((s) => s.venue_id));
+    const expanded = visible.find((s) => s.id === expandedId);
+    const expandedCard = expanded && container.querySelector(`.plan-card[data-id="${expanded.id}"]`);
+    if (expandedCard) ctx.expandCourseDetails(expandedCard, asCourse(expanded));
     container.querySelector(".plan-day.selected")?.scrollIntoView({ block: "nearest", inline: "center" });
     renderMarkers(visible);
   }
@@ -321,13 +333,18 @@ const planner = (() => {
         ? ""
         : `<span class="course-spots ${s.free_spots > 0 ? "available" : "full"}">${s.free_spots > 0 ? `${s.free_spots} left` : "full"}</span>`;
     const tags = s.tags.length ? `<div class="plan-tags">${s.tags.map((t) => `<span class="plan-tag">${esc(t)}</span>`).join("")}</div>` : "";
+    const limit = ctx.planVisitLimit(s.venue_id);
+    const limitText = limit != null ? ` (limit ${limit}/month)` : "";
+    // Picked: this pick's visit number. Not picked: picks already at the venue.
+    const n = s.picked
+      ? visitNumber(s)
+      : suggestions.filter((o) => o.picked && o.venue_id === s.venue_id && o.date.slice(0, 7) === s.date.slice(0, 7)).length;
+    const overLimit = limit != null && (s.picked ? n > limit : n >= limit);
     let visitNote = "";
-    if (s.picked) {
-      const n = visitNumber(s);
-      if (n > 1) visitNote = `${ordinal(n)} visit this month at ${esc(s.venue_name)}`;
-    } else {
-      const n = suggestions.filter((o) => o.picked && o.venue_id === s.venue_id && o.date.slice(0, 7) === s.date.slice(0, 7)).length;
-      if (n > 0) visitNote = `Already picked ${n}× this month at ${esc(s.venue_name)}`;
+    if (s.picked && (n > 1 || overLimit)) {
+      visitNote = `${ordinal(n)} visit this month at ${esc(s.venue_name)}${limitText}`;
+    } else if (!s.picked && n > 0) {
+      visitNote = `Already picked ${n}× this month at ${esc(s.venue_name)}${limitText}`;
     }
     const classes = ["plan-card"];
     if (s.picked) classes.push("picked");
@@ -340,11 +357,12 @@ const planner = (() => {
           <span class="course-time">${esc(s.start_time)} – ${esc(s.end_time)}</span>
           ${spots}
         </div>
-        <div class="course-title">${esc(s.title)}</div>
+        <div class="course-title">${esc(s.title)}${ctx.courseBadgesHtml(asCourse(s))}</div>
         <div class="course-venue">${esc(s.venue_name)}${s.district ? " · " + esc(s.district) : ""}${s.category ? " · " + esc(s.category) : ""}</div>
+        ${ctx.travelChipsHtml(s.venue_id)}
         ${s.reason ? `<div class="plan-reason">${esc(s.reason)}</div>` : ""}
         ${tags}
-        ${visitNote ? `<div class="plan-visit-note">${visitNote}</div>` : ""}
+        ${visitNote ? `<div class="plan-visit-note${overLimit ? " over" : ""}">${visitNote}</div>` : ""}
         <div class="plan-actions">
           ${past ? "" : `<button type="button" class="plan-button${s.picked ? " primary" : ""}" data-action="pick">${s.picked ? "Picked ✓" : "Pick"}</button>`}
           ${s.picked || past ? "" : `<button type="button" class="plan-button" data-action="dismiss">${s.not_interested ? "Undo not interested" : "✕ Not interested"}</button>`}
@@ -532,14 +550,29 @@ const planner = (() => {
         return;
     }
 
-    // A plain tap on a card (not on its controls) shows the course on the map.
+    // A plain tap on a card (not on its controls) opens its course details
+    // and shows it on the map, like a course in the Courses list. On mobile,
+    // focusing the map would drop the sheet over the details just opened, so
+    // there the first tap only expands and a second one collapses + focuses.
     if (card && s && !e.target.closest("form, button, label, textarea, input")) {
-      const marker = markers.get(s.id);
-      if (!marker) return;
-      ctx.collapseSheetForMap();
-      ctx.map.setView(marker.getLatLng(), Math.max(ctx.map.getZoom(), 15));
-      marker.openPopup();
+      if (expandedId !== s.id) {
+        expandedId = s.id;
+        ctx.expandCourseDetails(card, asCourse(s));
+        if (ctx.isMobileLayout()) return;
+      } else {
+        expandedId = null;
+        ctx.collapseCourseItem(card);
+      }
+      focusOnMap(s);
     }
+  }
+
+  function focusOnMap(s) {
+    const marker = markers.get(s.id);
+    if (!marker) return;
+    ctx.collapseSheetForMap();
+    ctx.map.setView(marker.getLatLng(), Math.max(ctx.map.getZoom(), 15));
+    marker.openPopup();
   }
 
   function onChange(e) {
@@ -558,7 +591,8 @@ const planner = (() => {
 
   // ── Public interface ──
 
-  // ctx: { map, esc, todayIso, addDaysIso, popupOptions, collapseSheetForMap }
+  // ctx: helpers from app.js (map, esc, date helpers, sheet helpers, course
+  // badges/details and travel chips), see the planner.init() call there.
   async function init(context) {
     ctx = context;
     layer = L.layerGroup();

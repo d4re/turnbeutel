@@ -93,6 +93,7 @@ The app does no recommending. `POST /api/planner/runs` stores Claude's per-day r
 - **Re-runs replace only untouched suggestions** in their date window. Picked, not-interested or reviewed suggestions are history and stay; a re-suggested kept course is updated in place (`UNIQUE (course_id, date)`).
 - **One pick per date** (partial unique index); picking another suggestion that day unpicks the first.
 - **Auth is one shared token** (`PLANNER_TOKEN`, Bearer, `secrets.compare_digest`): 503 when unset, 401 when wrong. The frontend keeps it in localStorage. Single user per instance; no accounts.
+- **Reuses course details and travel times.** Suggestions also snapshot the class tiers and on-site fee, so the Plan cards render with app.js's `courseBadgesHtml`, `travelChipsHtml` and the expandable details block (`expandCourseDetails`); `planner.init()` receives these helpers. `POST /api/planner/runs` queues travel for the suggested venues (`travel_worker.request`), so chips are usually ready when the Plan view opens. The run's plan, home and bike speed come from `/api/settings`, not the profile.
 
 ### Releases are derived from commit messages
 

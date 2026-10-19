@@ -241,7 +241,21 @@ async function init() {
   // Courses view is independent from the venues fetch — always wire it up.
   initCoursesView();
 
-  planner.init({ map, esc, todayIso, addDaysIso, popupOptions, collapseSheetForMap });
+  planner.init({
+    map,
+    esc,
+    todayIso,
+    addDaysIso,
+    popupOptions,
+    collapseSheetForMap,
+    isMobileLayout,
+    courseBadgesHtml,
+    travelChipsHtml,
+    requestTravel,
+    expandCourseDetails,
+    collapseCourseItem,
+    planVisitLimit,
+  });
 }
 
 function scheduleViewportUpdate() {
@@ -796,6 +810,24 @@ function courseBadgesHtml(course) {
     html += ` <span class="upgrade-badge" title="Needs ${label} or higher">\u2b06 ${label}</span>`;
   }
   return html;
+}
+
+// Open `course`'s details block inside `item`, closing any other open one.
+// The Plan view uses this for its cards (course-like suggestion objects).
+function expandCourseDetails(item, course) {
+  if (expandedCourse && expandedCourse.item !== item) collapseCourseItem(expandedCourse.item);
+  item.classList.add("expanded");
+  expandedCourse = { item, course };
+  renderCourseDetails(item, course);
+}
+
+// The plan's monthly visit limit at a venue, or null when unknown or only the
+// one-visit-per-day cap applies (stored as 30, see parse_venue_limits).
+function planVisitLimit(venueId) {
+  const plan = settings.plan;
+  const venue = plan && findVenue(venueId);
+  const limit = venue?.visit_limits?.[plan.type]?.[plan.tier];
+  return limit == null || limit >= 30 ? null : limit;
 }
 
 const BOOKING_TYPE_LABELS = {
