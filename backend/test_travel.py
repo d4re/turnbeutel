@@ -575,3 +575,38 @@ def test_worker_drops_home_requests_after_home_change(db, monkeypatch):
 
     _drive(w, lambda: len(fakes.of("transit")) == 1, setup)
     assert [(c[0], c[2]) for c in fakes.calls if c[1] == HOME] == [("bike", ("b",)), ("transit", B)]
+
+
+def test_worker_promoted_venue_not_pending_once_done(db, monkeypatch):
+    # The superseded warm job stays in the queue until dequeued; it must not keep
+    # reporting the venue as pending (the frontend polls while anything is).
+    fakes = _Fakes(monkeypatch)
+    _seed_venues({"a": A, "c": C})
+    fast_journeys = travel.fetch_journeys
+
+    async def slow_for_a(origin, dest, client, pacer, *, departure=None, arrival=None):
+        if dest == A:
+            await asyncio.sleep(5)
+        return await fast_journeys(origin, dest, client, pacer, departure=departure, arrival=arrival)
+
+    monkeypatch.setattr(travel, "fetch_journeys", slow_for_a)
+    w = _worker()
+
+    async def main():
+        await w.warm([("a", *A), ("c", *C)])
+        await w.request(["c"])
+        worker = asyncio.create_task(w.run())
+        for _ in range(100):
+            entry = storage.get_travel(KEY, ["c"]).get("c")
+            if entry and entry.pt_min:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)  # now stuck in a's slow warm lookup
+        pending = w.is_pending("c")
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
+        return pending
+
+    assert asyncio.run(main()) is False
+    assert fakes.of("transit")[0][2] == C

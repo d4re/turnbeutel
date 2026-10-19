@@ -390,9 +390,17 @@ class TravelWorker:
         job = _Job(priority, _KIND_RANK[kind], next(self._seq), kind, origin, dests, follows_home)
         okey = origin_key(*origin)
         for d in dests:
-            self._queued[(kind, okey, d[0])] = job  # supersedes a less urgent job
+            key = (kind, okey, d[0])
+            if key in self._queued:
+                self._release(d[0])  # supersedes a less urgent job, which loses the venue
+            self._queued[key] = job
             self._pending[d[0]] += 1
         self._queue.put_nowait(job)
+
+    def _release(self, venue_id: str) -> None:
+        self._pending[venue_id] -= 1
+        if self._pending[venue_id] <= 0:
+            del self._pending[venue_id]
 
     def _owned_dests(self, job: _Job) -> list[tuple[str, float, float]]:
         """The destinations this job is still responsible for (not superseded)."""
@@ -404,9 +412,7 @@ class TravelWorker:
         for d in job.dests:
             if self._queued.get((job.kind, okey, d[0])) is job:
                 del self._queued[(job.kind, okey, d[0])]
-            self._pending[d[0]] -= 1
-            if self._pending[d[0]] <= 0:
-                del self._pending[d[0]]
+                self._release(d[0])
 
     async def run(self) -> None:
         while True:
