@@ -13,20 +13,26 @@ their feedback on earlier picks. Design: `docs/superpowers/specs/2026-10-19-cour
 ## Setup
 
 Needs `TURNBEUTEL_URL` (e.g. `http://localhost:8000` or the deployed URL) and
-`PLANNER_TOKEN` in the environment. If either is missing, stop and ask the
-user for them. Don't guess the URL. Check that the planner is enabled:
+`PLANNER_TOKEN`. Both helpers read them from the environment, or else from
+`.env` in the repo root (from a worktree: the main checkout's root;
+gitignored). Every Bash call starts a fresh shell, so call the helpers rather
+than exporting the variables yourself, and never print the token. If neither
+source has them, stop and ask the user to add them to `.env`. Don't guess the
+URL. Check that the planner is enabled:
 
 ```bash
-curl -s "$TURNBEUTEL_URL/api/planner/status"          # {"enabled": true}
-curl -s "$TURNBEUTEL_URL/api/settings"                # plan, home, bike_kmh (the app's "You" panel)
+.claude/skills/plan-courses/api.sh GET /api/planner/status   # {"enabled": true}
+.claude/skills/plan-courses/api.sh GET /api/settings         # plan, home, bike_kmh (the app's "You" panel)
 ```
+
+`api.sh METHOD PATH [curl args]` adds the token, prints the body, and prints
+`HTTP <status>` on stderr.
 
 The user's membership plan, home and bike speed come from `/api/settings`,
 not from the profile. If `plan` or `home` is missing, ask the user to set it
 in the app's **You** panel before continuing: tier checks and travel times
 depend on it.
 
-All planner calls below need `-H "Authorization: Bearer $PLANNER_TOKEN"`.
 Keep large responses out of the conversation: save them to the scratchpad
 and summarise them with a short script.
 
@@ -35,8 +41,8 @@ and summarise them with a short script.
 ### 1. Load context
 
 ```bash
-curl -s -H "Authorization: Bearer $PLANNER_TOKEN" "$TURNBEUTEL_URL/api/planner/profile"
-curl -s -H "Authorization: Bearer $PLANNER_TOKEN" "$TURNBEUTEL_URL/api/planner/history" > <scratchpad>/history.json
+.claude/skills/plan-courses/api.sh GET /api/planner/profile
+.claude/skills/plan-courses/api.sh GET /api/planner/history > <scratchpad>/history.json
 ```
 
 If the profile text is empty, this is the first run. Show the user the
@@ -138,8 +144,7 @@ For every day in the window, choose up to N suggestions (profile, default 6):
 ### 6. Write the run
 
 ```bash
-curl -s -X POST -H "Authorization: Bearer $PLANNER_TOKEN" -H "Content-Type: application/json" \
-  "$TURNBEUTEL_URL/api/planner/runs" -d @<scratchpad>/run.json
+.claude/skills/plan-courses/api.sh POST /api/planner/runs -d @<scratchpad>/run.json
 ```
 
 `run.json`:
@@ -168,8 +173,7 @@ diff. **Only `PUT /api/planner/profile` after the user approves.** The
 profile is theirs.
 
 ```bash
-curl -s -X PUT -H "Authorization: Bearer $PLANNER_TOKEN" -H "Content-Type: application/json" \
-  "$TURNBEUTEL_URL/api/planner/profile" -d @<scratchpad>/profile.json   # {"text": "…markdown…"}
+.claude/skills/plan-courses/api.sh PUT /api/planner/profile -d @<scratchpad>/profile.json   # {"text": "…markdown…"}
 ```
 
 ### 8. Report
@@ -178,7 +182,7 @@ In chat:
 - two or three highlights per week
 - anything you deliberately left out and why
 - past picks still missing feedback
-- the link: `$TURNBEUTEL_URL` → Plan tab
+- the link: the instance URL (`TURNBEUTEL_URL`) → Plan tab
 
 ## Initial profile
 
