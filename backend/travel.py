@@ -238,9 +238,15 @@ class TransitUnavailable(Exception):
     """No exact journey could be found (VBB down, or nothing arrives in time)."""
 
 
+# Within a priority, bike batches (a fraction of a second per 100 venues) run
+# before any transit lookup (one paced VBB request each).
+_KIND_RANK = {"bike": 0, "transit": 1}
+
+
 @dataclass(order=True)
 class _Job:
     priority: int
+    rank: int
     seq: int
     kind: str = field(compare=False)  # "bike" | "transit"
     origin: tuple[float, float] = field(compare=False)
@@ -361,7 +367,6 @@ class TravelWorker:
             failed_recently = entry is not None and entry.pt_failed_at and now - entry.pt_failed_at < PT_RETRY_AFTER
             if not fresh and not failed_recently and ("transit", okey, p[0]) not in self._queued:
                 need_transit.append(p)
-        # Bike for the whole set first (a city takes seconds), then the slow transit lookups.
         for i in range(0, len(need_bike), OSRM_BATCH):
             batch = need_bike[i : i + OSRM_BATCH]
             self._put(priority, "bike", origin, batch, ("bike-batch", okey, next(self._seq)), batch_keys=True)
@@ -369,7 +374,7 @@ class TravelWorker:
             self._put(priority, "transit", origin, [p], ("transit", okey, p[0]))
 
     def _put(self, priority, kind, origin, dests, key, *, batch_keys=False) -> _Job:
-        job = _Job(priority, next(self._seq), kind, origin, dests, key)
+        job = _Job(priority, _KIND_RANK[kind], next(self._seq), kind, origin, dests, key)
         keys = [("bike", origin_key(*origin), d[0]) for d in dests] if batch_keys else [key]
         for k in keys:
             self._queued[k] = job

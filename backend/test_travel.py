@@ -387,6 +387,26 @@ def test_worker_priority_order(db, monkeypatch):
     assert order == [("transit", B), ("transit", A)]
 
 
+def test_worker_bike_jumps_ahead_of_earlier_transit(db, monkeypatch):
+    # Bike is ~100x cheaper than transit: a later request's bike batch must not
+    # wait behind an earlier request's transit lookups.
+    fakes = _Fakes(monkeypatch)
+    _seed_venues({"a": A, "b": B})
+    w = _worker()
+
+    async def setup():
+        await w.request(["a"])
+        await w.request(["b"])
+
+    _drive(w, lambda: len(fakes.of("transit")) == 2, setup)
+    assert [(c[0], c[2]) for c in fakes.calls] == [
+        ("bike", ("a",)),
+        ("bike", ("b",)),
+        ("transit", A),
+        ("transit", B),
+    ]
+
+
 def test_worker_exact_does_not_wait_behind_a_slow_job(db, monkeypatch):
     fakes = _Fakes(monkeypatch)
     _seed_venues({"a": A})
