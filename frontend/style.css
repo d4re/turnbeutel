@@ -308,6 +308,56 @@ select:focus, input[type="text"]:focus {
 /* Map */
 #map-container {
     flex: 1;
+    position: relative;
+}
+
+#map-hint {
+    position: absolute;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 1100;
+    padding: 8px 12px;
+    border-radius: 6px;
+    background: #1a1a2e;
+    color: white;
+    font-size: 13px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+    white-space: nowrap;
+}
+
+#map-hint[hidden] {
+    display: none;
+}
+
+#map-hint button {
+    margin-left: 8px;
+    border: none;
+    background: none;
+    color: #8fb8ea;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.map-picking #map {
+    cursor: crosshair;
+}
+
+.home-marker {
+    font-size: 22px;
+    line-height: 28px;
+    text-align: center;
+    filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.4));
+}
+
+.travel-chips {
+    font-size: 11px;
+    color: #2c3e50;
+    margin-top: 3px;
+}
+
+.travel-chips .cd-muted {
+    color: #aaa;
 }
 
 #map {
@@ -477,6 +527,72 @@ select:focus, input[type="text"]:focus {
     font-size: 13px;
 }
 
+#home-current {
+    font-size: 12px;
+    margin-bottom: 6px;
+    color: #333;
+}
+
+#home-current button,
+.link-button {
+    border: none;
+    background: none;
+    padding: 0;
+    color: #2471a3;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.home-search-row {
+    display: flex;
+    gap: 6px;
+}
+
+.home-search-row input {
+    flex: 1;
+    min-width: 0;
+    padding: 5px 8px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-size: 13px;
+}
+
+.home-search-row button {
+    padding: 5px 10px;
+    border: 1px solid #1a1a2e;
+    border-radius: 4px;
+    background: #1a1a2e;
+    color: white;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+#home-results {
+    display: flex;
+    flex-direction: column;
+    margin: 4px 0;
+}
+
+#home-results button {
+    text-align: left;
+    padding: 5px 6px;
+    border: none;
+    border-bottom: 1px solid #e3e7ef;
+    background: white;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+#home-results button:hover {
+    background: #eef3fb;
+}
+
+#home-results .cd-muted {
+    font-size: 12px;
+    color: #888;
+}
+
 .you-hint {
     font-size: 11px;
     color: #888;
@@ -596,6 +712,11 @@ select:focus, input[type="text"]:focus {
     display: flex;
     flex-direction: column;
     gap: 5px;
+}
+
+.cd-travel {
+    font-weight: 600;
+    color: #2c3e50;
 }
 
 .cd-description {

@@ -32,6 +32,25 @@
                     <button type="button" class="you-done">Done</button>
                 </div>
                 <div class="filter-group">
+                    <label class="filter-label" for="home-search">Home</label>
+                    <div id="home-current"></div>
+                    <form id="home-search-form" class="home-search-row">
+                        <input type="search" id="home-search" placeholder="Search an address…" autocomplete="street-address">
+                        <button type="submit">Search</button>
+                    </form>
+                    <div id="home-results"></div>
+                    <button type="button" id="home-pick" class="link-button">Pick on map</button>
+                    <div class="you-hint">Used for travel times. Right-click (or long-press) the map to set it there.</div>
+                </div>
+                <div class="filter-group">
+                    <label class="filter-label">Bike speed</label>
+                    <div class="toggle-group" id="bike-speed-toggle">
+                        <label class="toggle-option"><input type="radio" name="bike-speed" value="15"><span>15 km/h</span></label>
+                        <label class="toggle-option"><input type="radio" name="bike-speed" value="18" checked><span>18 km/h</span></label>
+                        <label class="toggle-option"><input type="radio" name="bike-speed" value="21"><span>21 km/h</span></label>
+                    </div>
+                </div>
+                <div class="filter-group">
                     <label class="filter-label">Your plan</label>
                     <div class="toggle-group" id="plan-type-toggle">
                         <label class="toggle-option">
@@ -173,6 +192,7 @@
 
         <main id="map-container">
             <div id="map"></div>
+            <div id="map-hint" hidden>Click the map to set your home <button type="button" id="map-hint-cancel">Cancel</button></div>
         </main>
     </div>
 
