@@ -84,6 +84,7 @@ let venueIndex = { source: null, size: 0, byId: new Map() };
 const travelByVenue = new Map();
 const travelPending = new Set(); // ids the backend is still computing
 const travelQueue = new Set(); // ids waiting for the next debounced request
+const travelRetry = new Set(); // ids whose poll timed out; asked again on next render
 let travelFlushTimer = null;
 let travelPollTimer = null;
 let travelPollDeadline = 0;
@@ -93,7 +94,7 @@ const TRAVEL_POLL_MAX_MS = 2 * 60 * 1000;
 const TRAVEL_BATCH = 500; // backend limit per request
 const DEFAULT_BIKE_KMH = 18;
 const courseExactCache = new Map(); // course id -> exact transit, or null if unavailable
-const courseExactInFlight = new Set();
+const courseExactInFlight = new Map(); // course id -> homeKey() the request was made for
 let expandedCourse = null; // { item, course } of the expanded list item
 let homeLayer = null;
 let pickingHome = false;
@@ -726,6 +727,15 @@ function collapseCourseItem(item) {
   if (expandedCourse?.item === item) expandedCourse = null;
 }
 
+// Whether `course` is the one currently expanded (and still on screen).
+// Compared by id/date: re-renders and cache refreshes create new objects.
+function isExpandedCourse(course) {
+  const open = expandedCourse?.course;
+  return Boolean(
+    open && open.id === course.id && open.date === course.date && expandedCourse.item.isConnected,
+  );
+}
+
 function findVenue(venueId) {
   if (venueIndex.source !== allVenues || venueIndex.size !== allVenues.length) {
     venueIndex = {
@@ -854,8 +864,9 @@ function renderCourseDetails(item, course) {
       .then((d) => {
         courseDetailInFlight.delete(course.id);
         courseDetailCache.set(course.id, d);
-        if (item.isConnected && item.classList.contains("expanded")) {
-          renderCourseDetails(item, course);
+        // The list may have re-rendered meanwhile: refill whichever item now shows it.
+        if (isExpandedCourse(course)) {
+          renderCourseDetails(expandedCourse.item, expandedCourse.course);
         }
       });
   }
@@ -927,9 +938,10 @@ function refreshExpandedCourseTravel() {
 }
 
 function fetchCourseExact(course) {
-  if (!settings.home || courseExactCache.has(course.id) || courseExactInFlight.has(course.id)) return;
+  const home = homeKey();
+  if (!home || courseExactCache.has(course.id) || courseExactInFlight.get(course.id) === home) return;
   requestTravel([course.venue_id]);
-  courseExactInFlight.add(course.id);
+  courseExactInFlight.set(course.id, home);
   const params = new URLSearchParams({
     venue_id: course.venue_id,
     date: course.date,
@@ -939,9 +951,10 @@ function fetchCourseExact(course) {
     .then((r) => (r.ok ? r.json() : null))
     .catch(() => null)
     .then((exact) => {
+      if (courseExactInFlight.get(course.id) !== home) return; // home changed meanwhile
       courseExactInFlight.delete(course.id);
       courseExactCache.set(course.id, exact);
-      if (expandedCourse?.course === course) refreshExpandedCourseTravel();
+      if (isExpandedCourse(course)) refreshExpandedCourseTravel();
     });
 }
 
@@ -967,7 +980,9 @@ function requestTravel(ids) {
   for (const id of ids) {
     if (id == null || id === "") continue;
     const key = String(id);
-    if (travelByVenue.has(key) || travelPending.has(key) || travelQueue.has(key)) continue;
+    if (travelPending.has(key) || travelQueue.has(key)) continue;
+    if (travelByVenue.has(key) && !travelRetry.has(key)) continue;
+    travelRetry.delete(key);
     travelQueue.add(key);
     added = true;
   }
@@ -1017,10 +1032,11 @@ function scheduleTravelPoll() {
   clearTimeout(travelPollTimer);
   if (travelPending.size === 0) return;
   if (Date.now() > travelPollDeadline) {
-    // Give up for now; ids without data stay unknown and are asked for again
-    // the next time they render.
+    // Give up polling for now; whatever is known stays shown, and these ids
+    // are asked for again the next time they render.
     for (const id of travelPending) {
       if (travelByVenue.get(id) === null) travelByVenue.delete(id);
+      else travelRetry.add(id);
     }
     travelPending.clear();
     updateAllTravelChips();
@@ -1081,7 +1097,9 @@ function onHomeChanged() {
   travelByVenue.clear();
   travelPending.clear();
   travelQueue.clear();
+  travelRetry.clear();
   courseExactCache.clear();
+  courseExactInFlight.clear();
   renderHomeMarker();
   renderHomeControls();
   // Lists carry the chip placeholders, so re-render them (markers untouched).
