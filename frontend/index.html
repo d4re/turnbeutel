@@ -19,6 +19,7 @@
                     <div class="view-tabs" id="view-tabs">
                         <button class="view-tab active" data-view="venues">Venues</button>
                         <button class="view-tab" data-view="courses">Courses</button>
+                        <button class="view-tab" data-view="plan" hidden>Plan</button>
                     </div>
                     <button id="you-button" type="button" aria-expanded="false">You</button>
                     <button id="filters-button" type="button">Filters<span id="filter-badge" hidden></span></button>
@@ -188,6 +189,7 @@
 
             <div id="venue-list"></div>
             <div id="course-list" style="display:none"></div>
+            <div id="plan-view" style="display:none"></div>
         </aside>
 
         <main id="map-container">
@@ -198,6 +200,7 @@
 
     <script src="vendor/leaflet/leaflet.js"></script>
     <script src="vendor/leaflet.markercluster/leaflet.markercluster.js"></script>
+    <script src="planner.js"></script>
     <script src="app.js"></script>
 </body>
 </html>

@@ -29,4 +29,13 @@ export default [
       "prefer-const": "warn",
     },
   },
+  {
+    // app.js and planner.js are classic scripts sharing one global scope.
+    files: ["app.js"],
+    languageOptions: { globals: { planner: "readonly" } },
+  },
+  {
+    files: ["planner.js"],
+    languageOptions: { sourceType: "script", globals: { API_BASE: "readonly" } },
+  },
 ];

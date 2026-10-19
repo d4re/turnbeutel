@@ -240,6 +240,8 @@ async function init() {
 
   // Courses view is independent from the venues fetch — always wire it up.
   initCoursesView();
+
+  planner.init({ map, esc, todayIso, addDaysIso, popupOptions, collapseSheetForMap });
 }
 
 function scheduleViewportUpdate() {
@@ -383,8 +385,17 @@ function switchView(view) {
   document.getElementById("courses-filters").style.display = view === "courses" ? "" : "none";
   document.getElementById("venue-list").style.display = view === "venues" ? "" : "none";
   document.getElementById("course-list").style.display = view === "courses" ? "" : "none";
+  document.getElementById("plan-view").style.display = view === "plan" ? "" : "none";
+  document.body.classList.toggle("plan-active", view === "plan");
 
-  if (view === "venues") {
+  if (view !== "plan") planner.hide();
+
+  if (view === "plan") {
+    // The planner draws its own markers; venues/courses re-render on return.
+    markerCluster.clearLayers();
+    mapMarkersCleared = true;
+    planner.show();
+  } else if (view === "venues") {
     applyFilters();
   } else if (!coursesLoaded) {
     fetchCourses();
@@ -1702,6 +1713,7 @@ function applyFilters() {
 }
 
 function updateStats() {
+  if (currentView === "plan") return; // the planner owns the stats line there
   const total = filteredVenues.length;
   const withCoords = filteredVenues.filter((v) => v.has_coordinates).length;
   const statsEl = document.getElementById("stats");
@@ -2200,7 +2212,9 @@ function updateFilterBadge() {
   const badge = document.getElementById("filter-badge");
   let count = 0;
 
-  if (currentView === "venues") {
+  if (currentView === "plan") {
+    // The Plan view has no filter overlay.
+  } else if (currentView === "venues") {
     const sliderMax = document.getElementById("slider-max");
     if (parseInt(document.getElementById("slider-min").value) > 0) count++;
     else if (parseInt(sliderMax.value) < parseInt(sliderMax.max)) count++;
