@@ -20,10 +20,34 @@
                         <button class="view-tab active" data-view="venues">Venues</button>
                         <button class="view-tab" data-view="courses">Courses</button>
                     </div>
+                    <button id="you-button" type="button" aria-expanded="false">You</button>
                     <button id="filters-button" type="button">Filters<span id="filter-badge" hidden></span></button>
                 </div>
                 <p id="stats"></p>
             </header>
+
+            <div id="you-panel" hidden>
+                <div class="filters-overlay-bar">
+                    <span>You</span>
+                    <button type="button" class="you-done">Done</button>
+                </div>
+                <div class="filter-group">
+                    <label class="filter-label">Your plan</label>
+                    <div class="toggle-group" id="plan-type-toggle">
+                        <label class="toggle-option">
+                            <input type="radio" name="plan-type" value="corporate" checked>
+                            <span>Corporate</span>
+                        </label>
+                        <label class="toggle-option">
+                            <input type="radio" name="plan-type" value="private">
+                            <span>Private</span>
+                        </label>
+                    </div>
+                    <select id="plan-tier" aria-label="Your plan tier"></select>
+                    <div class="you-hint">Classes your plan doesn't cover get a ⬆ badge.</div>
+                </div>
+                <div class="you-error" hidden></div>
+            </div>
 
             <div id="filters">
                 <div class="filters-overlay-bar">
