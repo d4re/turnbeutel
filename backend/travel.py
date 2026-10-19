@@ -21,6 +21,8 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+from models import GeocodeResult
+
 USER_AGENT = "turnbeutel (+https://github.com/d4re/turnbeutel)"
 OSRM_TABLE_URL = "https://routing.openstreetmap.de/routed-bike/table/v1/driving/"
 VBB_JOURNEYS_URL = "https://v6.vbb.transport.rest/journeys"
@@ -200,3 +202,18 @@ async def fetch_journeys(
                 raise
         await asyncio.sleep(RETRY_DELAY)
     raise AssertionError("unreachable")
+
+
+# Nominatim's usage policy: at most 1 request/s, with an identifying User-Agent.
+nominatim_pacer = Pacer(1.0)
+
+
+async def geocode(q: str, viewbox: str | None, client: httpx.AsyncClient, pacer: Pacer) -> list[GeocodeResult]:
+    """Address search via Nominatim; `viewbox` ("lng1,lat1,lng2,lat2") biases, not bounds, results."""
+    params = {"q": q, "format": "jsonv2", "addressdetails": 1, "limit": 5, "bounded": 0}
+    if viewbox:
+        params["viewbox"] = viewbox
+    await pacer.wait()
+    resp = await client.get(NOMINATIM_SEARCH_URL, params=params, headers={"User-Agent": USER_AGENT})
+    resp.raise_for_status()
+    return [GeocodeResult(label=r["display_name"], lat=float(r["lat"]), lng=float(r["lon"])) for r in resp.json()]

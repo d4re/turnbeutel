@@ -2,7 +2,7 @@
 
 from typing import Literal, Self
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 PRIVATE_TIER_ORDER = ["Essential", "Classic", "Premium", "Max"]
 CORPORATE_TIER_ORDER = ["S", "M", "L", "XL"]
@@ -189,10 +189,24 @@ class Plan(BaseModel):
         return self
 
 
+class Home(BaseModel):
+    lat: float = Field(ge=-90, le=90)
+    lng: float = Field(ge=-180, le=180)
+    label: str = ""
+
+
 class Settings(BaseModel):
     """Single-user settings stored server-side (see AGENTS.md: single-user assumption)."""
 
     plan: Plan | None = None
+    home: Home | None = None
+    bike_kmh: Literal[15, 18, 21] | None = None  # None = default (18)
+
+
+class GeocodeResult(BaseModel):
+    label: str
+    lat: float
+    lng: float
 
 
 class TravelEntry(BaseModel):

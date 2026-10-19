@@ -192,6 +192,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
             updated_at   REAL NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS geocode_cache (
+            query_norm   TEXT PRIMARY KEY,
+            payload_json TEXT NOT NULL,
+            fetched_at   REAL NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS travel (
             origin_key    TEXT NOT NULL,
             venue_id      TEXT NOT NULL,
@@ -912,3 +918,27 @@ def list_city_venue_points(city_ids: list[int]) -> list[tuple[str, float, float]
         tuple(city_ids),
     )
     return [(r["venue_id"], r["lat"], r["lng"]) for r in rows]
+
+
+# ── Geocode cache ──────────────────────────────────────────────────────────
+
+
+def get_geocode(query_norm: str, max_age: float) -> list[dict] | None:
+    row = _fetchone(
+        "SELECT payload_json FROM geocode_cache WHERE query_norm = ? AND fetched_at >= ?",
+        (query_norm, time.time() - max_age),
+    )
+    return json.loads(row["payload_json"]) if row else None
+
+
+def set_geocode(query_norm: str, results: list[dict], at: float) -> None:
+    with _lock:
+        _c().execute(
+            """
+            INSERT INTO geocode_cache (query_norm, payload_json, fetched_at) VALUES (?, ?, ?)
+            ON CONFLICT(query_norm) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                fetched_at   = excluded.fetched_at
+            """,
+            (query_norm, json.dumps(results), at),
+        )

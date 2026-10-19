@@ -218,3 +218,36 @@ def test_fetch_journeys_sends_arrival_param():
     assert params["from.latitude"] == str(HOME[0])
     assert params["to.longitude"] == "13.4"
     assert params["results"] == "3"
+
+
+# ── Nominatim ──────────────────────────────────────────────────────────────
+
+
+def test_geocode_parses_nominatim():
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            json=[
+                {"display_name": "143G, Falkenberger Straße, Berlin", "lat": "52.5579489", "lon": "13.4856965"},
+                {"display_name": "Falkenberger Straße, Berlin", "lat": "52.556", "lon": "13.48"},
+            ],
+        )
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await travel.geocode("Falkenberger Str. 143G", "13.3,52.6,13.6,52.4", client, _no_pacing())
+
+    results = asyncio.run(run())
+    assert [(r.label, r.lat, r.lng) for r in results] == [
+        ("143G, Falkenberger Straße, Berlin", 52.5579489, 13.4856965),
+        ("Falkenberger Straße, Berlin", 52.556, 13.48),
+    ]
+    req = seen[0]
+    assert req.headers["User-Agent"] == travel.USER_AGENT
+    assert req.url.params["q"] == "Falkenberger Str. 143G"
+    assert req.url.params["viewbox"] == "13.3,52.6,13.6,52.4"
+    assert req.url.params["bounded"] == "0"
+    assert req.url.params["limit"] == "5"

@@ -1146,3 +1146,58 @@ def test_settings_put_replaces_whole_object(seeded_client):
     seeded_client.put("/api/settings", json={"plan": {"type": "private", "tier": "Classic"}})
     seeded_client.put("/api/settings", json={})
     assert seeded_client.get("/api/settings").json()["plan"] is None
+
+
+def test_settings_home_and_bike_speed_roundtrip(seeded_client):
+    body = {"plan": None, "home": {"lat": 52.5579489, "lng": 13.4856965, "label": "Home"}, "bike_kmh": 21}
+    assert seeded_client.put("/api/settings", json=body).status_code == 200
+    got = seeded_client.get("/api/settings").json()
+    assert got["home"] == body["home"]
+    assert got["bike_kmh"] == 21
+
+
+def test_settings_rejects_bad_speed(seeded_client):
+    assert seeded_client.put("/api/settings", json={"bike_kmh": 20}).status_code == 422
+
+
+def test_settings_rejects_bad_coords(seeded_client):
+    assert seeded_client.put("/api/settings", json={"home": {"lat": 95, "lng": 13.4}}).status_code == 422
+
+
+# ── /api/geocode ───────────────────────────────────────────────────────────
+
+
+def test_geocode_endpoint_caches_by_normalised_query(seeded_client, monkeypatch):
+    import travel
+    from models import GeocodeResult
+
+    calls: list[str] = []
+
+    async def fake_geocode(q, viewbox, client, pacer):
+        calls.append(q)
+        return [GeocodeResult(label="Falkenberger Str. 143G, Berlin", lat=52.5579, lng=13.4857)]
+
+    monkeypatch.setattr(travel, "geocode", fake_geocode)
+    first = seeded_client.get("/api/geocode", params={"q": "Falkenberger Str 143G"})
+    second = seeded_client.get("/api/geocode", params={"q": "  falkenberger   str 143g "})
+    assert first.status_code == 200
+    assert (
+        first.json() == second.json() == [{"label": "Falkenberger Str. 143G, Berlin", "lat": 52.5579, "lng": 13.4857}]
+    )
+    assert len(calls) == 1
+
+
+def test_geocode_endpoint_upstream_error_is_502(seeded_client, monkeypatch):
+    import httpx
+
+    import travel
+
+    async def fake_geocode(q, viewbox, client, pacer):
+        raise httpx.ConnectError("down")
+
+    monkeypatch.setattr(travel, "geocode", fake_geocode)
+    assert seeded_client.get("/api/geocode", params={"q": "Alexanderplatz"}).status_code == 502
+
+
+def test_geocode_endpoint_rejects_short_query(seeded_client):
+    assert seeded_client.get("/api/geocode", params={"q": " a "}).status_code == 422

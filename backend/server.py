@@ -25,6 +25,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 
 import storage
+import travel
 from models import (
     CORPORATE_TIER_ORDER,
     PRIVATE_TIER_ORDER,
@@ -35,6 +36,7 @@ from models import (
     Course,
     CourseDetail,
     CourseFetchError,
+    GeocodeResult,
     MultiCityCoursesResponse,
     MultiCityVenuesPayload,
     Settings,
@@ -1002,6 +1004,26 @@ async def put_settings(settings: Settings):
     """Replace the stored settings (single user, last write wins)."""
     await run_in_threadpool(storage.put_settings, settings)
     return settings
+
+
+@app.get("/api/geocode", response_model=list[GeocodeResult])
+async def get_geocode(q: str, viewbox: str | None = None):
+    """Address search (Nominatim), cached 30 days per normalised query."""
+    query = " ".join(q.split())
+    if not 3 <= len(query) <= 200:
+        raise HTTPException(status_code=422, detail="q must be 3-200 characters")
+    key = query.lower()
+    cached = await run_in_threadpool(storage.get_geocode, key, float(travel.GEOCODE_TTL))
+    if cached is not None:
+        return cached
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            results = await travel.geocode(query, viewbox, client, travel.nominatim_pacer)
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail="Address search unavailable") from e
+    payload = [r.model_dump() for r in results]
+    await run_in_threadpool(storage.set_geocode, key, payload, time.time())
+    return payload
 
 
 @app.get("/api/cities", response_model=CitiesResponse)
