@@ -14,7 +14,18 @@ import threading
 import time
 from pathlib import Path
 
-from models import City, Course, CourseDetail, Settings, Venue, VenueAddress, VenueDetail, VenuesPayload, VisitLimits
+from models import (
+    City,
+    Course,
+    CourseDetail,
+    Settings,
+    TravelEntry,
+    Venue,
+    VenueAddress,
+    VenueDetail,
+    VenuesPayload,
+    VisitLimits,
+)
 
 # ── Module state ────────────────────────────────────────────────────────────
 
@@ -179,6 +190,34 @@ def _migrate(conn: sqlite3.Connection) -> None:
             id           INTEGER PRIMARY KEY CHECK (id = 1),
             payload_json TEXT NOT NULL,
             updated_at   REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS geocode_cache (
+            query_norm   TEXT PRIMARY KEY,
+            payload_json TEXT NOT NULL,
+            fetched_at   REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS travel (
+            origin_key    TEXT NOT NULL,
+            venue_id      TEXT NOT NULL,
+            bike_km       REAL,
+            bike_at       REAL,
+            pt_min        INTEGER,
+            pt_lines_json TEXT,
+            walk_m        INTEGER,
+            pt_at         REAL,
+            pt_failed_at  REAL,
+            PRIMARY KEY (origin_key, venue_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS travel_exact (
+            origin_key   TEXT NOT NULL,
+            venue_id     TEXT NOT NULL,
+            arrive_by    TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            fetched_at   REAL NOT NULL,
+            PRIMARY KEY (origin_key, venue_id, arrive_by)
         );
 
         CREATE TABLE IF NOT EXISTS course_details (
@@ -755,4 +794,151 @@ def put_settings(settings: Settings) -> None:
                 updated_at   = excluded.updated_at
             """,
             (settings.model_dump_json(), time.time()),
+        )
+
+
+# ── Travel cache (keyed by rounded origin, see travel.origin_key) ──────────
+
+
+def get_travel(origin_key: str, venue_ids: list[str]) -> dict[str, TravelEntry]:
+    if not venue_ids:
+        return {}
+    placeholders = ",".join("?" * len(venue_ids))
+    rows = _fetchall(
+        f"SELECT * FROM travel WHERE origin_key = ? AND venue_id IN ({placeholders})",
+        (origin_key, *venue_ids),
+    )
+    return {
+        r["venue_id"]: TravelEntry(
+            venue_id=r["venue_id"],
+            bike_km=r["bike_km"],
+            bike_at=r["bike_at"],
+            pt_min=r["pt_min"],
+            pt_lines=json.loads(r["pt_lines_json"] or "[]"),
+            walk_m=r["walk_m"],
+            pt_at=r["pt_at"],
+            pt_failed_at=r["pt_failed_at"],
+        )
+        for r in rows
+    }
+
+
+def set_bike_km(origin_key: str, values: dict[str, float | None], at: float) -> None:
+    with _lock:
+        _c().executemany(
+            """
+            INSERT INTO travel (origin_key, venue_id, bike_km, bike_at) VALUES (?, ?, ?, ?)
+            ON CONFLICT(origin_key, venue_id) DO UPDATE SET
+                bike_km = excluded.bike_km,
+                bike_at = excluded.bike_at
+            """,
+            [(origin_key, vid, km, at) for vid, km in values.items()],
+        )
+
+
+def set_transit(origin_key: str, venue_id: str, pt_min: int, lines: list[str], walk_m: int, at: float) -> None:
+    with _lock:
+        _c().execute(
+            """
+            INSERT INTO travel (origin_key, venue_id, pt_min, pt_lines_json, walk_m, pt_at, pt_failed_at)
+            VALUES (?, ?, ?, ?, ?, ?, NULL)
+            ON CONFLICT(origin_key, venue_id) DO UPDATE SET
+                pt_min        = excluded.pt_min,
+                pt_lines_json = excluded.pt_lines_json,
+                walk_m        = excluded.walk_m,
+                pt_at         = excluded.pt_at,
+                pt_failed_at  = NULL
+            """,
+            (origin_key, venue_id, pt_min, json.dumps(lines), walk_m, at),
+        )
+
+
+def mark_transit_failed(origin_key: str, venue_id: str, at: float) -> None:
+    with _lock:
+        _c().execute(
+            """
+            INSERT INTO travel (origin_key, venue_id, pt_failed_at) VALUES (?, ?, ?)
+            ON CONFLICT(origin_key, venue_id) DO UPDATE SET pt_failed_at = excluded.pt_failed_at
+            """,
+            (origin_key, venue_id, at),
+        )
+
+
+def get_exact(origin_key: str, venue_id: str, arrive_by: str, max_age: float) -> dict | None:
+    row = _fetchone(
+        """
+        SELECT payload_json FROM travel_exact
+        WHERE origin_key = ? AND venue_id = ? AND arrive_by = ? AND fetched_at >= ?
+        """,
+        (origin_key, venue_id, arrive_by, time.time() - max_age),
+    )
+    return json.loads(row["payload_json"]) if row else None
+
+
+def set_exact(origin_key: str, venue_id: str, arrive_by: str, result: dict, at: float) -> None:
+    with _lock:
+        _c().execute(
+            """
+            INSERT INTO travel_exact (origin_key, venue_id, arrive_by, payload_json, fetched_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(origin_key, venue_id, arrive_by) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                fetched_at   = excluded.fetched_at
+            """,
+            (origin_key, venue_id, arrive_by, json.dumps(result), at),
+        )
+
+
+def get_venue_points(venue_ids: list[str]) -> dict[str, tuple[float, float]]:
+    """Coordinates of the given venues (any city); venues without coordinates are left out."""
+    if not venue_ids:
+        return {}
+    placeholders = ",".join("?" * len(venue_ids))
+    rows = _fetchall(
+        f"""
+        SELECT venue_id, lat, lng FROM venues
+        WHERE has_coordinates = 1 AND venue_id IN ({placeholders})
+        """,
+        tuple(venue_ids),
+    )
+    return {r["venue_id"]: (r["lat"], r["lng"]) for r in rows}
+
+
+def list_city_venue_points(city_ids: list[int]) -> list[tuple[str, float, float]]:
+    """(venue_id, lat, lng) of every venue with coordinates in the given cities, deduplicated."""
+    if not city_ids:
+        return []
+    placeholders = ",".join("?" * len(city_ids))
+    rows = _fetchall(
+        f"""
+        SELECT venue_id, MIN(lat) AS lat, MIN(lng) AS lng FROM venues
+        WHERE has_coordinates = 1 AND city_id IN ({placeholders})
+        GROUP BY venue_id
+        """,
+        tuple(city_ids),
+    )
+    return [(r["venue_id"], r["lat"], r["lng"]) for r in rows]
+
+
+# ── Geocode cache ──────────────────────────────────────────────────────────
+
+
+def get_geocode(query_norm: str, max_age: float) -> list[dict] | None:
+    row = _fetchone(
+        "SELECT payload_json FROM geocode_cache WHERE query_norm = ? AND fetched_at >= ?",
+        (query_norm, time.time() - max_age),
+    )
+    return json.loads(row["payload_json"]) if row else None
+
+
+def set_geocode(query_norm: str, results: list[dict], at: float) -> None:
+    with _lock:
+        _c().execute(
+            """
+            INSERT INTO geocode_cache (query_norm, payload_json, fetched_at) VALUES (?, ?, ?)
+            ON CONFLICT(query_norm) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                fetched_at   = excluded.fetched_at
+            """,
+            (query_norm, json.dumps(results), at),
         )

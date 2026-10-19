@@ -2,7 +2,7 @@
 
 from typing import Literal, Self
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 PRIVATE_TIER_ORDER = ["Essential", "Classic", "Premium", "Max"]
 CORPORATE_TIER_ORDER = ["S", "M", "L", "XL"]
@@ -189,7 +189,64 @@ class Plan(BaseModel):
         return self
 
 
+class Home(BaseModel):
+    lat: float = Field(ge=-90, le=90)
+    lng: float = Field(ge=-180, le=180)
+    label: str = ""
+
+
 class Settings(BaseModel):
     """Single-user settings stored server-side (see AGENTS.md: single-user assumption)."""
 
     plan: Plan | None = None
+    home: Home | None = None
+    bike_kmh: Literal[15, 18, 21] | None = None  # None = default (18)
+
+
+class GeocodeResult(BaseModel):
+    label: str
+    lat: float
+    lng: float
+
+
+class TravelEntry(BaseModel):
+    """Cached travel data from one origin to one venue (travel table row)."""
+
+    venue_id: str
+    bike_km: float | None = None
+    bike_at: float | None = None
+    pt_min: int | None = None
+    pt_lines: list[str] = []
+    walk_m: int | None = None
+    pt_at: float | None = None
+    pt_failed_at: float | None = None
+
+
+class LatLng(BaseModel):
+    lat: float = Field(ge=-90, le=90)
+    lng: float = Field(ge=-180, le=180)
+
+
+class TravelRequest(BaseModel):
+    venue_ids: list[str] = Field(max_length=500)
+    origin: LatLng | None = None  # default: the stored home
+
+
+class TravelResult(BaseModel):
+    bike_km: float | None
+    pt_min: int | None
+    pt_lines: list[str]
+    walk_m: int | None
+
+
+class TravelResponse(BaseModel):
+    results: dict[str, TravelResult]
+    pending: list[str]
+
+
+class ExactTransit(BaseModel):
+    pt_min: int
+    depart_at: str
+    arrive_at: str
+    lines: list[str]
+    walk_m: int

@@ -79,6 +79,26 @@ const courseDetailCache = new Map(); // course id -> detail, or null after a fai
 const courseDetailInFlight = new Set();
 let venueIndex = { source: null, size: 0, byId: new Map() };
 
+// Travel times from home (POST /api/travel), per venue id. A value of null
+// means the backend has nothing for that venue (e.g. no route).
+const travelByVenue = new Map();
+const travelPending = new Set(); // ids the backend is still computing
+const travelQueue = new Set(); // ids waiting for the next debounced request
+const travelRetry = new Set(); // ids whose poll timed out; asked again on next render
+let travelFlushTimer = null;
+let travelPollTimer = null;
+let travelPollDeadline = 0;
+const TRAVEL_DEBOUNCE_MS = 150;
+const TRAVEL_POLL_MS = 3000;
+const TRAVEL_POLL_MAX_MS = 2 * 60 * 1000;
+const TRAVEL_BATCH = 500; // backend limit per request
+const DEFAULT_BIKE_KMH = 18;
+const courseExactCache = new Map(); // course id -> exact transit, or null if unavailable
+const courseExactInFlight = new Map(); // course id -> homeKey() the request was made for
+let expandedCourse = null; // { item, course } of the expanded list item
+let homeLayer = null;
+let pickingHome = false;
+
 // Current state
 function getMembershipType() {
   return document.querySelector('#membership-toggle input:checked').value;
@@ -190,6 +210,11 @@ async function init() {
   map.addLayer(markerCluster);
 
   cityPinLayer = L.layerGroup();
+  // Own layer outside the cluster group: moving home never rebuilds markers.
+  homeLayer = L.layerGroup().addTo(map);
+  renderHomeMarker();
+  map.on("click", onMapClickForHome);
+  map.on("contextmenu", onMapContextMenu);
 
   allVenues = [];
   // Browse with the user's own membership type by default.
@@ -647,6 +672,7 @@ function renderCourseListChunk(container, courses, start, prevDate) {
       <div class="course-time">${esc(course.start_time)} – ${esc(course.end_time)}</div>
       <div class="course-title">${esc(course.title)}${plusHtml}${courseBadgesHtml(course)}</div>
       <div class="course-venue">${esc(course.venue_name)}${course.district ? " \u00b7 " + esc(course.district) : ""}</div>
+      ${travelChipsHtml(course.venue_id)}
       <div class="course-meta">${esc(course.category)}${teacherHtml} ${spotsHtml}</div>
     `;
 
@@ -657,6 +683,7 @@ function renderCourseListChunk(container, courses, start, prevDate) {
       item.classList.add("active");
       if (!wasExpanded) {
         item.classList.add("expanded");
+        expandedCourse = { item, course };
         renderCourseDetails(item, course);
         // On mobile, focusing the map drops the sheet to peek and would hide
         // the details just opened; a second tap collapses and focuses instead.
@@ -666,7 +693,17 @@ function renderCourseListChunk(container, courses, start, prevDate) {
     });
 
     container.appendChild(item);
+
+    // A re-render (more data arrived, filters changed) keeps the open course open.
+    const open = expandedCourse?.course;
+    if (open && open.id === course.id && open.date === course.date) {
+      item.classList.add("active", "expanded");
+      expandedCourse = { item, course };
+      renderCourseDetails(item, course);
+    }
   }
+
+  requestTravel(courses.slice(start, end).map((c) => c.venue_id));
 
   if (end < courses.length) {
     appendShowMore(container, courses.length - end, () =>
@@ -687,6 +724,16 @@ function renderCourseListChunk(container, courses, start, prevDate) {
 function collapseCourseItem(item) {
   item.classList.remove("expanded");
   item.querySelector(".course-details")?.remove();
+  if (expandedCourse?.item === item) expandedCourse = null;
+}
+
+// Whether `course` is the one currently expanded (and still on screen).
+// Compared by id/date: re-renders and cache refreshes create new objects.
+function isExpandedCourse(course) {
+  const open = expandedCourse?.course;
+  return Boolean(
+    open && open.id === course.id && open.date === course.date && expandedCourse.item.isConnected,
+  );
 }
 
 function findVenue(venueId) {
@@ -765,6 +812,7 @@ function renderCourseDetails(item, course) {
   if (course.extra_fee_text) {
     parts.push(`<div>On-site fee: ${esc(course.extra_fee_text)}</div>`);
   }
+  parts.push(courseTravelHtml(course));
   if (tiers.length) {
     parts.push(`<div>Included in: ${tiers.map((t) => tierBadgeHtml(t)).join(" ")}</div>`);
   }
@@ -806,6 +854,8 @@ function renderCourseDetails(item, course) {
     e.target.textContent = desc.classList.contains("open") ? "less" : "more";
   });
 
+  fetchCourseExact(course);
+
   if (detail === undefined && !courseDetailInFlight.has(course.id)) {
     courseDetailInFlight.add(course.id);
     fetch(`${API_BASE}/api/courses/${course.id}`)
@@ -814,11 +864,308 @@ function renderCourseDetails(item, course) {
       .then((d) => {
         courseDetailInFlight.delete(course.id);
         courseDetailCache.set(course.id, d);
-        if (item.isConnected && item.classList.contains("expanded")) {
-          renderCourseDetails(item, course);
+        // The list may have re-rendered meanwhile: refill whichever item now shows it.
+        if (isExpandedCourse(course)) {
+          renderCourseDetails(expandedCourse.item, expandedCourse.course);
         }
       });
   }
+}
+
+// ── Travel times ──
+
+function homeKey() {
+  const h = settings.home;
+  return h ? `${h.lat},${h.lng}` : "";
+}
+
+function bikeMinutes(km) {
+  return Math.round((km / (settings.bike_kmh || DEFAULT_BIKE_KMH)) * 60 + 2);
+}
+
+function linesText(lines) {
+  return lines && lines.length ? lines.join(" \u2192 ") : "";
+}
+
+function travelChipsInner(venueId) {
+  const t = travelByVenue.get(String(venueId));
+  if (t === undefined) return '<span class="cd-muted">\ud83d\udeb2 \u2026 \u00b7 \ud83d\ude86 \u2026</span>';
+  const pending = travelPending.has(String(venueId));
+  const bike = t && t.bike_km != null ? `\ud83d\udeb2 ${bikeMinutes(t.bike_km)} min` : `\ud83d\udeb2 ${pending ? "\u2026" : "\u2013"}`;
+  let pt = `\ud83d\ude86 ${pending ? "\u2026" : "\u2013"}`;
+  if (t && t.pt_min != null) {
+    const lines = linesText(t.pt_lines);
+    pt = `\ud83d\ude86 ${t.pt_min} min${lines ? ` (${esc(lines)})` : ""}`;
+  }
+  return `${bike} \u00b7 ${pt}`;
+}
+
+// Chips placeholder for one venue; filled in place as results arrive.
+function travelChipsHtml(venueId) {
+  if (!settings.home || venueId == null) return "";
+  return `<div class="travel-chips" data-travel-venue="${esc(String(venueId))}">${travelChipsInner(venueId)}</div>`;
+}
+
+function hhmm(iso) {
+  return iso ? iso.slice(11, 16) : "";
+}
+
+// Travel line inside an expanded course: the exact journey (arriving before
+// the class starts) once known, else the venue's typical time.
+function courseTravelHtml(course) {
+  if (!settings.home) return "";
+  const t = travelByVenue.get(String(course.venue_id));
+  const exact = courseExactCache.get(course.id);
+  const bike = t && t.bike_km != null ? `\ud83d\udeb2 ${bikeMinutes(t.bike_km)} min` : "\ud83d\udeb2 \u2026";
+  let pt;
+  if (exact) {
+    const lines = linesText(exact.lines);
+    pt = `\ud83d\ude86 ${exact.pt_min} min \u00b7 leave ${hhmm(exact.depart_at)}${lines ? ` \u00b7 ${esc(lines)}` : ""}`;
+  } else if (t && t.pt_min != null) {
+    const lines = linesText(t.pt_lines);
+    const note = exact === null ? " (typical, Tue 17:30)" : "";
+    pt = `\ud83d\ude86 ${t.pt_min} min${lines ? ` (${esc(lines)})` : ""}${note}`;
+  } else {
+    pt = exact === null ? "\ud83d\ude86 \u2013" : "\ud83d\ude86 \u2026";
+  }
+  return `<div class="cd-travel">${bike} \u00b7 ${pt}</div>`;
+}
+
+function refreshExpandedCourseTravel() {
+  if (!expandedCourse || !expandedCourse.item.isConnected) return;
+  const el = expandedCourse.item.querySelector(".cd-travel");
+  if (el) el.outerHTML = courseTravelHtml(expandedCourse.course);
+}
+
+function fetchCourseExact(course) {
+  const home = homeKey();
+  if (!home || courseExactCache.has(course.id) || courseExactInFlight.get(course.id) === home) return;
+  requestTravel([course.venue_id]);
+  courseExactInFlight.set(course.id, home);
+  const params = new URLSearchParams({
+    venue_id: course.venue_id,
+    date: course.date,
+    start: course.start_time,
+  });
+  fetch(`${API_BASE}/api/travel/exact?${params}`)
+    .then((r) => (r.ok ? r.json() : null))
+    .catch(() => null)
+    .then((exact) => {
+      if (courseExactInFlight.get(course.id) !== home) return; // home changed meanwhile
+      courseExactInFlight.delete(course.id);
+      courseExactCache.set(course.id, exact);
+      if (isExpandedCourse(course)) refreshExpandedCourseTravel();
+    });
+}
+
+function updateTravelChips(ids) {
+  for (const id of ids) {
+    const sel = `[data-travel-venue="${CSS.escape(String(id))}"]`;
+    for (const el of document.querySelectorAll(sel)) el.innerHTML = travelChipsInner(id);
+  }
+  refreshExpandedCourseTravel();
+}
+
+function updateAllTravelChips() {
+  for (const el of document.querySelectorAll("[data-travel-venue]")) {
+    el.innerHTML = travelChipsInner(el.dataset.travelVenue);
+  }
+  refreshExpandedCourseTravel();
+}
+
+// Queue venue ids for a (debounced, batched) travel request.
+function requestTravel(ids) {
+  if (!settings.home) return;
+  let added = false;
+  for (const id of ids) {
+    if (id == null || id === "") continue;
+    const key = String(id);
+    if (travelPending.has(key) || travelQueue.has(key)) continue;
+    if (travelByVenue.has(key) && !travelRetry.has(key)) continue;
+    travelRetry.delete(key);
+    travelQueue.add(key);
+    added = true;
+  }
+  if (!added) return;
+  travelPollDeadline = Date.now() + TRAVEL_POLL_MAX_MS;
+  if (!travelFlushTimer) travelFlushTimer = setTimeout(() => flushTravel(), TRAVEL_DEBOUNCE_MS);
+}
+
+async function flushTravel(ids = null) {
+  if (ids === null) {
+    ids = [...travelQueue];
+    travelQueue.clear();
+    travelFlushTimer = null;
+  }
+  const home = homeKey();
+  for (let i = 0; i < ids.length; i += TRAVEL_BATCH) {
+    const chunk = ids.slice(i, i + TRAVEL_BATCH);
+    let data;
+    try {
+      const resp = await fetch(`${API_BASE}/api/travel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ venue_ids: chunk }),
+      });
+      if (!resp.ok) continue;
+      data = await resp.json();
+    } catch {
+      continue;
+    }
+    if (homeKey() !== home) return; // home changed meanwhile; results are for the old one
+    const pending = new Set(data.pending);
+    for (const id of chunk) {
+      if (id in data.results) travelByVenue.set(id, data.results[id]);
+      if (pending.has(id)) {
+        travelPending.add(id);
+      } else {
+        travelPending.delete(id);
+        if (!travelByVenue.has(id)) travelByVenue.set(id, null);
+      }
+    }
+    updateTravelChips(chunk);
+  }
+  scheduleTravelPoll();
+}
+
+function scheduleTravelPoll() {
+  clearTimeout(travelPollTimer);
+  if (travelPending.size === 0) return;
+  if (Date.now() > travelPollDeadline) {
+    // Give up polling for now; whatever is known stays shown, and these ids
+    // are asked for again the next time they render.
+    for (const id of travelPending) {
+      if (travelByVenue.get(id) === null) travelByVenue.delete(id);
+      else travelRetry.add(id);
+    }
+    travelPending.clear();
+    updateAllTravelChips();
+    return;
+  }
+  travelPollTimer = setTimeout(() => flushTravel([...travelPending]), TRAVEL_POLL_MS);
+}
+
+// ── Home ──
+
+function renderHomeMarker() {
+  if (!homeLayer) return;
+  homeLayer.clearLayers();
+  const home = settings.home;
+  if (!home) return;
+  const marker = L.marker([home.lat, home.lng], {
+    draggable: true,
+    keyboard: false,
+    zIndexOffset: 1000,
+    title: home.label || "Home",
+    icon: L.divIcon({ className: "home-marker", html: "\ud83c\udfe0", iconSize: [28, 28], iconAnchor: [14, 14] }),
+  });
+  marker.on("dragend", () => {
+    const { lat, lng } = marker.getLatLng();
+    setHome({ lat, lng, label: "Pinned location" });
+  });
+  homeLayer.addLayer(marker);
+}
+
+function renderHomeControls() {
+  const el = document.getElementById("home-current");
+  const home = settings.home;
+  if (home) {
+    el.innerHTML = `\ud83c\udfe0 ${esc(home.label || "Pinned location")} <button type="button" id="home-clear">Clear</button>`;
+    document.getElementById("home-clear").addEventListener("click", () => setHome(null));
+  } else {
+    el.innerHTML = '<span class="cd-muted">Not set</span>';
+  }
+  const speed = String(settings.bike_kmh || DEFAULT_BIKE_KMH);
+  const radio = document.querySelector(`#bike-speed-toggle input[value="${speed}"]`);
+  if (radio) radio.checked = true;
+}
+
+async function setHome(home) {
+  try {
+    await saveSettings({ ...settings, home });
+    showYouError("");
+  } catch {
+    showYouError("Couldn't save — try again");
+  }
+  onHomeChanged();
+}
+
+function onHomeChanged() {
+  clearTimeout(travelFlushTimer);
+  clearTimeout(travelPollTimer);
+  travelFlushTimer = null;
+  travelByVenue.clear();
+  travelPending.clear();
+  travelQueue.clear();
+  travelRetry.clear();
+  courseExactCache.clear();
+  courseExactInFlight.clear();
+  renderHomeMarker();
+  renderHomeControls();
+  // Lists carry the chip placeholders, so re-render them (markers untouched).
+  if (currentView === "venues") renderList(filteredVenues || []);
+  else renderCourseList(filteredCourses);
+}
+
+async function searchHome(query) {
+  const results = document.getElementById("home-results");
+  if (query.trim().length < 3) return;
+  results.innerHTML = '<span class="cd-muted">Searching…</span>';
+  const b = map.getBounds();
+  const params = new URLSearchParams({
+    q: query,
+    viewbox: [b.getWest(), b.getNorth(), b.getEast(), b.getSouth()].map((x) => x.toFixed(4)).join(","),
+  });
+  let found;
+  try {
+    const resp = await fetch(`${API_BASE}/api/geocode?${params}`);
+    if (!resp.ok) throw new Error(`API ${resp.status}`);
+    found = await resp.json();
+  } catch {
+    results.innerHTML = '<span class="cd-muted">Search unavailable — set home on the map instead</span>';
+    return;
+  }
+  if (found.length === 0) {
+    results.innerHTML = '<span class="cd-muted">No matches</span>';
+    return;
+  }
+  results.innerHTML = "";
+  for (const r of found) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = r.label;
+    btn.addEventListener("click", async () => {
+      results.innerHTML = "";
+      document.getElementById("home-search").value = "";
+      await setHome({ lat: r.lat, lng: r.lng, label: r.label });
+      map.setView([r.lat, r.lng], Math.max(map.getZoom(), 13));
+    });
+    results.appendChild(btn);
+  }
+}
+
+function setPickingHome(on) {
+  pickingHome = on;
+  document.getElementById("map-hint").hidden = !on;
+  document.getElementById("map-container").classList.toggle("map-picking", on);
+}
+
+function onMapClickForHome(e) {
+  if (!pickingHome) return;
+  setPickingHome(false);
+  setHome({ lat: e.latlng.lat, lng: e.latlng.lng, label: "Pinned location" });
+}
+
+function onMapContextMenu(e) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "link-button";
+  btn.textContent = "\ud83c\udfe0 Set home here";
+  btn.addEventListener("click", () => {
+    map.closePopup();
+    setHome({ lat: e.latlng.lat, lng: e.latlng.lng, label: "Pinned location" });
+  });
+  L.popup().setLatLng(e.latlng).setContent(btn).openOn(map);
 }
 
 // ── "You" settings ──
@@ -905,6 +1252,35 @@ function initYouPanel() {
     }),
   );
   document.getElementById("plan-tier").addEventListener("change", () => onPlanChange(false));
+
+  renderHomeControls();
+  document.getElementById("home-search-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    searchHome(document.getElementById("home-search").value);
+  });
+  document.getElementById("home-pick").addEventListener("click", () => {
+    document.body.classList.remove("you-open");
+    if (isMobileLayout()) setSheetState("peek");
+    setPickingHome(true);
+  });
+  document.getElementById("map-hint-cancel").addEventListener("click", () => setPickingHome(false));
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && pickingHome) setPickingHome(false);
+  });
+  document.querySelectorAll("#bike-speed-toggle input").forEach((r) =>
+    r.addEventListener("change", async () => {
+      const previous = settings.bike_kmh;
+      try {
+        await saveSettings({ ...settings, bike_kmh: Number(r.value) });
+        showYouError("");
+      } catch {
+        settings.bike_kmh = previous;
+        showYouError("Couldn't save — try again");
+        renderHomeControls();
+      }
+      updateAllTravelChips();
+    }),
+  );
 }
 
 // With no plan saved yet, flipping the type only swaps the tier options.
@@ -984,6 +1360,7 @@ function renderCourseMap(courses) {
 }
 
 function buildCoursePopup(venueData) {
+  requestTravel([venueData.venue_id]);
   const coursesHtml = venueData.courses
     .map((c) => {
       const spots =
@@ -1002,6 +1379,7 @@ function buildCoursePopup(venueData) {
   return `
     <div class="popup-name">${esc(venueData.venue_name)}</div>
     <div class="popup-address">${esc(venueData.district || "")}</div>
+    ${travelChipsHtml(venueData.venue_id)}
     <div class="popup-course-list">${coursesHtml}</div>
   `;
 }
@@ -1389,6 +1767,7 @@ function renderVenueListChunk(container, venues, start) {
     item.innerHTML = `
       <div class="venue-name">${esc(venue.name)}${plusHtml}</div>
       <div class="venue-meta">${esc(venue.district)}${venue.street ? " \u00b7 " + esc(venue.street) : ""} ${ratingHtml}</div>
+      ${travelChipsHtml(venue.address_id)}
       <div class="venue-tiers">${tiers.map((t) => tierBadgeHtml(t)).join("")}</div>
       ${visitHtml}
       <div class="venue-activities">${esc(venue.activities.join(" \u00b7 "))}</div>
@@ -1406,6 +1785,8 @@ function renderVenueListChunk(container, venues, start) {
 
     container.appendChild(item);
   }
+
+  requestTravel(venues.slice(start, end).map((v) => v.address_id));
 
   if (end < venues.length) {
     appendShowMore(container, venues.length - end, () =>
@@ -1451,6 +1832,7 @@ function renderMap(venues) {
 }
 
 function buildPopup(venue) {
+  requestTravel([venue.address_id]);
   const type = getMembershipType();
   const tiers = getVenueTiers(venue);
   const tiersHtml = tiers.map((t) => tierBadgeHtml(t)).join(" ");
@@ -1520,6 +1902,7 @@ function buildPopup(venue) {
   return `
     <div class="popup-name">${nameHtml}${plusHtml}</div>
     <div class="popup-address">${esc(addressText)}</div>
+    ${travelChipsHtml(venue.address_id)}
     <div class="popup-tiers">${tiersHtml}</div>
     ${visitsHtml}
     <div class="popup-activities">${esc(venue.activities.join(" \u00b7 "))}</div>

@@ -16,6 +16,8 @@ export default [
         clearTimeout: "readonly",
         localStorage: "readonly",
         getComputedStyle: "readonly",
+        URLSearchParams: "readonly",
+        CSS: "readonly",
         L: "readonly",
       },
     },

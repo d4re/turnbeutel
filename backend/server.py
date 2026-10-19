@@ -14,7 +14,7 @@ import os
 import re
 import time
 from contextlib import asynccontextmanager
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -25,6 +25,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 
 import storage
+import travel
 from models import (
     CORPORATE_TIER_ORDER,
     PRIVATE_TIER_ORDER,
@@ -35,10 +36,15 @@ from models import (
     Course,
     CourseDetail,
     CourseFetchError,
+    ExactTransit,
+    GeocodeResult,
     MultiCityCoursesResponse,
     MultiCityVenuesPayload,
     Settings,
     TierConfig,
+    TravelRequest,
+    TravelResponse,
+    TravelResult,
     Venue,
     VenueAddress,
     VenueDetail,
@@ -89,6 +95,13 @@ PREFETCH_INTERVAL = float(os.environ.get("PREFETCH_INTERVAL_MINUTES", "60")) * 6
 # one — the map's default Berlin view pulls in ~20 small Brandenburg towns.
 PREFETCH_RADIUS_KM = float(os.environ.get("PREFETCH_RADIUS_KM", "0"))
 
+# Travel times (travel.py): the worker starts with the app; tests switch it off.
+TRAVEL_ENABLED = True
+travel_worker: travel.TravelWorker | None = None
+EXACT_TIMEOUT = 10.0  # s an expanded course waits for its exact journey
+EXACT_BUFFER = timedelta(minutes=5)  # arrive this long before the class starts
+_prefetch_cities: list[City] = []
+
 # ── Tier mappings ──
 
 CORP_TO_PRIVATE = {"S": "Essential", "M": "Classic", "L": "Premium", "XL": "Max"}
@@ -129,7 +142,7 @@ def _invalidate_venues_cache(city_id: int) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize SQLite storage, sync /cities index, and purge stale courses."""
-    global _cities_index
+    global _cities_index, travel_worker, _prefetch_cities
 
     await run_in_threadpool(storage.init, DB_PATH)
 
@@ -146,14 +159,29 @@ async def lifespan(app: FastAPI):
     await run_in_threadpool(storage.purge_stale_courses, float(COURSES_STALE))
 
     prefetch_cities = resolve_prefetch_cities(PREFETCH_CITIES, _cities_index, PREFETCH_RADIUS_KM)
+    _prefetch_cities = prefetch_cities
+
+    travel_task = travel_client = None
+    if TRAVEL_ENABLED:
+        travel_client = httpx.AsyncClient(headers={"User-Agent": travel.USER_AGENT}, timeout=15)
+        travel_worker = travel.TravelWorker(travel_client, travel.Pacer(travel.VBB_SPACING))
+        settings = await run_in_threadpool(storage.get_settings)
+        if settings.home:
+            travel_worker.set_origin((settings.home.lat, settings.home.lng))
+        travel_task = asyncio.create_task(travel_worker.run())
+
     prefetch_task = asyncio.create_task(prefetch_loop(prefetch_cities)) if prefetch_cities else None
 
     yield
 
-    if prefetch_task is not None:
-        prefetch_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await prefetch_task
+    for task in (prefetch_task, travel_task):
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+    if travel_client is not None:
+        await travel_client.aclose()
+        travel_worker = None
     storage.close()
 
 
@@ -822,6 +850,16 @@ async def prefetch_cycle(cities: list[City], interval: float) -> None:
         if pairs:
             await _refresh_courses_in_background(pairs)
 
+    # Keep travel times from home warm too (only re-fetches what has expired).
+    await _warm_travel(cities)
+
+
+async def _warm_travel(cities: list[City]) -> None:
+    if travel_worker is None or travel_worker.origin is None or not cities:
+        return
+    points = await run_in_threadpool(storage.list_city_venue_points, [c.id for c in cities])
+    await travel_worker.warm(points)
+
 
 async def prefetch_loop(cities: list[City], interval: float | None = None) -> None:
     """Keep `cities` warm forever: one prefetch cycle every `interval` seconds."""
@@ -999,9 +1037,93 @@ async def get_settings():
 
 @app.put("/api/settings", response_model=Settings)
 async def put_settings(settings: Settings):
-    """Replace the stored settings (single user, last write wins)."""
+    """Replace the stored settings (single user, last write wins). A new home re-warms travel times."""
+    previous = await run_in_threadpool(storage.get_settings)
     await run_in_threadpool(storage.put_settings, settings)
+    home = (settings.home.lat, settings.home.lng) if settings.home else None
+    old_home = (previous.home.lat, previous.home.lng) if previous.home else None
+    if travel_worker is not None and home != old_home:
+        travel_worker.set_origin(home)
+        await _warm_travel(_prefetch_cities)
     return settings
+
+
+@app.get("/api/geocode", response_model=list[GeocodeResult])
+async def get_geocode(q: str, viewbox: str | None = None):
+    """Address search (Nominatim), cached 30 days per normalised query."""
+    query = " ".join(q.split())
+    if not 3 <= len(query) <= 200:
+        raise HTTPException(status_code=422, detail="q must be 3-200 characters")
+    key = query.lower()
+    cached = await run_in_threadpool(storage.get_geocode, key, float(travel.GEOCODE_TTL))
+    if cached is not None:
+        return cached
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            results = await travel.geocode(query, viewbox, client, travel.nominatim_pacer)
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail="Address search unavailable") from e
+    payload = [r.model_dump() for r in results]
+    await run_in_threadpool(storage.set_geocode, key, payload, time.time())
+    return payload
+
+
+async def _stored_home() -> tuple[float, float] | None:
+    settings = await run_in_threadpool(storage.get_settings)
+    return (settings.home.lat, settings.home.lng) if settings.home else None
+
+
+@app.post("/api/travel", response_model=TravelResponse)
+async def post_travel(req: TravelRequest):
+    """Cached travel data per venue, plus the ids still being computed in the background."""
+    origin = (req.origin.lat, req.origin.lng) if req.origin else await _stored_home()
+    if origin is None:
+        raise HTTPException(status_code=409, detail="Set a home first")
+    points = await run_in_threadpool(storage.get_venue_points, list(dict.fromkeys(req.venue_ids)))
+    known = [vid for vid in dict.fromkeys(req.venue_ids) if vid in points]
+    cached = await run_in_threadpool(storage.get_travel, travel.origin_key(*origin), known)
+    if travel_worker is not None and known:
+        await travel_worker.request(known, origin=origin)
+    results = {
+        vid: TravelResult(bike_km=e.bike_km, pt_min=e.pt_min, pt_lines=e.pt_lines, walk_m=e.walk_m)
+        for vid, e in cached.items()
+        if e.bike_km is not None or e.pt_min is not None
+    }
+    pending = [vid for vid in known if travel_worker is not None and travel_worker.is_pending(vid)]
+    return TravelResponse(results=results, pending=pending)
+
+
+@app.get("/api/travel/exact", response_model=ExactTransit)
+async def get_travel_exact(venue_id: str, date: str, start: str):
+    """Transit journey from home arriving EXACT_BUFFER before a class starts (waits up to EXACT_TIMEOUT)."""
+    home = await _stored_home()
+    if home is None:
+        raise HTTPException(status_code=409, detail="Set a home first")
+    try:
+        starts_at = datetime.fromisoformat(f"{date}T{start}").replace(tzinfo=travel.BERLIN)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail="Expected date=YYYY-MM-DD and start=HH:MM") from e
+    points = await run_in_threadpool(storage.get_venue_points, [venue_id])
+    if venue_id not in points:
+        raise HTTPException(status_code=404, detail=f"Venue {venue_id} not found")
+    dest = points[venue_id]
+    if not (travel.in_vbb_area(*home) and travel.in_vbb_area(*dest)):
+        raise HTTPException(status_code=404, detail="No transit data for this area")
+
+    arrive_by = starts_at - EXACT_BUFFER
+    cached = await run_in_threadpool(
+        storage.get_exact, travel.origin_key(*home), venue_id, arrive_by.isoformat(), float(travel.EXACT_TTL)
+    )
+    if cached is not None:
+        return cached
+    if travel_worker is None:
+        raise HTTPException(status_code=502, detail="Transit lookup unavailable")
+    try:
+        return await asyncio.wait_for(travel_worker.exact(venue_id, dest, arrive_by), EXACT_TIMEOUT)
+    except TimeoutError as e:
+        raise HTTPException(status_code=504, detail="Transit lookup timed out") from e
+    except travel.TransitUnavailable as e:
+        raise HTTPException(status_code=502, detail="Transit lookup unavailable") from e
 
 
 @app.get("/api/cities", response_model=CitiesResponse)
