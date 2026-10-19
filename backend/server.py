@@ -12,18 +12,20 @@ import logging
 import math
 import os
 import re
+import secrets
 import time
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 
+import planner_store
 import storage
 import travel
 from models import (
@@ -37,10 +39,18 @@ from models import (
     CourseDetail,
     CourseFetchError,
     ExactTransit,
+    Feedback,
     GeocodeResult,
     MultiCityCoursesResponse,
     MultiCityVenuesPayload,
+    PlannerSuggestionsResponse,
+    Profile,
+    ProfileUpdate,
+    RunCreate,
+    RunCreated,
     Settings,
+    Suggestion,
+    SuggestionPatch,
     TierConfig,
     TravelRequest,
     TravelResponse,
@@ -102,6 +112,12 @@ EXACT_TIMEOUT = 10.0  # s an expanded course waits for its exact journey
 EXACT_BUFFER = timedelta(minutes=5)  # arrive this long before the class starts
 _prefetch_cities: list[City] = []
 
+# Planner (single user per instance): suggestions, picks and feedback live in
+# their own database, since usc.db is a disposable cache. The planner API is
+# disabled unless PLANNER_TOKEN is set; clients send it as a Bearer token.
+PLANNER_TOKEN = os.environ.get("PLANNER_TOKEN", "")
+PLANNER_DB = Path(os.environ.get("PLANNER_DB", str(Path(__file__).parent / "data" / "planner.db")))
+
 # ── Tier mappings ──
 
 CORP_TO_PRIVATE = {"S": "Essential", "M": "Classic", "L": "Premium", "XL": "Max"}
@@ -145,6 +161,7 @@ async def lifespan(app: FastAPI):
     global _cities_index, travel_worker, _prefetch_cities
 
     await run_in_threadpool(storage.init, DB_PATH)
+    await run_in_threadpool(planner_store.init, PLANNER_DB)
 
     cities_fetched_at = await run_in_threadpool(storage.get_cities_fetched_at)
     if cities_fetched_at is None or (time.time() - cities_fetched_at) > CITIES_TTL:
@@ -183,6 +200,7 @@ async def lifespan(app: FastAPI):
         await travel_client.aclose()
         travel_worker = None
     storage.close()
+    planner_store.close()
 
 
 app = FastAPI(title="Turnbeutel API", lifespan=lifespan)
@@ -1135,6 +1153,108 @@ async def get_cities():
 @app.get("/api/health")
 async def health():
     return {"status": "ok"}
+
+
+# ── Planner ──
+#
+# Claude writes ranked per-day suggestions (POST /runs) and reads feedback
+# (GET /history); the Plan view shows suggestions and records picks/feedback.
+
+
+def require_planner(authorization: str = Header("")) -> None:
+    if not PLANNER_TOKEN:
+        raise HTTPException(status_code=503, detail="planner disabled: PLANNER_TOKEN not set")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not secrets.compare_digest(token.encode(), PLANNER_TOKEN.encode()):
+        raise HTTPException(status_code=401, detail="invalid planner token", headers={"WWW-Authenticate": "Bearer"})
+
+
+planner = APIRouter(prefix="/api/planner", dependencies=[Depends(require_planner)])
+
+
+@app.get("/api/planner/status")
+async def planner_status():
+    return {"enabled": bool(PLANNER_TOKEN)}
+
+
+async def _planner_call(fn, *args):
+    """Run a planner_store call in the threadpool, mapping its errors to HTTP codes."""
+    try:
+        return await run_in_threadpool(fn, *args)
+    except planner_store.NotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except planner_store.ConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+
+
+async def _with_live_spots(suggestions: list[Suggestion]) -> list[Suggestion]:
+    cached = await run_in_threadpool(storage.find_courses, [(s.course_id, s.date) for s in suggestions])
+    for s in suggestions:
+        hit = cached.get((s.course_id, s.date))
+        if hit:
+            s.free_spots, s.max_spots = hit[1].free_spots, hit[1].max_spots
+    return suggestions
+
+
+@planner.get("/profile", response_model=Profile)
+async def planner_get_profile():
+    return await _planner_call(planner_store.get_profile)
+
+
+@planner.put("/profile", response_model=Profile)
+async def planner_put_profile(body: ProfileUpdate):
+    return await _planner_call(planner_store.set_profile, body.text, time.time())
+
+
+@planner.get("/history", response_model=PlannerSuggestionsResponse)
+async def planner_history():
+    return PlannerSuggestionsResponse(
+        runs=await _planner_call(planner_store.list_runs),
+        suggestions=await _planner_call(planner_store.list_history),
+    )
+
+
+@planner.post("/runs", response_model=RunCreated)
+async def planner_create_run(body: RunCreate):
+    pairs = [(s.course_id, s.date) for s in body.suggestions]
+    snapshots = await run_in_threadpool(storage.find_courses, pairs)
+    missing = [{"course_id": cid, "date": d} for cid, d in dict.fromkeys(pairs) if (cid, d) not in snapshots]
+    if missing:
+        raise HTTPException(status_code=422, detail={"message": "unknown courses", "missing": missing})
+    run, suggestions = await _planner_call(planner_store.create_run, body, snapshots, time.time())
+    return RunCreated(run=run, suggestions=await _with_live_spots(suggestions))
+
+
+@planner.get("/suggestions", response_model=PlannerSuggestionsResponse)
+async def planner_suggestions(
+    date_from: str = Query(alias="from", pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    date_to: str = Query(alias="to", pattern=r"^\d{4}-\d{2}-\d{2}$"),
+):
+    suggestions = await _planner_call(planner_store.list_suggestions, date_from, date_to)
+    run_ids = {s.run_id for s in suggestions}
+    runs = [r for r in await _planner_call(planner_store.list_runs) if r.id in run_ids]
+    return PlannerSuggestionsResponse(runs=runs, suggestions=await _with_live_spots(suggestions))
+
+
+@planner.patch("/suggestions/{sid}", response_model=Suggestion)
+async def planner_patch_suggestion(sid: int, body: SuggestionPatch):
+    s = await _planner_call(planner_store.update_suggestion, sid, body)
+    return (await _with_live_spots([s]))[0]
+
+
+@planner.delete("/suggestions/{sid}", status_code=204)
+async def planner_delete_suggestion(sid: int):
+    await _planner_call(planner_store.delete_suggestion, sid)
+    return Response(status_code=204)
+
+
+@planner.put("/suggestions/{sid}/feedback", response_model=Suggestion)
+async def planner_put_feedback(sid: int, body: Feedback):
+    s = await _planner_call(planner_store.set_feedback, sid, body, date.today().isoformat(), time.time())
+    return (await _with_live_spots([s]))[0]
+
+
+app.include_router(planner)
 
 
 # Serve frontend static files — must be last (catch-all mount)

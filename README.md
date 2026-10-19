@@ -82,6 +82,7 @@ uv run uvicorn server:app --reload --host 0.0.0.0 --port 8000
 - **You** (sidebar header) — set your own plan (corporate/private + tier), your home and your bike speed. The plan drives the `⬆` badges and the default Corporate/Private toggle; without one, the badge marks classes that need a higher tier than their venue. Set home by address search, "Pick on map", right-click/long-press on the map, or by dragging the 🏠 pin.
 - **Travel times** — with a home set, venues and courses show `🚲 14 min · 🚆 22 min (M4 → U8)`. Bike minutes come from the route distance at your chosen speed; transit is a typical weekday-evening journey (Berlin/Brandenburg only). An expanded course shows the exact connection that gets you there 5 minutes before it starts, including when to leave. Times fill in gradually in the background.
 - **Zoom out** to see pins for every USC city; click one to fly there and load its venues.
+- **Plan tab** (only when the planner is enabled, see [Planner](#planner)) — ranked course suggestions per day written by Claude. Pick one per day, filter by time of day, mark suggestions as not interested, and leave feedback on past picks.
 - **On a phone** the sidebar becomes a bottom sheet over a full-screen map: drag the handle (or tap it) to switch between peek, half, and full height, and open filters via the **Filters** button in the sheet header (the badge shows how many filters are active).
 
 ## Project Structure
@@ -91,16 +92,20 @@ backend/
   server.py             # FastAPI app — proxies USC API, transforms, caches, serves frontend
   storage.py            # SQLite persistence layer (venues, courses, cities, categories, settings)
   travel.py             # Travel times: OSRM bike distances, VBB transit, Nominatim, background worker
+  planner_store.py      # SQLite store for the planner (profile, runs, suggestions, feedback)
   models.py             # Pydantic domain models
   pyproject.toml        # Python dependencies (managed by uv)
   test_server.py        # Backend tests: pure functions + endpoints (pytest)
   test_storage.py       # Backend tests: SQLite layer (pytest)
   test_travel.py        # Backend tests: travel helpers, clients and worker (pytest)
+  test_planner_store.py # Backend tests: planner store (pytest)
   cache/                # Persistent SQLite cache, usc.db (gitignored)
+  data/                 # Planner database, planner.db (gitignored, user data)
 
 frontend/
   index.html            # Single-page app
   app.js                # Map, filters, rendering logic
+  planner.js            # Plan view (suggestions, picks, feedback)
   style.css             # Styling
 
 data/                   # Historical scraped snapshots (gitignored, not used by the app)
@@ -110,6 +115,7 @@ docker-compose.yml      # Single-command container deployment (local build)
 docker-compose.prod.yml # Same, but pulls the CI-published image from ghcr.io
 Makefile                # Local dev shortcuts (serve, test, lint, clean)
 .sbx/kit/               # Docker Sandboxes kit for the agent dev environment
+.claude/skills/         # Claude Code project skills (verify, plan-courses)
 ```
 
 ## API Endpoints
@@ -128,6 +134,17 @@ The backend exposes:
 - `GET /api/travel/exact?venue_id=...&date=YYYY-MM-DD&start=HH:MM` — The transit connection arriving 5 minutes before a class starts (waits up to 10 s; cached 24 h)
 - `GET /api/health` — Health check (used by Docker HEALTHCHECK and load balancers)
 
+Planner endpoints (see [Planner](#planner)); all except `status` need `Authorization: Bearer $PLANNER_TOKEN`:
+
+- `GET /api/planner/status` — `{enabled}`; no auth
+- `GET` / `PUT /api/planner/profile` — Preferences profile (markdown) read by every recommendation run
+- `GET /api/planner/history` — Every picked, not-interested or reviewed suggestion with its feedback, plus all runs
+- `POST /api/planner/runs` — Store a run's ranked suggestions `{date_from, date_to, summary, suggestions: [{course_id, date, rank, reason, tags}]}`; course data is snapshotted from the course cache (422 lists unknown courses)
+- `GET /api/planner/suggestions?from=YYYY-MM-DD&to=YYYY-MM-DD` — Suggestions with picks, feedback and live free spots
+- `PATCH /api/planner/suggestions/{id}` — Change `rank`, `reason`, `tags`, `picked`, `not_interested`
+- `DELETE /api/planner/suggestions/{id}` — Remove an untouched suggestion (409 if picked or reviewed)
+- `PUT /api/planner/suggestions/{id}/feedback` — Feedback on a past pick: `went` (`yes`/`no`/`came_up`), `no_reason`, `rating` 1–5, `again` (`no`/`maybe`/`yes`), `again_after` (`1w`/`2-4w`/`1-3m`/`someday`), `note`
+
 ## Cache
 
 All fetched data (cities, venues, venue details, courses, course details, categories, travel times, geocoding results) and your settings are stored in a single SQLite database, `backend/cache/usc.db`. The cache survives server restarts. To force a refresh, delete the database (`make clean` or `rm backend/cache/usc.db*`) and restart the backend — this also clears your settings (plan, home, bike speed).
@@ -145,6 +162,22 @@ PREFETCH_CITIES=Berlin PREFETCH_RADIUS_KM=30 make serve
 ```
 
 The frontend additionally keeps an in-memory cache of loaded cities and dates with a soft 60-minute TTL: panning back to already-loaded data within the TTL makes no requests, while stale data is transparently re-fetched (and replaced) the next time the viewport or date selection touches it. A page reload always re-fetches.
+
+## Planner
+
+A single-user loop for finding courses worth trying:
+
+1. Every week or two, run `/plan-courses` in Claude Code (project skill in `.claude/skills/plan-courses/`). Claude reads your profile and feedback history, goes through the cached courses for the next two weeks, and writes ranked suggestions per day.
+2. In the **Plan** tab, pick at most one course per day, hide what doesn't appeal, and after a course leave feedback: did you go, how was it, would you go again and when.
+3. The next run uses that feedback.
+
+Enable it by setting `PLANNER_TOKEN` to a random secret on the server (the Plan tab asks for it once and remembers it in the browser). For runs, export `TURNBEUTEL_URL` (e.g. `http://localhost:8000`) and `PLANNER_TOKEN` in the shell you start Claude Code from.
+
+```bash
+PLANNER_TOKEN=$(openssl rand -hex 16) PREFETCH_CITIES=Berlin make serve
+```
+
+Planner data lives in its own SQLite database, `backend/data/planner.db` (override with `PLANNER_DB`); unlike the cache it is never purged, and `make clean` leaves it alone. Docker Compose stores it in the `planner-data` volume.
 
 ## License
 

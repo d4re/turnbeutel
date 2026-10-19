@@ -13,9 +13,14 @@ services:
       # to "" to disable. PREFETCH_INTERVAL_MINUTES tunes the cycle (default 60).
       PREFETCH_CITIES: ${PREFETCH_CITIES-Berlin}
       PREFETCH_RADIUS_KM: ${PREFETCH_RADIUS_KM-30}
+      # Enables the Plan view and /api/planner/* (Bearer token); unset = disabled.
+      PLANNER_TOKEN: ${PLANNER_TOKEN-}
     volumes:
       - venue-cache:/app/backend/cache
+      # Planner suggestions, picks and feedback (user data, not cache).
+      - planner-data:/app/backend/data
     restart: unless-stopped
 
 volumes:
   venue-cache:
+  planner-data:

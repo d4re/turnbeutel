@@ -18,8 +18,8 @@ COPY frontend/ ./frontend/
 
 # Non-root user for runtime
 RUN useradd -r -s /bin/false appuser \
-    && mkdir -p /app/backend/cache \
-    && chown -R appuser:appuser /app/backend/cache
+    && mkdir -p /app/backend/cache /app/backend/data \
+    && chown -R appuser:appuser /app/backend/cache /app/backend/data
 USER appuser
 
 EXPOSE 8000
