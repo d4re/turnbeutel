@@ -74,6 +74,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if row and row[0] and "PRIMARY KEY (city_id, course_id, date)" not in row[0]:
         conn.execute("DROP TABLE courses")
         conn.execute("DROP TABLE IF EXISTS course_fetches")
+    # Class tiers and on-site fee columns were added later; same remedy.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(courses)").fetchall()}
+    if cols and "extra_fee_eur" not in cols:
+        conn.execute("DROP TABLE courses")
+        conn.execute("DROP TABLE IF EXISTS course_fetches")
 
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS cities (
@@ -160,6 +165,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
             max_spots    INTEGER,
             is_online    INTEGER,
             is_plus      INTEGER,
+            tiers_private_json   TEXT,
+            tiers_corporate_json TEXT,
+            min_tier_private     TEXT,
+            min_tier_corporate   TEXT,
+            extra_fee_text       TEXT,
+            extra_fee_eur        INTEGER,
             PRIMARY KEY (city_id, course_id, date)
         );
         CREATE INDEX IF NOT EXISTS idx_courses_city_date ON courses(city_id, date);
@@ -547,6 +558,12 @@ def _row_to_course(row: sqlite3.Row) -> Course:
         max_spots=row["max_spots"],
         is_online=bool(row["is_online"]),
         is_plus=bool(row["is_plus"]),
+        tiers_private=json.loads(row["tiers_private_json"] or "[]"),
+        tiers_corporate=json.loads(row["tiers_corporate_json"] or "[]"),
+        min_tier_private=row["min_tier_private"],
+        min_tier_corporate=row["min_tier_corporate"],
+        extra_fee_text=row["extra_fee_text"],
+        extra_fee_eur=row["extra_fee_eur"],
     )
 
 
@@ -586,9 +603,11 @@ def upsert_courses_for_date(
                         city_id, course_id, date, title, start_time, end_time,
                         venue_id, venue_name, lat, lng, district,
                         category, category_id, teacher, free_spots, max_spots,
-                        is_online, is_plus
+                        is_online, is_plus,
+                        tiers_private_json, tiers_corporate_json, min_tier_private, min_tier_corporate,
+                        extra_fee_text, extra_fee_eur
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         (
@@ -610,6 +629,12 @@ def upsert_courses_for_date(
                             c.max_spots,
                             int(c.is_online),
                             int(c.is_plus),
+                            json.dumps(c.tiers_private),
+                            json.dumps(c.tiers_corporate),
+                            c.min_tier_private,
+                            c.min_tier_corporate,
+                            c.extra_fee_text,
+                            c.extra_fee_eur,
                         )
                         for c in courses
                     ],

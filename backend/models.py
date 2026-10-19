@@ -82,6 +82,14 @@ class Course(BaseModel):
     max_spots: int | None
     is_online: bool
     is_plus: bool
+    # Class-level plan coverage; can be stricter than the venue's.
+    tiers_private: list[str] = []
+    tiers_corporate: list[str] = []
+    min_tier_private: str | None = None
+    min_tier_corporate: str | None = None
+    # On-site surcharge: USC's own text, and the amount parsed from it or the title.
+    extra_fee_text: str | None = None
+    extra_fee_eur: int | None = None
 
 
 class CourseFetchError(BaseModel):

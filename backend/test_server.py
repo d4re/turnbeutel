@@ -15,6 +15,7 @@ from server import (
     CORPORATE_TIER_ORDER,
     PRIVATE_TIER_ORDER,
     min_tier,
+    parse_extra_fee,
     parse_venue_limits,
     transform_city,
     transform_course,
@@ -278,6 +279,46 @@ def test_transform_course_plus_and_online_flags():
     result = transform_course(raw)
     assert result.is_online is True
     assert result.is_plus is True
+
+
+@pytest.mark.parametrize(
+    ("title", "extra", "expected"),
+    [
+        ("Aerial Hoop | USC Checkin + 15 €", None, 15),
+        ("Pottery +12 Euros", None, 12),
+        ("Sauna EXTRA 5 EUR PAID AT THE DOOR", None, 5),
+        ("Ice Bath", "+ 10€ Zuzahlung", 10),
+        ("Ice Bath + 8 €", "+ 10€ Zuzahlung", 10),  # extra text wins
+        ("Drop-in 15 €", None, None),  # bare price, no + / extra
+        ("Yoga", "", None),
+        ("", None, None),
+    ],
+)
+def test_parse_extra_fee(title, extra, expected):
+    assert parse_extra_fee(title, extra) == expected
+
+
+def test_transform_course_class_tiers_and_fee():
+    raw = _make_raw_course(
+        title="Intro to Aerial Silks + 5 €",
+        planTypes=["L", "XL"],
+        planTypesB2B=["L", "XL"],
+        extraPriceDescriptionText="",
+    )
+    c = transform_course(raw)
+    assert c.tiers_private == ["Premium", "Max"]
+    assert c.tiers_corporate == ["L", "XL"]
+    assert c.min_tier_private == "Premium"
+    assert c.min_tier_corporate == "L"
+    assert c.extra_fee_text is None
+    assert c.extra_fee_eur == 5
+
+
+def test_transform_course_without_plan_types():
+    c = transform_course(_make_raw_course())
+    assert c.tiers_corporate == []
+    assert c.min_tier_corporate is None
+    assert c.extra_fee_eur is None
 
 
 # ── fetch_all_venue_pages ───────────────────────────────────────────────────

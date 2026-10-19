@@ -11,6 +11,7 @@ import contextlib
 import logging
 import math
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
@@ -391,6 +392,20 @@ def build_venue_detail(raw: dict, limits: dict) -> VenueDetail:
 
 # ── Course transformation and fetching ──
 
+# On-site surcharges are often only in the title: "USC Checkin + 15 €",
+# "+12 Euros", "EXTRA 5 EUR PAID AT THE DOOR", "+ 10€ Zuzahlung". Requiring a
+# leading "+" or "extra" keeps plain prices ("Drop-in 15 €") from matching.
+_EXTRA_FEE_RE = re.compile(r"(?:\+|\bextra\b)\s*(\d{1,3})\s*(?:€|eur(?:os?)?\b)", re.IGNORECASE)
+
+
+def parse_extra_fee(title: str, extra_text: str | None) -> int | None:
+    """Euro amount payable on site, from USC's extra-price text or else the title."""
+    for text in (extra_text, title):
+        m = _EXTRA_FEE_RE.search(text or "")
+        if m:
+            return int(m.group(1))
+    return None
+
 
 def transform_course(raw: dict) -> Course:
     """Transform a USC API course object into a Course model."""
@@ -400,10 +415,14 @@ def transform_course(raw: dict) -> Course:
     category = raw.get("category") or {}
     start_time = raw.get("startTime") or ""
     end_time = raw.get("endTime") or ""
+    tiers_private = [CORP_TO_PRIVATE[t] for t in raw.get("planTypes") or [] if t in CORP_TO_PRIVATE]
+    tiers_corporate = [t for t in raw.get("planTypesB2B") or [] if t in CORPORATE_TIER_ORDER]
+    title = raw.get("title", "")
+    extra_fee_text = raw.get("extraPriceDescriptionText") or None
     return Course(
         id=raw.get("id"),
         date=raw.get("date", ""),
-        title=raw.get("title", ""),
+        title=title,
         start_time=start_time[:5],
         end_time=end_time[:5],
         venue_id=str(venue.get("id", "")),
@@ -418,6 +437,12 @@ def transform_course(raw: dict) -> Course:
         max_spots=raw.get("maximumNumber"),
         is_online=raw.get("isOnline", 0) == 1,
         is_plus=raw.get("isPlusCheckin", 0) == 1,
+        tiers_private=tiers_private,
+        tiers_corporate=tiers_corporate,
+        min_tier_private=min_tier(tiers_private, PRIVATE_TIER_ORDER),
+        min_tier_corporate=min_tier(tiers_corporate, CORPORATE_TIER_ORDER),
+        extra_fee_text=extra_fee_text,
+        extra_fee_eur=parse_extra_fee(title, extra_fee_text),
     )
 
 
