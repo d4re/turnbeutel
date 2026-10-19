@@ -543,3 +543,35 @@ def test_worker_unknown_venue_is_ignored(db, monkeypatch):
     w = _worker()
     _drive(w, lambda: False, lambda: w.request(["nope"]), max_wait=0.2)
     assert fakes.calls == []
+
+
+def test_worker_request_promotes_venue_already_queued_by_warm(db, monkeypatch):
+    # The warm queues every prefetch venue at low priority; a venue the user is
+    # looking at must still jump ahead when requested.
+    fakes = _Fakes(monkeypatch)
+    _seed_venues({"a": A, "b": B, "c": C})
+    w = _worker()
+
+    async def setup():
+        await w.warm([("a", *A), ("b", *B), ("c", *C)])
+        await w.request(["c"])
+
+    _drive(w, lambda: len(fakes.of("transit")) == 3, setup)
+    assert fakes.of("transit")[0][2] == C
+    assert [c[2] for c in fakes.of("transit")].count(C) == 1  # the superseded warm job is skipped
+    assert storage.get_travel(KEY, ["c"])["c"].pt_min == 38
+
+
+def test_worker_drops_home_requests_after_home_change(db, monkeypatch):
+    fakes = _Fakes(monkeypatch)
+    _seed_venues({"a": A, "b": B})
+    other = (52.40, 13.10)
+    w = _worker()
+
+    async def setup():
+        await w.request(["a"])  # for the current home
+        await w.request(["b"], origin=HOME)  # explicit origin (e.g. the planner)
+        w.set_origin(other)
+
+    _drive(w, lambda: len(fakes.of("transit")) == 1, setup)
+    assert [(c[0], c[2]) for c in fakes.calls if c[1] == HOME] == [("bike", ("b",)), ("transit", B)]

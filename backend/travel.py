@@ -251,7 +251,9 @@ class _Job:
     kind: str = field(compare=False)  # "bike" | "transit"
     origin: tuple[float, float] = field(compare=False)
     dests: list[tuple[str, float, float]] = field(compare=False)  # bike: a batch; transit: one
-    key: tuple = field(compare=False)
+    # Work for "the current home" (warm, requests without an explicit origin) is
+    # dropped when the home changes; explicit-origin requests are kept.
+    follows_home: bool = field(compare=False)
 
 
 def _haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -265,7 +267,9 @@ class TravelWorker:
 
     Bike distances go to OSRM in batches; every transit lookup is one paced VBB
     request. Results land in the travel cache tables, which the endpoints read.
-    Warm jobs queued for an earlier home are dropped once the home changes.
+    Each (kind, origin, venue) is queued at most once; a more urgent request
+    supersedes a queued warm job for the same venue (the old job skips it).
+    Work queued for an earlier home is dropped once the home changes.
     Exact lookups (someone is waiting on them) bypass the queue but share the
     VBB pacer, so a slow background request never holds them up.
     """
@@ -290,11 +294,13 @@ class TravelWorker:
 
     async def request(self, venue_ids: list[str], origin: tuple[float, float] | None = None) -> None:
         """Queue whatever is missing or expired for these venues (looked up in the venues table)."""
+        follows_home = origin is None
         origin = origin or self.origin
         if origin is None:
             return
         points = await run_in_threadpool(storage.get_venue_points, venue_ids)
-        await self._enqueue(PRIORITY_REQUEST, origin, [(vid, *points[vid]) for vid in venue_ids if vid in points])
+        dests = [(vid, *points[vid]) for vid in venue_ids if vid in points]
+        await self._enqueue(PRIORITY_REQUEST, origin, dests, follows_home)
 
     async def warm(self, points: list[tuple[str, float, float]]) -> None:
         """Queue the background warm for `points`, nearest to the current home first."""
@@ -302,7 +308,7 @@ class TravelWorker:
             return
         origin = self.origin
         ordered = sorted(points, key=lambda p: _haversine_km(origin, (p[1], p[2])))
-        await self._enqueue(PRIORITY_WARM, origin, ordered)
+        await self._enqueue(PRIORITY_WARM, origin, ordered, follows_home=True)
 
     async def exact(self, venue_id: str, dest: tuple[float, float], arrive_by: datetime) -> dict:
         """Journey arriving by `arrive_by`; raises TransitUnavailable."""
@@ -348,8 +354,16 @@ class TravelWorker:
         )
         return result
 
+    def _needs_job(self, kind: str, okey: str, venue_id: str, priority: int) -> bool:
+        queued = self._queued.get((kind, okey, venue_id))
+        return queued is None or queued.priority > priority
+
     async def _enqueue(
-        self, priority: int, origin: tuple[float, float], points: list[tuple[str, float, float]]
+        self,
+        priority: int,
+        origin: tuple[float, float],
+        points: list[tuple[str, float, float]],
+        follows_home: bool,
     ) -> None:
         okey = origin_key(*origin)
         cached = await run_in_threadpool(storage.get_travel, okey, [p[0] for p in points])
@@ -359,37 +373,37 @@ class TravelWorker:
         for p in points:
             entry = cached.get(p[0])
             bike_stale = entry is None or entry.bike_at is None or now - entry.bike_at >= BIKE_TTL
-            if bike_ok and bike_stale and ("bike", okey, p[0]) not in self._queued:
+            if bike_ok and bike_stale and self._needs_job("bike", okey, p[0], priority):
                 need_bike.append(p)
             if not (in_vbb_area(*origin) and in_vbb_area(p[1], p[2])):
                 continue
             fresh = entry is not None and entry.pt_at is not None and now - entry.pt_at < PT_TTL
             failed_recently = entry is not None and entry.pt_failed_at and now - entry.pt_failed_at < PT_RETRY_AFTER
-            if not fresh and not failed_recently and ("transit", okey, p[0]) not in self._queued:
+            if not fresh and not failed_recently and self._needs_job("transit", okey, p[0], priority):
                 need_transit.append(p)
         for i in range(0, len(need_bike), OSRM_BATCH):
-            batch = need_bike[i : i + OSRM_BATCH]
-            self._put(priority, "bike", origin, batch, ("bike-batch", okey, next(self._seq)), batch_keys=True)
+            self._put(priority, "bike", origin, need_bike[i : i + OSRM_BATCH], follows_home)
         for p in need_transit:
-            self._put(priority, "transit", origin, [p], ("transit", okey, p[0]))
+            self._put(priority, "transit", origin, [p], follows_home)
 
-    def _put(self, priority, kind, origin, dests, key, *, batch_keys=False) -> _Job:
-        job = _Job(priority, _KIND_RANK[kind], next(self._seq), kind, origin, dests, key)
-        keys = [("bike", origin_key(*origin), d[0]) for d in dests] if batch_keys else [key]
-        for k in keys:
-            self._queued[k] = job
+    def _put(self, priority, kind, origin, dests, follows_home) -> None:
+        job = _Job(priority, _KIND_RANK[kind], next(self._seq), kind, origin, dests, follows_home)
+        okey = origin_key(*origin)
         for d in dests:
+            self._queued[(kind, okey, d[0])] = job  # supersedes a less urgent job
             self._pending[d[0]] += 1
         self._queue.put_nowait(job)
-        return job
+
+    def _owned_dests(self, job: _Job) -> list[tuple[str, float, float]]:
+        """The destinations this job is still responsible for (not superseded)."""
+        okey = origin_key(*job.origin)
+        return [d for d in job.dests if self._queued.get((job.kind, okey, d[0])) is job]
 
     def _done(self, job: _Job) -> None:
         okey = origin_key(*job.origin)
-        keys = [("bike", okey, d[0]) for d in job.dests] if job.kind == "bike" else [job.key]
-        for k in keys:
-            if self._queued.get(k) is job:
-                del self._queued[k]
         for d in job.dests:
+            if self._queued.get((job.kind, okey, d[0])) is job:
+                del self._queued[(job.kind, okey, d[0])]
             self._pending[d[0]] -= 1
             if self._pending[d[0]] <= 0:
                 del self._pending[d[0]]
@@ -398,28 +412,30 @@ class TravelWorker:
         while True:
             job = await self._queue.get()
             try:
-                if job.priority == PRIORITY_WARM and job.origin != self.origin:
-                    continue  # home changed since this warm was queued
-                await self._process(job)
+                if job.follows_home and job.origin != self.origin:
+                    continue  # queued for an earlier home
+                dests = self._owned_dests(job)
+                if dests:
+                    await self._process(job, dests)
             except Exception as e:
                 # Only the type: httpx messages carry the URL, i.e. the home coordinates.
                 logger.warning("Travel %s job failed: %s", job.kind, type(e).__name__)
             finally:
                 self._done(job)
 
-    async def _process(self, job: _Job) -> None:
+    async def _process(self, job: _Job, dests: list[tuple[str, float, float]]) -> None:
         okey = origin_key(*job.origin)
         if job.kind == "bike":
             try:
-                km = await fetch_bike_km(job.origin, job.dests, self._client)
+                km = await fetch_bike_km(job.origin, dests, self._client)
             except Exception:
                 self._bike_failed_at[okey] = self._now()
                 raise
             # Unroutable venues are stored as None so they aren't re-asked every time.
-            values = {vid: km.get(vid) for vid, _, _ in job.dests}
+            values = {vid: km.get(vid) for vid, _, _ in dests}
             await run_in_threadpool(storage.set_bike_km, okey, values, self._now())
         else:
-            vid, lat, lng = job.dests[0]
+            vid, lat, lng = dests[0]
             try:
                 departure = next_reference_departure(datetime.fromtimestamp(self._now(), BERLIN))
                 journeys = await fetch_journeys(job.origin, (lat, lng), self._client, self._pacer, departure=departure)
