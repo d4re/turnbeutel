@@ -171,7 +171,7 @@ A single-user loop for finding courses worth trying:
 2. In the **Plan** tab, pick at most one course per day, hide what doesn't appeal, and after a course leave feedback: did you go, how was it, would you go again and when. Cards show fee/upgrade badges and travel times from your home (precomputed when the run is written); tap one for its details and exact connection.
 3. The next run uses that feedback.
 
-Set your plan and home in the **You** panel first: runs use them for tier checks and travel times. Enable the planner by setting `PLANNER_TOKEN` to a random secret on the server (the Plan tab asks for it once and remembers it in the browser). For runs, export `TURNBEUTEL_URL` (e.g. `http://localhost:8000`) and `PLANNER_TOKEN` in the shell you start Claude Code from.
+Set your plan and home in the **You** panel first: runs use them for tier checks and travel times. Enable the planner by setting `PLANNER_TOKEN` to a random secret on the server (the Plan tab asks for it once and remembers it in the browser). For runs, put `TURNBEUTEL_URL` (e.g. `https://turnbeutel.example`) and `PLANNER_TOKEN` in a `.env` file in the repo root (gitignored; worktrees use the main checkout's), or export them in the environment.
 
 ```bash
 PLANNER_TOKEN=$(openssl rand -hex 16) PREFETCH_CITIES=Berlin make serve

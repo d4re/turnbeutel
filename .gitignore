@@ -1,4 +1,6 @@
 .venv/
+# Local secrets (TURNBEUTEL_URL, PLANNER_TOKEN for /plan-courses)
+.env
 data/
 __pycache__/
 *.pyc
