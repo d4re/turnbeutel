@@ -8,7 +8,7 @@ import time
 import pytest
 
 import storage
-from models import City, Course, Venue, VenueAddress, VenueDetail, VisitLimits
+from models import City, Course, CourseDetail, Plan, Settings, Venue, VenueAddress, VenueDetail, VisitLimits
 
 
 @pytest.fixture
@@ -425,3 +425,83 @@ def test_storage_roundtrip_preserves_pydantic_types(db):
     detail = db.get_venue_detail("a")
     assert isinstance(detail, VenueDetail)
     assert isinstance(detail.visit_limits, VisitLimits)
+
+
+# ── Course tiers / fee + migration ─────────────────────────────────────────
+
+
+def test_courses_roundtrip_keeps_tiers_and_fee(db):
+    db.upsert_cities([make_city()], fetched_at=time.time())
+    course = make_course(
+        tiers_private=["Premium", "Max"],
+        tiers_corporate=["L", "XL"],
+        min_tier_private="Premium",
+        min_tier_corporate="L",
+        extra_fee_text="+ 10€",
+        extra_fee_eur=10,
+    )
+    db.upsert_courses_for_date(1, "2026-04-10", [course], fetched_at=time.time())
+    [got] = db.get_courses_for_dates(1, ["2026-04-10"])["2026-04-10"]
+    assert got.tiers_private == ["Premium", "Max"]
+    assert got.tiers_corporate == ["L", "XL"]
+    assert got.min_tier_private == "Premium"
+    assert got.min_tier_corporate == "L"
+    assert got.extra_fee_text == "+ 10€"
+    assert got.extra_fee_eur == 10
+
+
+def test_migrate_drops_courses_table_without_fee_column(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE cities (id INTEGER PRIMARY KEY, name TEXT NOT NULL, country_code TEXT,
+            centroid_lat REAL, centroid_lng REAL, venue_address_count INTEGER,
+            lat_min REAL, lat_max REAL, lng_min REAL, lng_max REAL, fetched_at REAL NOT NULL);
+        INSERT INTO cities (id, name, fetched_at) VALUES (1, 'Berlin', 0);
+        CREATE TABLE courses (
+            city_id INTEGER NOT NULL REFERENCES cities(id), course_id INTEGER NOT NULL, date TEXT NOT NULL,
+            title TEXT, start_time TEXT, end_time TEXT, venue_id TEXT, venue_name TEXT, lat REAL, lng REAL,
+            district TEXT, category TEXT, category_id INTEGER, teacher TEXT, free_spots INTEGER,
+            max_spots INTEGER, is_online INTEGER, is_plus INTEGER,
+            PRIMARY KEY (city_id, course_id, date)
+        );
+        INSERT INTO courses (city_id, course_id, date) VALUES (1, 5, '2026-04-10');
+        CREATE TABLE course_fetches (city_id INTEGER NOT NULL, date TEXT NOT NULL,
+            fetched_at REAL NOT NULL, course_count INTEGER NOT NULL, PRIMARY KEY (city_id, date));
+        INSERT INTO course_fetches VALUES (1, '2026-04-10', 0, 1);
+    """)
+    conn.commit()
+    conn.close()
+
+    storage.close()
+    storage.init(path)
+    try:
+        cols = {r["name"] for r in storage._fetchall("PRAGMA table_info(courses)")}
+        assert "extra_fee_eur" in cols
+        assert storage._fetchall("SELECT * FROM courses") == []
+        assert storage._fetchall("SELECT * FROM course_fetches") == []
+    finally:
+        storage.close()
+
+
+def test_course_detail_roundtrip(db):
+    detail = CourseDetail(
+        description="Hang on",
+        rating=4.8,
+        rating_count=120,
+        free_cancellation_hours=12,
+        booking_type="instant",
+        fetched_at=123.0,
+    )
+    db.upsert_course_detail(7, detail)
+    assert db.get_course_detail(7) == detail
+    assert db.get_course_detail(8) is None
+
+
+def test_settings_roundtrip(db):
+    assert db.get_settings() == Settings()
+    s = Settings(plan=Plan(type="corporate", tier="L"))
+    db.put_settings(s)
+    assert db.get_settings() == s

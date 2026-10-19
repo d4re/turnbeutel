@@ -11,6 +11,7 @@ import contextlib
 import logging
 import math
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
@@ -25,14 +26,18 @@ from fastapi.staticfiles import StaticFiles
 
 import storage
 from models import (
+    CORPORATE_TIER_ORDER,
+    PRIVATE_TIER_ORDER,
     CitiesResponse,
     City,
     CityCoursesEntry,
     CityVenuesEntry,
     Course,
+    CourseDetail,
     CourseFetchError,
     MultiCityCoursesResponse,
     MultiCityVenuesPayload,
+    Settings,
     TierConfig,
     Venue,
     VenueAddress,
@@ -70,6 +75,7 @@ VENUES_TTL = 24 * 3600
 DETAILS_TTL = 7 * 24 * 3600
 CATEGORIES_TTL = 7 * 24 * 3600
 COURSES_TTL = 48 * 3600
+COURSE_DETAILS_TTL = 7 * 24 * 3600
 COURSES_STALE = 3 * 24 * 3600
 CITIES_TTL = 7 * 24 * 3600
 
@@ -85,8 +91,6 @@ PREFETCH_RADIUS_KM = float(os.environ.get("PREFETCH_RADIUS_KM", "0"))
 
 # ── Tier mappings ──
 
-PRIVATE_TIER_ORDER = ["Essential", "Classic", "Premium", "Max"]
-CORPORATE_TIER_ORDER = ["S", "M", "L", "XL"]
 CORP_TO_PRIVATE = {"S": "Essential", "M": "Classic", "L": "Premium", "XL": "Max"}
 
 TIER_CONFIG = TierConfig(
@@ -110,6 +114,9 @@ _venue_fetch_semaphore = asyncio.Semaphore(MAX_CONCURRENT_VENUE_FETCHES)
 # Guards against duplicate stale-while-revalidate refreshes.
 _venue_refresh_cities: set[int] = set()
 _course_refresh_keys: set[tuple[int, str]] = set()
+_course_detail_refresh: set[int] = set()
+# One request per click, but still bounded like every other course fetch.
+_course_detail_semaphore = asyncio.Semaphore(5)
 
 
 def _invalidate_venues_cache(city_id: int) -> None:
@@ -391,6 +398,20 @@ def build_venue_detail(raw: dict, limits: dict) -> VenueDetail:
 
 # ── Course transformation and fetching ──
 
+# On-site surcharges are often only in the title: "USC Checkin + 15 €",
+# "+12 Euros", "EXTRA 5 EUR PAID AT THE DOOR", "+ 10€ Zuzahlung". Requiring a
+# leading "+" or "extra" keeps plain prices ("Drop-in 15 €") from matching.
+_EXTRA_FEE_RE = re.compile(r"(?:\+|\bextra\b)\s*(\d{1,3})\s*(?:€|eur(?:os?)?\b)", re.IGNORECASE)
+
+
+def parse_extra_fee(title: str, extra_text: str | None) -> int | None:
+    """Euro amount payable on site, from USC's extra-price text or else the title."""
+    for text in (extra_text, title):
+        m = _EXTRA_FEE_RE.search(text or "")
+        if m:
+            return int(m.group(1))
+    return None
+
 
 def transform_course(raw: dict) -> Course:
     """Transform a USC API course object into a Course model."""
@@ -400,10 +421,14 @@ def transform_course(raw: dict) -> Course:
     category = raw.get("category") or {}
     start_time = raw.get("startTime") or ""
     end_time = raw.get("endTime") or ""
+    tiers_private = [CORP_TO_PRIVATE[t] for t in raw.get("planTypes") or [] if t in CORP_TO_PRIVATE]
+    tiers_corporate = [t for t in raw.get("planTypesB2B") or [] if t in CORPORATE_TIER_ORDER]
+    title = raw.get("title", "")
+    extra_fee_text = raw.get("extraPriceDescriptionText") or None
     return Course(
         id=raw.get("id"),
         date=raw.get("date", ""),
-        title=raw.get("title", ""),
+        title=title,
         start_time=start_time[:5],
         end_time=end_time[:5],
         venue_id=str(venue.get("id", "")),
@@ -418,6 +443,12 @@ def transform_course(raw: dict) -> Course:
         max_spots=raw.get("maximumNumber"),
         is_online=raw.get("isOnline", 0) == 1,
         is_plus=raw.get("isPlusCheckin", 0) == 1,
+        tiers_private=tiers_private,
+        tiers_corporate=tiers_corporate,
+        min_tier_private=min_tier(tiers_private, PRIVATE_TIER_ORDER),
+        min_tier_corporate=min_tier(tiers_corporate, CORPORATE_TIER_ORDER),
+        extra_fee_text=extra_fee_text,
+        extra_fee_eur=parse_extra_fee(title, extra_fee_text),
     )
 
 
@@ -899,6 +930,78 @@ async def get_courses(
         date_to=date_list[-1],
         errors=errors,
     )
+
+
+async def fetch_course_detail(course_id: int, client: httpx.AsyncClient | None = None) -> dict:
+    """Fetch a single course from the USC API (description, ratings, cancellation)."""
+    if client is None:
+        async with httpx.AsyncClient(headers=USC_HEADERS, timeout=30) as one_shot:
+            return await fetch_course_detail(course_id, one_shot)
+    resp = await client.get(f"{USC_API}/courses/{course_id}")
+    resp.raise_for_status()
+    return resp.json().get("data", {})
+
+
+def build_course_detail(raw: dict) -> CourseDetail:
+    ratings = raw.get("ratings") or {}
+    return CourseDetail(
+        description=raw.get("description") or "",
+        rating=ratings.get("averageScore"),
+        rating_count=ratings.get("totalRatings"),
+        free_cancellation_hours=raw.get("freeCancellationHours"),
+        booking_type=raw.get("bookingType"),
+        fetched_at=time.time(),
+    )
+
+
+async def _load_course_detail(course_id: int) -> CourseDetail:
+    async with _course_detail_semaphore:
+        raw = await fetch_course_detail(course_id)
+    detail = build_course_detail(raw)
+    await run_in_threadpool(storage.upsert_course_detail, course_id, detail)
+    return detail
+
+
+async def _refresh_course_detail_in_background(course_id: int) -> None:
+    if course_id in _course_detail_refresh:
+        return
+    _course_detail_refresh.add(course_id)
+    try:
+        await _load_course_detail(course_id)
+    except Exception as e:
+        logger.warning("Background course detail refresh failed for %s: %r", course_id, e)
+    finally:
+        _course_detail_refresh.discard(course_id)
+
+
+@app.get("/api/courses/{course_id}", response_model=CourseDetail)
+async def get_course_detail(course_id: int):
+    """Course description, rating and cancellation window; cached 7 days, stale served while refreshing."""
+    cached = await run_in_threadpool(storage.get_course_detail, course_id)
+    if cached is not None:
+        if time.time() - cached.fetched_at >= COURSE_DETAILS_TTL:
+            asyncio.create_task(_refresh_course_detail_in_background(course_id))
+        return cached
+    try:
+        return await _load_course_detail(course_id)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            raise HTTPException(status_code=404, detail=f"Course {course_id} not found") from e
+        raise HTTPException(status_code=502, detail="USC unavailable") from e
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail="USC unavailable") from e
+
+
+@app.get("/api/settings", response_model=Settings)
+async def get_settings():
+    return await run_in_threadpool(storage.get_settings)
+
+
+@app.put("/api/settings", response_model=Settings)
+async def put_settings(settings: Settings):
+    """Replace the stored settings (single user, last write wins)."""
+    await run_in_threadpool(storage.put_settings, settings)
+    return settings
 
 
 @app.get("/api/cities", response_model=CitiesResponse)

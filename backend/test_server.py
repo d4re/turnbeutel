@@ -10,11 +10,12 @@ from fastapi.testclient import TestClient
 
 import server
 import storage
-from models import City, Course, Venue, VenueAddress, VenueDetail, VisitLimits
+from models import City, Course, CourseDetail, Venue, VenueAddress, VenueDetail, VisitLimits
 from server import (
     CORPORATE_TIER_ORDER,
     PRIVATE_TIER_ORDER,
     min_tier,
+    parse_extra_fee,
     parse_venue_limits,
     transform_city,
     transform_course,
@@ -280,6 +281,46 @@ def test_transform_course_plus_and_online_flags():
     assert result.is_plus is True
 
 
+@pytest.mark.parametrize(
+    ("title", "extra", "expected"),
+    [
+        ("Aerial Hoop | USC Checkin + 15 €", None, 15),
+        ("Pottery +12 Euros", None, 12),
+        ("Sauna EXTRA 5 EUR PAID AT THE DOOR", None, 5),
+        ("Ice Bath", "+ 10€ Zuzahlung", 10),
+        ("Ice Bath + 8 €", "+ 10€ Zuzahlung", 10),  # extra text wins
+        ("Drop-in 15 €", None, None),  # bare price, no + / extra
+        ("Yoga", "", None),
+        ("", None, None),
+    ],
+)
+def test_parse_extra_fee(title, extra, expected):
+    assert parse_extra_fee(title, extra) == expected
+
+
+def test_transform_course_class_tiers_and_fee():
+    raw = _make_raw_course(
+        title="Intro to Aerial Silks + 5 €",
+        planTypes=["L", "XL"],
+        planTypesB2B=["L", "XL"],
+        extraPriceDescriptionText="",
+    )
+    c = transform_course(raw)
+    assert c.tiers_private == ["Premium", "Max"]
+    assert c.tiers_corporate == ["L", "XL"]
+    assert c.min_tier_private == "Premium"
+    assert c.min_tier_corporate == "L"
+    assert c.extra_fee_text is None
+    assert c.extra_fee_eur == 5
+
+
+def test_transform_course_without_plan_types():
+    c = transform_course(_make_raw_course())
+    assert c.tiers_corporate == []
+    assert c.min_tier_corporate is None
+    assert c.extra_fee_eur is None
+
+
 # ── fetch_all_venue_pages ───────────────────────────────────────────────────
 
 
@@ -479,6 +520,9 @@ def seeded_client(tmp_path: Path, monkeypatch):
     async def _fake_venue_limits(venue_id):
         return {}
 
+    async def _fake_course_detail(course_id):
+        return {}
+
     async def _fake_enrich(city_id):
         # No-op: the fire-and-forget enrichment task would otherwise outlive the
         # SQLite connection and touch it after fixture teardown (segfault).
@@ -488,6 +532,8 @@ def seeded_client(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(server, "fetch_venue_detail", _fake_venue_detail)
     monkeypatch.setattr(server, "fetch_venue_limits", _fake_venue_limits)
     monkeypatch.setattr(server, "enrich_venue_details", _fake_enrich)
+    monkeypatch.setattr(server, "fetch_course_detail", _fake_course_detail)
+    server._course_detail_refresh.clear()
 
     with TestClient(server.app) as client:
         yield client
@@ -1005,3 +1051,98 @@ def test_transform_city_uses_default_name():
     assert c.centroid_lat == 50.780658
     assert c.centroid_lng == 6.083815
     assert c.venue_address_count == 122
+
+
+# ── GET /api/courses/{id} ──────────────────────────────────────────────────
+
+_RAW_COURSE_DETAIL = {
+    "description": "Hang on",
+    "ratings": {"averageScore": 4.8, "totalRatings": 120},
+    "freeCancellationHours": 12,
+    "bookingType": "instant",
+}
+
+
+def test_get_course_detail_fetches_and_caches(seeded_client, monkeypatch):
+    calls: list[int] = []
+
+    async def fake(course_id):
+        calls.append(course_id)
+        return dict(_RAW_COURSE_DETAIL)
+
+    monkeypatch.setattr(server, "fetch_course_detail", fake)
+
+    resp = seeded_client.get("/api/courses/7")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["description"] == "Hang on"
+    assert data["rating"] == 4.8
+    assert data["rating_count"] == 120
+    assert data["free_cancellation_hours"] == 12
+    assert data["booking_type"] == "instant"
+
+    assert seeded_client.get("/api/courses/7").status_code == 200
+    assert calls == [7]
+    assert storage.get_course_detail(7).rating_count == 120
+
+
+def test_get_course_detail_stale_served_then_refreshed(seeded_client, monkeypatch):
+    stale_at = time.time() - server.COURSE_DETAILS_TTL - 1
+    storage.upsert_course_detail(7, CourseDetail(description="old", fetched_at=stale_at))
+
+    async def fake(course_id):
+        return dict(_RAW_COURSE_DETAIL)
+
+    monkeypatch.setattr(server, "fetch_course_detail", fake)
+
+    resp = seeded_client.get("/api/courses/7")
+    assert resp.json()["description"] == "old"
+    assert _wait_until(lambda: storage.get_course_detail(7).description == "Hang on")
+
+
+def test_get_course_detail_404(seeded_client, monkeypatch):
+    import httpx
+
+    async def fake(course_id):
+        req = httpx.Request("GET", "https://example.com")
+        raise httpx.HTTPStatusError("nf", request=req, response=httpx.Response(404, request=req))
+
+    monkeypatch.setattr(server, "fetch_course_detail", fake)
+    assert seeded_client.get("/api/courses/7").status_code == 404
+
+
+def test_get_course_detail_upstream_error_is_502(seeded_client, monkeypatch):
+    import httpx
+
+    async def fake(course_id):
+        raise httpx.ConnectError("x")
+
+    monkeypatch.setattr(server, "fetch_course_detail", fake)
+    assert seeded_client.get("/api/courses/7").status_code == 502
+
+
+# ── /api/settings ──────────────────────────────────────────────────────────
+
+
+def test_settings_default_empty(seeded_client):
+    resp = seeded_client.get("/api/settings")
+    assert resp.status_code == 200
+    assert resp.json()["plan"] is None
+
+
+def test_settings_put_then_get(seeded_client):
+    plan = {"type": "corporate", "tier": "M"}
+    assert seeded_client.put("/api/settings", json={"plan": plan}).status_code == 200
+    assert seeded_client.get("/api/settings").json()["plan"] == plan
+
+
+def test_settings_rejects_tier_of_other_type(seeded_client):
+    resp = seeded_client.put("/api/settings", json={"plan": {"type": "private", "tier": "M"}})
+    assert resp.status_code == 422
+    assert seeded_client.get("/api/settings").json()["plan"] is None
+
+
+def test_settings_put_replaces_whole_object(seeded_client):
+    seeded_client.put("/api/settings", json={"plan": {"type": "private", "tier": "Classic"}})
+    seeded_client.put("/api/settings", json={})
+    assert seeded_client.get("/api/settings").json()["plan"] is None

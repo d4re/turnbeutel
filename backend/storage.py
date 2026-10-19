@@ -14,7 +14,7 @@ import threading
 import time
 from pathlib import Path
 
-from models import City, Course, Venue, VenueAddress, VenueDetail, VenuesPayload, VisitLimits
+from models import City, Course, CourseDetail, Settings, Venue, VenueAddress, VenueDetail, VenuesPayload, VisitLimits
 
 # ── Module state ────────────────────────────────────────────────────────────
 
@@ -72,6 +72,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # are TTL-cached and will be re-fetched on demand.
     row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='courses'").fetchone()
     if row and row[0] and "PRIMARY KEY (city_id, course_id, date)" not in row[0]:
+        conn.execute("DROP TABLE courses")
+        conn.execute("DROP TABLE IF EXISTS course_fetches")
+    # Class tiers and on-site fee columns were added later; same remedy.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(courses)").fetchall()}
+    if cols and "extra_fee_eur" not in cols:
         conn.execute("DROP TABLE courses")
         conn.execute("DROP TABLE IF EXISTS course_fetches")
 
@@ -160,9 +165,27 @@ def _migrate(conn: sqlite3.Connection) -> None:
             max_spots    INTEGER,
             is_online    INTEGER,
             is_plus      INTEGER,
+            tiers_private_json   TEXT,
+            tiers_corporate_json TEXT,
+            min_tier_private     TEXT,
+            min_tier_corporate   TEXT,
+            extra_fee_text       TEXT,
+            extra_fee_eur        INTEGER,
             PRIMARY KEY (city_id, course_id, date)
         );
         CREATE INDEX IF NOT EXISTS idx_courses_city_date ON courses(city_id, date);
+
+        CREATE TABLE IF NOT EXISTS settings (
+            id           INTEGER PRIMARY KEY CHECK (id = 1),
+            payload_json TEXT NOT NULL,
+            updated_at   REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS course_details (
+            course_id    INTEGER PRIMARY KEY,
+            payload_json TEXT NOT NULL,
+            fetched_at   REAL NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS course_fetches (
             city_id      INTEGER NOT NULL REFERENCES cities(id),
@@ -547,6 +570,12 @@ def _row_to_course(row: sqlite3.Row) -> Course:
         max_spots=row["max_spots"],
         is_online=bool(row["is_online"]),
         is_plus=bool(row["is_plus"]),
+        tiers_private=json.loads(row["tiers_private_json"] or "[]"),
+        tiers_corporate=json.loads(row["tiers_corporate_json"] or "[]"),
+        min_tier_private=row["min_tier_private"],
+        min_tier_corporate=row["min_tier_corporate"],
+        extra_fee_text=row["extra_fee_text"],
+        extra_fee_eur=row["extra_fee_eur"],
     )
 
 
@@ -586,9 +615,11 @@ def upsert_courses_for_date(
                         city_id, course_id, date, title, start_time, end_time,
                         venue_id, venue_name, lat, lng, district,
                         category, category_id, teacher, free_spots, max_spots,
-                        is_online, is_plus
+                        is_online, is_plus,
+                        tiers_private_json, tiers_corporate_json, min_tier_private, min_tier_corporate,
+                        extra_fee_text, extra_fee_eur
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         (
@@ -610,6 +641,12 @@ def upsert_courses_for_date(
                             c.max_spots,
                             int(c.is_online),
                             int(c.is_plus),
+                            json.dumps(c.tiers_private),
+                            json.dumps(c.tiers_corporate),
+                            c.min_tier_private,
+                            c.min_tier_corporate,
+                            c.extra_fee_text,
+                            c.extra_fee_eur,
                         )
                         for c in courses
                     ],
@@ -628,6 +665,24 @@ def upsert_courses_for_date(
         except Exception:
             conn.execute("ROLLBACK")
             raise
+
+
+def get_course_detail(course_id: int) -> CourseDetail | None:
+    row = _fetchone("SELECT payload_json FROM course_details WHERE course_id = ?", (course_id,))
+    return CourseDetail.model_validate_json(row["payload_json"]) if row else None
+
+
+def upsert_course_detail(course_id: int, detail: CourseDetail) -> None:
+    with _lock:
+        _c().execute(
+            """
+            INSERT INTO course_details (course_id, payload_json, fetched_at) VALUES (?, ?, ?)
+            ON CONFLICT(course_id) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                fetched_at   = excluded.fetched_at
+            """,
+            (course_id, detail.model_dump_json(), detail.fetched_at),
+        )
 
 
 def purge_stale_courses(max_age_seconds: float) -> int:
@@ -679,4 +734,25 @@ def set_categories(payload: dict, fetched_at: float) -> None:
             WHERE id = 1
             """,
             (json.dumps(payload, ensure_ascii=False), fetched_at),
+        )
+
+
+# ── Settings (single row) ──────────────────────────────────────────────────
+
+
+def get_settings() -> Settings:
+    row = _fetchone("SELECT payload_json FROM settings WHERE id = 1")
+    return Settings.model_validate_json(row["payload_json"]) if row else Settings()
+
+
+def put_settings(settings: Settings) -> None:
+    with _lock:
+        _c().execute(
+            """
+            INSERT INTO settings (id, payload_json, updated_at) VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                updated_at   = excluded.updated_at
+            """,
+            (settings.model_dump_json(), time.time()),
         )

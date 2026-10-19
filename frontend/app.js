@@ -69,6 +69,16 @@ let dateDragChanged = false; // did the selection change during this drag?
 let dateDragPrevStart = null; // selection to restore if the drag is cancelled
 let dateDragPrevEnd = null;
 
+// "You" settings, stored server-side (GET/PUT /api/settings): { plan: {type, tier} | null }
+let settings = {};
+const PLAN_TIER_ORDER = {
+  corporate: ["S", "M", "L", "XL"],
+  private: ["Essential", "Classic", "Premium", "Max"],
+};
+const courseDetailCache = new Map(); // course id -> detail, or null after a failed fetch
+const courseDetailInFlight = new Set();
+let venueIndex = { source: null, size: 0, byId: new Map() };
+
 // Current state
 function getMembershipType() {
   return document.querySelector('#membership-toggle input:checked').value;
@@ -147,6 +157,7 @@ async function init() {
     allCities = citiesData.cities || [];
     defaultCityId = citiesData.default_city_id ?? 1;
     tierConfig = {}; // filled on first /api/venues response
+    await loadSettings();
   } catch (err) {
     document.getElementById("venue-list").innerHTML =
       `<div class="loading">Error loading cities: ${esc(err.message)}</div>`;
@@ -181,6 +192,14 @@ async function init() {
   cityPinLayer = L.layerGroup();
 
   allVenues = [];
+  // Browse with the user's own membership type by default.
+  if (settings.plan) {
+    const radio = document.querySelector(
+      `#membership-toggle input[value="${settings.plan.type}"]`,
+    );
+    if (radio) radio.checked = true;
+  }
+  initYouPanel();
   bindFilterEvents();
   rebuildFilterOptions(allVenues);
   updateSliderLabels();
@@ -626,14 +645,23 @@ function renderCourseListChunk(container, courses, start, prevDate) {
 
     item.innerHTML = `
       <div class="course-time">${esc(course.start_time)} – ${esc(course.end_time)}</div>
-      <div class="course-title">${esc(course.title)}${plusHtml}</div>
+      <div class="course-title">${esc(course.title)}${plusHtml}${courseBadgesHtml(course)}</div>
       <div class="course-venue">${esc(course.venue_name)}${course.district ? " \u00b7 " + esc(course.district) : ""}</div>
       <div class="course-meta">${esc(course.category)}${teacherHtml} ${spotsHtml}</div>
     `;
 
     item.addEventListener("click", () => {
+      const wasExpanded = item.classList.contains("expanded");
       container.querySelectorAll(".course-item.active").forEach((el) => el.classList.remove("active"));
+      container.querySelectorAll(".course-item.expanded").forEach(collapseCourseItem);
       item.classList.add("active");
+      if (!wasExpanded) {
+        item.classList.add("expanded");
+        renderCourseDetails(item, course);
+        // On mobile, focusing the map drops the sheet to peek and would hide
+        // the details just opened; a second tap collapses and focuses instead.
+        if (isMobileLayout()) return;
+      }
       focusCourseVenueOnMap(course);
     });
 
@@ -654,6 +682,241 @@ function renderCourseListChunk(container, courses, start, prevDate) {
 // map. Don't gate on getElement(): Leaflet keeps a stale detached element on
 // markers that were displayed once and then re-clustered, so a truthy element
 // does not mean the marker is on the map.
+// ── Course details ──
+
+function collapseCourseItem(item) {
+  item.classList.remove("expanded");
+  item.querySelector(".course-details")?.remove();
+}
+
+function findVenue(venueId) {
+  if (venueIndex.source !== allVenues || venueIndex.size !== allVenues.length) {
+    venueIndex = {
+      source: allVenues,
+      size: allVenues.length,
+      byId: new Map(allVenues.map((v) => [String(v.address_id), v])),
+    };
+  }
+  return venueIndex.byId.get(String(venueId));
+}
+
+function tierLabel(type, tier) {
+  return tierConfig[type]?.display?.[tier] || tier;
+}
+
+// The tier a class needs that the user doesn't have, as {type, tier}, or null.
+// With a plan set: the class's lowest tier when it's above the plan's tier.
+// Without one: when the class needs more than its venue (active toggle).
+function courseUpgradeTier(course) {
+  const plan = settings.plan;
+  const type = plan ? plan.type : getMembershipType();
+  const tiers = (type === "corporate" ? course.tiers_corporate : course.tiers_private) || [];
+  const minT = type === "corporate" ? course.min_tier_corporate : course.min_tier_private;
+  if (!minT || tiers.length === 0) return null;
+  const order = PLAN_TIER_ORDER[type];
+  let baseline;
+  if (plan) {
+    if (tiers.includes(plan.tier)) return null;
+    baseline = plan.tier;
+  } else {
+    const venue = findVenue(course.venue_id);
+    baseline = venue && getVenueMinTier(venue);
+    if (!baseline) return null;
+  }
+  return order.indexOf(minT) > order.indexOf(baseline) ? { type, tier: minT } : null;
+}
+
+function courseBadgesHtml(course) {
+  let html = "";
+  if (course.extra_fee_eur != null) {
+    const title = course.extra_fee_text ? ` title="${esc(course.extra_fee_text)}"` : "";
+    html += ` <span class="fee-badge"${title}>+${course.extra_fee_eur} € on site</span>`;
+  }
+  const up = courseUpgradeTier(course);
+  if (up) {
+    const label = esc(tierLabel(up.type, up.tier));
+    html += ` <span class="upgrade-badge" title="Needs ${label} or higher">\u2b06 ${label}</span>`;
+  }
+  return html;
+}
+
+const BOOKING_TYPE_LABELS = {
+  instant: "Instant booking",
+  confirmation_required: "Booking needs studio confirmation",
+};
+
+// Fill (or refill) the details block of an expanded course item. Shows what the
+// list call already has right away, then the lazily fetched detail.
+function renderCourseDetails(item, course) {
+  let el = item.querySelector(".course-details");
+  if (!el) {
+    el = document.createElement("div");
+    el.className = "course-details";
+    // Links and "more" inside the block must not collapse the item.
+    el.addEventListener("click", (e) => e.stopPropagation());
+    item.appendChild(el);
+  }
+
+  const type = getMembershipType();
+  const tiers = (type === "corporate" ? course.tiers_corporate : course.tiers_private) || [];
+  const detail = courseDetailCache.get(course.id);
+  const parts = [];
+
+  if (course.extra_fee_text) {
+    parts.push(`<div>On-site fee: ${esc(course.extra_fee_text)}</div>`);
+  }
+  if (tiers.length) {
+    parts.push(`<div>Included in: ${tiers.map((t) => tierBadgeHtml(t)).join(" ")}</div>`);
+  }
+  if (detail === undefined) {
+    parts.push('<div class="cd-muted">Loading details…</div>');
+  } else if (detail === null) {
+    parts.push('<div class="cd-muted">Details unavailable</div>');
+  } else {
+    if (detail.rating != null) {
+      const count = detail.rating_count != null ? ` (${detail.rating_count})` : "";
+      parts.push(`<div class="cd-rating">\u2605 ${detail.rating}${count}</div>`);
+    }
+    if (detail.description) {
+      parts.push(`<div class="cd-description">${esc(detail.description)}</div>`);
+      if (detail.description.length > 240) {
+        parts.push('<button type="button" class="cd-more">more</button>');
+      }
+    }
+    const facts = [];
+    if (detail.free_cancellation_hours != null) {
+      facts.push(`Free cancellation up to ${detail.free_cancellation_hours} h before`);
+    }
+    if (detail.booking_type) {
+      facts.push(BOOKING_TYPE_LABELS[detail.booking_type] || detail.booking_type.replace(/_/g, " "));
+    }
+    if (facts.length) parts.push(`<div class="cd-muted">${esc(facts.join(" \u00b7 "))}</div>`);
+  }
+  const venue = findVenue(course.venue_id);
+  if (venue && isHttpUrl(venue.url)) {
+    parts.push(
+      `<a href="${esc(venue.url)}" target="_blank" rel="noopener noreferrer">Book on USC \u2197</a>`,
+    );
+  }
+  el.innerHTML = parts.join("");
+
+  el.querySelector(".cd-more")?.addEventListener("click", (e) => {
+    const desc = el.querySelector(".cd-description");
+    desc.classList.toggle("open");
+    e.target.textContent = desc.classList.contains("open") ? "less" : "more";
+  });
+
+  if (detail === undefined && !courseDetailInFlight.has(course.id)) {
+    courseDetailInFlight.add(course.id);
+    fetch(`${API_BASE}/api/courses/${course.id}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null)
+      .then((d) => {
+        courseDetailInFlight.delete(course.id);
+        courseDetailCache.set(course.id, d);
+        if (item.isConnected && item.classList.contains("expanded")) {
+          renderCourseDetails(item, course);
+        }
+      });
+  }
+}
+
+// ── "You" settings ──
+
+async function loadSettings() {
+  try {
+    const resp = await fetch(`${API_BASE}/api/settings`);
+    settings = resp.ok ? await resp.json() : {};
+  } catch {
+    settings = {};
+  }
+}
+
+// PUT the whole settings object; on success it becomes the current settings.
+async function saveSettings(next) {
+  const resp = await fetch(`${API_BASE}/api/settings`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(next),
+  });
+  if (!resp.ok) throw new Error(`API ${resp.status}`);
+  settings = await resp.json();
+}
+
+function showYouError(message) {
+  const el = document.querySelector("#you-panel .you-error");
+  el.textContent = message;
+  el.hidden = !message;
+}
+
+function renderPlanControls() {
+  const plan = settings.plan;
+  const type = plan ? plan.type : getMembershipType();
+  document.querySelector(`#plan-type-toggle input[value="${type}"]`).checked = true;
+  renderPlanControlsForType(type);
+  document.getElementById("plan-tier").value = plan ? plan.tier : "";
+}
+
+async function onPlanChange(typeChanged) {
+  const type = document.querySelector("#plan-type-toggle input:checked").value;
+  const select = document.getElementById("plan-tier");
+  let tier = select.value;
+  // Switching type keeps the equivalent tier (M <-> Classic) rather than unsetting.
+  if (typeChanged && settings.plan) {
+    const idx = PLAN_TIER_ORDER[settings.plan.type].indexOf(settings.plan.tier);
+    tier = PLAN_TIER_ORDER[type][idx];
+  }
+  const plan = tier ? { type, tier } : null;
+  try {
+    await saveSettings({ ...settings, plan });
+    showYouError("");
+  } catch {
+    showYouError("Couldn't save — try again");
+  }
+  renderPlanControls();
+  if (currentView === "courses") renderCourseList(filteredCourses);
+}
+
+function initYouPanel() {
+  const button = document.getElementById("you-button");
+  const panel = document.getElementById("you-panel");
+  renderPlanControls();
+
+  button.addEventListener("click", () => {
+    renderPlanControls(); // tier labels arrive with the first venues load
+    if (isMobileLayout()) {
+      setSheetState("full");
+      document.body.classList.add("you-open");
+      return;
+    }
+    panel.hidden = !panel.hidden;
+    button.setAttribute("aria-expanded", String(!panel.hidden));
+  });
+  panel.querySelector(".you-done").addEventListener("click", () =>
+    document.body.classList.remove("you-open"),
+  );
+  document.querySelectorAll("#plan-type-toggle input").forEach((r) =>
+    r.addEventListener("change", () => {
+      if (settings.plan) {
+        onPlanChange(true);
+      } else {
+        renderPlanControlsForType(r.value);
+      }
+    }),
+  );
+  document.getElementById("plan-tier").addEventListener("change", () => onPlanChange(false));
+}
+
+// With no plan saved yet, flipping the type only swaps the tier options.
+function renderPlanControlsForType(type) {
+  const select = document.getElementById("plan-tier");
+  select.innerHTML =
+    '<option value="">Not set</option>' +
+    PLAN_TIER_ORDER[type]
+      .map((t) => `<option value="${esc(t)}">${esc(tierLabel(type, t))}</option>`)
+      .join("");
+}
+
 function focusMarker(marker, lat, lng, zoom) {
   const target = L.latLng(lat, lng);
   const openWhenDisplayed = (triesLeft) => {
@@ -1543,6 +1806,7 @@ function initMobileSheet() {
       sidebar.style.transform = "";
       sidebar.classList.remove("dragging");
       document.body.classList.remove("filters-open");
+      document.body.classList.remove("you-open");
     }
   });
 }
