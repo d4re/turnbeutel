@@ -78,6 +78,8 @@ uv run uvicorn server:app --reload --host 0.0.0.0 --port 8000
 - **Map markers** are color-coded by minimum required tier (green → red).
 - **Click a venue** on the map or in the list to see visit limits per tier (loaded on demand from the API).
 - **Courses tab** — switch to browse classes/courses in the visible cities for a specific day or range (tap a date chip, or drag across chips for a range). Filter by time of day, category, free text, free-spots-only, and PLUS-only. The sidebar shows courses sorted by time; the map shows a marker per venue hosting matching courses, with the full schedule in each popup.
+- **Click a course** to expand it in place: description, rating, free-cancellation window, which tiers the class is included in, and a link to the venue on USC (loaded on demand). Badges flag on-site fees (`+15 € on site`, parsed from USC's text or the title) and classes your plan doesn't cover (`⬆ L Pro`).
+- **You** (sidebar header) — set your own plan (corporate/private + tier). It drives the `⬆` badges and the default Corporate/Private toggle; without one, the badge marks classes that need a higher tier than their venue.
 - **Zoom out** to see pins for every USC city; click one to fly there and load its venues.
 - **On a phone** the sidebar becomes a bottom sheet over a full-screen map: drag the handle (or tap it) to switch between peek, half, and full height, and open filters via the **Filters** button in the sheet header (the badge shows how many filters are active).
 
@@ -86,7 +88,7 @@ uv run uvicorn server:app --reload --host 0.0.0.0 --port 8000
 ```
 backend/
   server.py             # FastAPI app — proxies USC API, transforms, caches, serves frontend
-  storage.py            # SQLite persistence layer (venues, courses, cities, categories)
+  storage.py            # SQLite persistence layer (venues, courses, cities, categories, settings)
   models.py             # Pydantic domain models
   pyproject.toml        # Python dependencies (managed by uv)
   test_server.py        # Backend tests: pure functions + endpoints (pytest)
@@ -115,12 +117,14 @@ The backend exposes:
 - `GET /api/venues?city_ids=1&city_ids=2` — Venues for one or more cities, grouped per city (cached 24h per city)
 - `GET /api/venues/{id}` — Single venue detail with visit limits per tier (cached 7 days)
 - `GET /api/categories` — Activity categories (cached 7 days)
-- `GET /api/courses?start_date=YYYY-MM-DD&days=N&city_ids=1` — Courses for a date or range (1–14 days) in one or more cities. Cached per (city, day) with a 2-day TTL so overlapping queries hit the cache.
+- `GET /api/courses?start_date=YYYY-MM-DD&days=N&city_ids=1` — Courses for a date or range (1–14 days) in one or more cities, including class-level tiers and on-site fees. Cached per (city, day) with a 2-day TTL so overlapping queries hit the cache.
+- `GET /api/courses/{id}` — One course's description, rating, free-cancellation hours and booking type (fetched on demand, cached 7 days)
+- `GET /api/settings` / `PUT /api/settings` — The user's settings (currently their plan). Stored server-side for a single user.
 - `GET /api/health` — Health check (used by Docker HEALTHCHECK and load balancers)
 
 ## Cache
 
-All fetched data (cities, venues, venue details, courses, categories) is cached in a single SQLite database, `backend/cache/usc.db`. The cache survives server restarts. To force a refresh, delete the database (`make clean` or `rm backend/cache/usc.db*`) and restart the backend.
+All fetched data (cities, venues, venue details, courses, course details, categories) is cached in a single SQLite database, `backend/cache/usc.db`. The cache survives server restarts. To force a refresh, delete the database (`make clean` or `rm backend/cache/usc.db*`) and restart the backend.
 
 When running via Docker, the cache is stored in a named volume (`venue-cache`) and persists across container rebuilds.
 
