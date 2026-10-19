@@ -31,6 +31,7 @@ from models import (
     CityCoursesEntry,
     CityVenuesEntry,
     Course,
+    CourseDetail,
     CourseFetchError,
     MultiCityCoursesResponse,
     MultiCityVenuesPayload,
@@ -71,6 +72,7 @@ VENUES_TTL = 24 * 3600
 DETAILS_TTL = 7 * 24 * 3600
 CATEGORIES_TTL = 7 * 24 * 3600
 COURSES_TTL = 48 * 3600
+COURSE_DETAILS_TTL = 7 * 24 * 3600
 COURSES_STALE = 3 * 24 * 3600
 CITIES_TTL = 7 * 24 * 3600
 
@@ -111,6 +113,9 @@ _venue_fetch_semaphore = asyncio.Semaphore(MAX_CONCURRENT_VENUE_FETCHES)
 # Guards against duplicate stale-while-revalidate refreshes.
 _venue_refresh_cities: set[int] = set()
 _course_refresh_keys: set[tuple[int, str]] = set()
+_course_detail_refresh: set[int] = set()
+# One request per click, but still bounded like every other course fetch.
+_course_detail_semaphore = asyncio.Semaphore(5)
 
 
 def _invalidate_venues_cache(city_id: int) -> None:
@@ -924,6 +929,66 @@ async def get_courses(
         date_to=date_list[-1],
         errors=errors,
     )
+
+
+async def fetch_course_detail(course_id: int, client: httpx.AsyncClient | None = None) -> dict:
+    """Fetch a single course from the USC API (description, ratings, cancellation)."""
+    if client is None:
+        async with httpx.AsyncClient(headers=USC_HEADERS, timeout=30) as one_shot:
+            return await fetch_course_detail(course_id, one_shot)
+    resp = await client.get(f"{USC_API}/courses/{course_id}")
+    resp.raise_for_status()
+    return resp.json().get("data", {})
+
+
+def build_course_detail(raw: dict) -> CourseDetail:
+    ratings = raw.get("ratings") or {}
+    return CourseDetail(
+        description=raw.get("description") or "",
+        rating=ratings.get("averageScore"),
+        rating_count=ratings.get("totalRatings"),
+        free_cancellation_hours=raw.get("freeCancellationHours"),
+        booking_type=raw.get("bookingType"),
+        fetched_at=time.time(),
+    )
+
+
+async def _load_course_detail(course_id: int) -> CourseDetail:
+    async with _course_detail_semaphore:
+        raw = await fetch_course_detail(course_id)
+    detail = build_course_detail(raw)
+    await run_in_threadpool(storage.upsert_course_detail, course_id, detail)
+    return detail
+
+
+async def _refresh_course_detail_in_background(course_id: int) -> None:
+    if course_id in _course_detail_refresh:
+        return
+    _course_detail_refresh.add(course_id)
+    try:
+        await _load_course_detail(course_id)
+    except Exception as e:
+        logger.warning("Background course detail refresh failed for %s: %r", course_id, e)
+    finally:
+        _course_detail_refresh.discard(course_id)
+
+
+@app.get("/api/courses/{course_id}", response_model=CourseDetail)
+async def get_course_detail(course_id: int):
+    """Course description, rating and cancellation window; cached 7 days, stale served while refreshing."""
+    cached = await run_in_threadpool(storage.get_course_detail, course_id)
+    if cached is not None:
+        if time.time() - cached.fetched_at >= COURSE_DETAILS_TTL:
+            asyncio.create_task(_refresh_course_detail_in_background(course_id))
+        return cached
+    try:
+        return await _load_course_detail(course_id)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            raise HTTPException(status_code=404, detail=f"Course {course_id} not found") from e
+        raise HTTPException(status_code=502, detail="USC unavailable") from e
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail="USC unavailable") from e
 
 
 @app.get("/api/cities", response_model=CitiesResponse)

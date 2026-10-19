@@ -92,6 +92,17 @@ class Course(BaseModel):
     extra_fee_eur: int | None = None
 
 
+class CourseDetail(BaseModel):
+    """Lazily fetched extras for one course, returned by /api/courses/{id}."""
+
+    description: str = ""
+    rating: float | None = None
+    rating_count: int | None = None
+    free_cancellation_hours: int | None = None
+    booking_type: str | None = None
+    fetched_at: float
+
+
 class CourseFetchError(BaseModel):
     date: str
     reason: str

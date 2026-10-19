@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 import server
 import storage
-from models import City, Course, Venue, VenueAddress, VenueDetail, VisitLimits
+from models import City, Course, CourseDetail, Venue, VenueAddress, VenueDetail, VisitLimits
 from server import (
     CORPORATE_TIER_ORDER,
     PRIVATE_TIER_ORDER,
@@ -520,6 +520,9 @@ def seeded_client(tmp_path: Path, monkeypatch):
     async def _fake_venue_limits(venue_id):
         return {}
 
+    async def _fake_course_detail(course_id):
+        return {}
+
     async def _fake_enrich(city_id):
         # No-op: the fire-and-forget enrichment task would otherwise outlive the
         # SQLite connection and touch it after fixture teardown (segfault).
@@ -529,6 +532,8 @@ def seeded_client(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(server, "fetch_venue_detail", _fake_venue_detail)
     monkeypatch.setattr(server, "fetch_venue_limits", _fake_venue_limits)
     monkeypatch.setattr(server, "enrich_venue_details", _fake_enrich)
+    monkeypatch.setattr(server, "fetch_course_detail", _fake_course_detail)
+    server._course_detail_refresh.clear()
 
     with TestClient(server.app) as client:
         yield client
@@ -1046,3 +1051,71 @@ def test_transform_city_uses_default_name():
     assert c.centroid_lat == 50.780658
     assert c.centroid_lng == 6.083815
     assert c.venue_address_count == 122
+
+
+# ── GET /api/courses/{id} ──────────────────────────────────────────────────
+
+_RAW_COURSE_DETAIL = {
+    "description": "Hang on",
+    "ratings": {"averageScore": 4.8, "totalRatings": 120},
+    "freeCancellationHours": 12,
+    "bookingType": "instant",
+}
+
+
+def test_get_course_detail_fetches_and_caches(seeded_client, monkeypatch):
+    calls: list[int] = []
+
+    async def fake(course_id):
+        calls.append(course_id)
+        return dict(_RAW_COURSE_DETAIL)
+
+    monkeypatch.setattr(server, "fetch_course_detail", fake)
+
+    resp = seeded_client.get("/api/courses/7")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["description"] == "Hang on"
+    assert data["rating"] == 4.8
+    assert data["rating_count"] == 120
+    assert data["free_cancellation_hours"] == 12
+    assert data["booking_type"] == "instant"
+
+    assert seeded_client.get("/api/courses/7").status_code == 200
+    assert calls == [7]
+    assert storage.get_course_detail(7).rating_count == 120
+
+
+def test_get_course_detail_stale_served_then_refreshed(seeded_client, monkeypatch):
+    stale_at = time.time() - server.COURSE_DETAILS_TTL - 1
+    storage.upsert_course_detail(7, CourseDetail(description="old", fetched_at=stale_at))
+
+    async def fake(course_id):
+        return dict(_RAW_COURSE_DETAIL)
+
+    monkeypatch.setattr(server, "fetch_course_detail", fake)
+
+    resp = seeded_client.get("/api/courses/7")
+    assert resp.json()["description"] == "old"
+    assert _wait_until(lambda: storage.get_course_detail(7).description == "Hang on")
+
+
+def test_get_course_detail_404(seeded_client, monkeypatch):
+    import httpx
+
+    async def fake(course_id):
+        req = httpx.Request("GET", "https://example.com")
+        raise httpx.HTTPStatusError("nf", request=req, response=httpx.Response(404, request=req))
+
+    monkeypatch.setattr(server, "fetch_course_detail", fake)
+    assert seeded_client.get("/api/courses/7").status_code == 404
+
+
+def test_get_course_detail_upstream_error_is_502(seeded_client, monkeypatch):
+    import httpx
+
+    async def fake(course_id):
+        raise httpx.ConnectError("x")
+
+    monkeypatch.setattr(server, "fetch_course_detail", fake)
+    assert seeded_client.get("/api/courses/7").status_code == 502

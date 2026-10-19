@@ -14,7 +14,7 @@ import threading
 import time
 from pathlib import Path
 
-from models import City, Course, Venue, VenueAddress, VenueDetail, VenuesPayload, VisitLimits
+from models import City, Course, CourseDetail, Venue, VenueAddress, VenueDetail, VenuesPayload, VisitLimits
 
 # ── Module state ────────────────────────────────────────────────────────────
 
@@ -174,6 +174,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (city_id, course_id, date)
         );
         CREATE INDEX IF NOT EXISTS idx_courses_city_date ON courses(city_id, date);
+
+        CREATE TABLE IF NOT EXISTS course_details (
+            course_id    INTEGER PRIMARY KEY,
+            payload_json TEXT NOT NULL,
+            fetched_at   REAL NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS course_fetches (
             city_id      INTEGER NOT NULL REFERENCES cities(id),
@@ -653,6 +659,24 @@ def upsert_courses_for_date(
         except Exception:
             conn.execute("ROLLBACK")
             raise
+
+
+def get_course_detail(course_id: int) -> CourseDetail | None:
+    row = _fetchone("SELECT payload_json FROM course_details WHERE course_id = ?", (course_id,))
+    return CourseDetail.model_validate_json(row["payload_json"]) if row else None
+
+
+def upsert_course_detail(course_id: int, detail: CourseDetail) -> None:
+    with _lock:
+        _c().execute(
+            """
+            INSERT INTO course_details (course_id, payload_json, fetched_at) VALUES (?, ?, ?)
+            ON CONFLICT(course_id) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                fetched_at   = excluded.fetched_at
+            """,
+            (course_id, detail.model_dump_json(), detail.fetched_at),
+        )
 
 
 def purge_stale_courses(max_age_seconds: float) -> int:

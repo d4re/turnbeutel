@@ -8,7 +8,7 @@ import time
 import pytest
 
 import storage
-from models import City, Course, Venue, VenueAddress, VenueDetail, VisitLimits
+from models import City, Course, CourseDetail, Venue, VenueAddress, VenueDetail, VisitLimits
 
 
 @pytest.fixture
@@ -484,3 +484,17 @@ def test_migrate_drops_courses_table_without_fee_column(tmp_path):
         assert storage._fetchall("SELECT * FROM course_fetches") == []
     finally:
         storage.close()
+
+
+def test_course_detail_roundtrip(db):
+    detail = CourseDetail(
+        description="Hang on",
+        rating=4.8,
+        rating_count=120,
+        free_cancellation_hours=12,
+        booking_type="instant",
+        fetched_at=123.0,
+    )
+    db.upsert_course_detail(7, detail)
+    assert db.get_course_detail(7) == detail
+    assert db.get_course_detail(8) is None
