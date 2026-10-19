@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -26,6 +27,33 @@ from datetime import date, timedelta
 
 CORPORATE = ["S", "M", "L", "XL"]
 PRIVATE = ["Essential", "Classic", "Premium", "Max"]
+
+
+def load_dotenv() -> None:
+    """Fill missing env vars from .env in the repo root (from a worktree: the main checkout's)."""
+
+    def git(*args: str) -> str | None:
+        try:
+            return subprocess.run(["git", *args], capture_output=True, text=True, check=True).stdout.strip()
+        except (OSError, subprocess.CalledProcessError):
+            return None
+
+    top = git("rev-parse", "--show-toplevel")
+    common = git("rev-parse", "--path-format=absolute", "--git-common-dir")
+    candidates = [os.path.join(top, ".env")] if top else []
+    if common:
+        candidates.append(os.path.join(os.path.dirname(common), ".env"))
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.removeprefix("export ").split("=", 1)
+                os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+        return
 
 
 def get_json(base: str, path: str, params: list[tuple[str, str]] | None = None) -> dict:
@@ -66,6 +94,7 @@ def fetch_travel(base: str, venue_ids: list[str], wait_s: float) -> dict[str, di
 
 
 def main() -> int:
+    load_dotenv()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--url", default=os.environ.get("TURNBEUTEL_URL", "http://localhost:8000"))
     ap.add_argument("--from", dest="start", default=(date.today() + timedelta(days=1)).isoformat())
