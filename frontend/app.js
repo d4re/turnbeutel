@@ -1194,7 +1194,7 @@ function buildPopup(venue) {
 
   // Lazy-load visit limits from API once per venue. We track "fetched"
   // separately from visit_limits because a venue may legitimately have no
-  // parseable limits (visit_limits === null), and we must not refetch in a loop.
+  // limits (visit_limits === null), and we must not refetch in a loop.
   const vid = venue.address_id;
   if (!venueDetailFetched.has(vid) && !venueDetailInFlight.has(vid)) {
     venueDetailInFlight.add(vid);
@@ -1203,7 +1203,6 @@ function buildPopup(venue) {
       .then((detail) => {
         if (detail) {
           venue.visit_limits = detail.visit_limits;
-          venue.bookingLimitsText = detail.bookingLimitsText;
         }
         venueDetailFetched.add(vid);
         venueDetailInFlight.delete(vid);

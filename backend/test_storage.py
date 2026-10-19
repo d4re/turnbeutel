@@ -91,7 +91,6 @@ def make_detail(**overrides) -> VenueDetail:
             private={"Essential": None, "Classic": 4, "Premium": None, "Max": 8},
             corporate={"S": None, "M": 4, "L": None, "XL": 8},
         ),
-        bookingLimitsText="some text",
         importantInfo="important",
         phone="+49 30 12345",
         website="https://example.com",
@@ -183,7 +182,6 @@ def test_upsert_venues_does_not_touch_venue_details(db):
     stored = db.get_venue_detail("a")
     assert stored is not None
     assert stored.description == "original"
-    assert stored.bookingLimitsText == "some text"
 
 
 def test_upsert_venues_derives_city_bbox(db):
@@ -211,7 +209,6 @@ def test_venue_details_are_shared_across_cities(db):
         payload = db.get_venues_payload(city_id)
         assert payload is not None
         assert len(payload.venues) == 1
-        assert payload.venues[0].bookingLimitsText == "some text"
         assert payload.venues[0].visit_limits is not None
         assert payload.venues[0].visit_limits.corporate["M"] == 4
 

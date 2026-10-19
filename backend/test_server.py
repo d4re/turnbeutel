@@ -15,154 +15,77 @@ from server import (
     CORPORATE_TIER_ORDER,
     PRIVATE_TIER_ORDER,
     min_tier,
-    parse_visit_limits,
+    parse_venue_limits,
     transform_city,
     transform_course,
     transform_venue,
 )
 
-# ── parse_visit_limits ──
+# ── parse_venue_limits ──
 
 
-def test_parse_visit_limits_none_input():
-    assert parse_visit_limits(None) is None
+def _plan(name, venue=-1, address=-1):
+    """One plan entry as returned by USC's /venues/{id}/limits."""
+    return {
+        "id": 1,
+        "name": name,
+        "planName": name,
+        "priority": 1,
+        "monthlyLimitVenue": venue,
+        "monthlyUsageVenue": -1,
+        "monthlyLimitVenueAddress": address,
+        "monthlyUsageVenueAddress": -1,
+        "categoryLimits": [],
+    }
 
 
-def test_parse_visit_limits_empty_string():
-    assert parse_visit_limits("") is None
+def test_parse_venue_limits_none_or_empty():
+    assert parse_venue_limits(None) is None
+    assert parse_venue_limits({}) is None
+    assert parse_venue_limits({"b2c": [], "b2e": []}) is None
 
 
-def test_parse_visit_limits_no_match():
-    assert parse_visit_limits("No limits apply to this venue.") is None
-
-
-def test_parse_visit_limits_single_tier():
-    result = parse_visit_limits("S-Mitglieder können 4x pro Monat trainieren.")
-    assert result is not None
-    assert result.corporate["S"] == 4
-    assert result.private["Essential"] == 4
-    assert result.corporate["M"] is None
-    assert result.corporate["L"] is None
-    assert result.corporate["XL"] is None
-
-
-def test_parse_visit_limits_multiple_tiers():
-    text = (
-        "S-Mitglieder können 4x pro Monat trainieren. "
-        "M-Mitglieder können 8x pro Monat trainieren. "
-        "L-Mitglieder können 12x pro Monat trainieren. "
-        "XL-Mitglieder können 16x pro Monat trainieren."
+def test_parse_venue_limits_maps_b2c_to_private_and_b2e_to_corporate():
+    # Fenriz-style mismatch: corporate M is included, private Classic is not.
+    result = parse_venue_limits(
+        {
+            "b2c": [_plan("L", address=8), _plan("XL", address=8)],
+            "b2e": [_plan("M", address=4), _plan("L", address=8), _plan("XL", address=8)],
+        }
     )
-    result = parse_visit_limits(text)
-    assert result is not None
-    assert result.corporate == {"S": 4, "M": 8, "L": 12, "XL": 16}
-    assert result.private == {"Essential": 4, "Classic": 8, "Premium": 12, "Max": 16}
+    assert result.private == {"Essential": None, "Classic": None, "Premium": 8, "Max": 8}
+    assert result.corporate == {"S": None, "M": 4, "L": 8, "XL": 8}
 
 
-def test_parse_visit_limits_mal_variant():
-    result = parse_visit_limits("M-Mitglieder können 8 Mal pro Monat trainieren.")
-    assert result is not None
-    assert result.corporate["M"] == 8
+def test_parse_venue_limits_unlimited_is_daily_cap():
+    # -1 on both levels = no monthly limit, only the 1-visit-per-day cap.
+    result = parse_venue_limits({"b2c": [_plan("XL")], "b2e": [_plan("XL")]})
+    assert result.private["Max"] == 30
+    assert result.corporate["XL"] == 30
+
+
+def test_parse_venue_limits_takes_stricter_of_venue_and_address_limit():
+    # Holmes Place S: 3/month across the chain, 1/month at this address.
+    result = parse_venue_limits({"b2c": [_plan("M", venue=4, address=8)], "b2e": [_plan("S", venue=3, address=1)]})
+    assert result.private["Classic"] == 4
+    assert result.corporate["S"] == 1
+
+
+def test_parse_venue_limits_venue_wide_limit_only():
+    result = parse_venue_limits({"b2c": [_plan("M", venue=8, address=-1)], "b2e": []})
     assert result.private["Classic"] == 8
 
 
-def test_parse_visit_limits_grouped_tier_prefix():
-    """USC frequently groups tiers like 'L- & XL-Mitglieder können 8 Mal pro Monat'."""
-    text = (
-        "M-Mitglieder können 4 Mal pro Monat CORE Training besuchen.\r\n\r\n"
-        "L- & XL-Mitglieder können 8 Mal pro Monat CORE Training besuchen."
-    )
-    result = parse_visit_limits(text)
-    assert result is not None
-    assert result.corporate["M"] == 4
-    assert result.corporate["L"] == 8
-    assert result.corporate["XL"] == 8
-    assert result.corporate["S"] is None
-    assert result.private["Premium"] == 8
-    assert result.private["Max"] == 8
+def test_parse_venue_limits_plan_without_values_is_not_included():
+    result = parse_venue_limits({"b2c": [_plan("S", venue=None, address=None), _plan("M", address=4)]})
+    assert result.private["Essential"] is None
+    assert result.private["Classic"] == 4
 
 
-def test_parse_visit_limits_grouped_with_und():
-    result = parse_visit_limits("M, L und XL-Mitglieder können 8x pro Monat trainieren.")
-    assert result is not None
-    assert result.corporate["M"] == 8
-    assert result.corporate["L"] == 8
-    assert result.corporate["XL"] == 8
-    assert result.corporate["S"] is None
-
-
-def test_parse_visit_limits_im_monat_variant():
-    result = parse_visit_limits("S-Mitglieder können 4x im Monat trainieren.")
-    assert result is not None
-    assert result.corporate["S"] == 4
-
-
-def test_parse_visit_limits_per_day_converted_to_month():
-    """'1 Mal pro Tag' should be converted to 30 / month (30-day month assumption)."""
-    text = "M, L & XL-Mitglieder können diesen Standort 1 Mal pro Tag besuchen"
-    result = parse_visit_limits(text)
-    assert result is not None
-    assert result.corporate["M"] == 30
-    assert result.corporate["L"] == 30
-    assert result.corporate["XL"] == 30
-    assert result.corporate["S"] is None
-
-
-def test_parse_visit_limits_per_day_multi_visit():
-    result = parse_visit_limits("XL-Mitglieder können 2x pro Tag trainieren.")
-    assert result is not None
-    assert result.corporate["XL"] == 60
-
-
-def test_parse_visit_limits_duerfen_variant():
-    """USC also uses 'dürfen' instead of 'können' (e.g. Berliner Bäderbetriebe)."""
-    result = parse_visit_limits("M, L & XL-Mitglieder dürfen 1 x am Tag schwimmen gehen")
-    assert result is not None
-    assert result.corporate["M"] == 30
-    assert result.corporate["L"] == 30
-    assert result.corporate["XL"] == 30
-    assert result.corporate["S"] is None
-
-
-def test_parse_visit_limits_filler_between_count_and_preposition():
-    """Real text has noun fillers between the count and 'pro/im Monat'."""
-    result = parse_visit_limits(
-        "S-Mitglieder können im Rahmen ihres Kontingents von insgesamt 4 x Sport im Monat trainieren"
-    )
-    assert result is not None
-    assert result.corporate["S"] == 4
-
-
-def test_parse_visit_limits_hyphen_mal_form():
-    """'8-Mal pro Monat' (hyphenated) should parse the same as '8 Mal pro Monat'."""
-    result = parse_visit_limits("M-Mitglieder können diesen Standort insgesamt 8-Mal pro Monat besuchen")
-    assert result is not None
-    assert result.corporate["M"] == 8
-
-
-def test_parse_visit_limits_baederbetriebe_full_text():
-    """Both sentences in a real Berliner Bäderbetriebe text should parse together."""
-    text = (
-        "M, L & XL-Mitglieder\xa0dürfen\xa01 x am Tag\xa0bei den Berliner Bäderbetrieben schwimmen gehen\r\n\r\n"
-        "S-Mitglieder\xa0können im Rahmen ihres\xa0Kontingents von insgesamt\xa04 x Sport im Monat\xa0die Berliner Bäderbetriebe\xa0besuchen"
-    )
-    result = parse_visit_limits(text)
-    assert result is not None
-    assert result.corporate["S"] == 4
-    assert result.corporate["M"] == 30
-    assert result.corporate["L"] == 30
-    assert result.corporate["XL"] == 30
-
-
-def test_parse_visit_limits_unmentioned_tiers_are_none():
-    result = parse_visit_limits("L-Mitglieder können 5x pro Monat trainieren.")
-    assert result is not None
-    for tier in CORPORATE_TIER_ORDER:
-        assert tier in result.corporate
-    for tier in PRIVATE_TIER_ORDER:
-        assert tier in result.private
-    assert result.corporate["L"] == 5
-    assert result.corporate["S"] is None
+def test_parse_venue_limits_ignores_unknown_plans():
+    result = parse_venue_limits({"b2c": [_plan("XXL", address=4), _plan("M", address=4)]})
+    assert set(result.private) == set(PRIVATE_TIER_ORDER)
+    assert set(result.corporate) == set(CORPORATE_TIER_ORDER)
 
 
 # ── min_tier ──
@@ -250,19 +173,16 @@ def test_transform_venue_with_detail():
             private={"Essential": None, "Classic": 8, "Premium": None, "Max": None},
             corporate={"S": None, "M": 8, "L": None, "XL": None},
         ),
-        bookingLimitsText="some text",
         fetched_at=time.time(),
     )
     result = transform_venue(_make_raw(), detail=detail)
     assert result.visit_limits is not None
     assert result.visit_limits.corporate["M"] == 8
-    assert result.bookingLimitsText == "some text"
 
 
 def test_transform_venue_without_detail():
     result = transform_venue(_make_raw(), detail=None)
     assert result.visit_limits is None
-    assert result.bookingLimitsText is None
 
 
 def test_transform_venue_activities():
@@ -506,7 +426,7 @@ def test_fetch_courses_for_date_single_short_page():
 def seeded_client(tmp_path: Path, monkeypatch):
     """FastAPI TestClient with a temp SQLite DB pre-seeded with two cities.
 
-    - `fetch_all_cities` and `fetch_venue_detail` are monkeypatched to no-ops so
+    - `fetch_all_cities`, `fetch_venue_detail` and `fetch_venue_limits` are monkeypatched to no-ops so
       neither lifespan nor background enrichment hits USC.
     - `fetch_all_venue_pages` and `fetch_courses_for_date` are left as stubs
       that individual tests override (see `monkeypatch.setattr` calls inside
@@ -556,6 +476,9 @@ def seeded_client(tmp_path: Path, monkeypatch):
     async def _fake_venue_detail(venue_id):
         return {}
 
+    async def _fake_venue_limits(venue_id):
+        return {}
+
     async def _fake_enrich(city_id):
         # No-op: the fire-and-forget enrichment task would otherwise outlive the
         # SQLite connection and touch it after fixture teardown (segfault).
@@ -563,6 +486,7 @@ def seeded_client(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr(server, "fetch_all_cities", _fake_cities)
     monkeypatch.setattr(server, "fetch_venue_detail", _fake_venue_detail)
+    monkeypatch.setattr(server, "fetch_venue_limits", _fake_venue_limits)
     monkeypatch.setattr(server, "enrich_venue_details", _fake_enrich)
 
     with TestClient(server.app) as client:
@@ -613,6 +537,26 @@ def test_get_cities_returns_seeded_list(seeded_client):
     assert berlin["name"] == "Berlin"
     assert berlin["centroid_lat"] == 52.52
     assert berlin["centroid_lng"] == 13.405
+
+
+def test_get_venue_detail_combines_detail_and_limits(seeded_client, monkeypatch):
+    async def fake_detail(venue_id):
+        return {"importantInfo": "Bring a towel", "website": "https://example.com"}
+
+    async def fake_limits(venue_id):
+        return {"b2c": [_plan("M", address=4)], "b2e": [_plan("M", address=8)]}
+
+    monkeypatch.setattr(server, "fetch_venue_detail", fake_detail)
+    monkeypatch.setattr(server, "fetch_venue_limits", fake_limits)
+
+    resp = seeded_client.get("/api/venues/42")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["importantInfo"] == "Bring a towel"
+    assert data["visit_limits"]["private"]["Classic"] == 4
+    assert data["visit_limits"]["corporate"]["M"] == 8
+    assert data["visit_limits"]["corporate"]["S"] is None
+    assert storage.get_venue_detail("42").visit_limits.corporate["M"] == 8
 
 
 def test_get_venues_requires_city_ids(seeded_client):
