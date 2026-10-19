@@ -823,7 +823,7 @@ def get_travel(origin_key: str, venue_ids: list[str]) -> dict[str, TravelEntry]:
     }
 
 
-def set_bike_km(origin_key: str, values: dict[str, float], at: float) -> None:
+def set_bike_km(origin_key: str, values: dict[str, float | None], at: float) -> None:
     with _lock:
         _c().executemany(
             """

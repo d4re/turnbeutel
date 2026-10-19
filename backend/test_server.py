@@ -504,6 +504,8 @@ def seeded_client(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(server, "DB_PATH", db_path)
     # Never start the background prefetch loop from the fixture's lifespan.
     monkeypatch.setattr(server, "PREFETCH_CITIES", "")
+    # Never start the travel worker either; tests inject fakes via server.travel_worker.
+    monkeypatch.setattr(server, "TRAVEL_ENABLED", False)
 
     # Reset module-level caches so state doesn't leak between tests.
     server._venues_response_cache.clear()
@@ -1201,3 +1203,44 @@ def test_geocode_endpoint_upstream_error_is_502(seeded_client, monkeypatch):
 
 def test_geocode_endpoint_rejects_short_query(seeded_client):
     assert seeded_client.get("/api/geocode", params={"q": " a "}).status_code == 422
+
+
+# ── Travel wiring ──────────────────────────────────────────────────────────
+
+
+class _FakeWorker:
+    def __init__(self):
+        self.origin = None
+        self.warmed: list[list] = []
+        self.requested: list[tuple] = []
+
+    def set_origin(self, origin):
+        self.origin = origin
+
+    async def warm(self, points):
+        self.warmed.append(sorted(points))
+
+    async def request(self, venue_ids, origin=None):
+        self.requested.append((list(venue_ids), origin))
+
+    def is_pending(self, venue_id):
+        return False
+
+
+def test_put_settings_home_change_triggers_warm(seeded_client, monkeypatch):
+    fake = _FakeWorker()
+    monkeypatch.setattr(server, "travel_worker", fake)
+    monkeypatch.setattr(server, "_prefetch_cities", [c for c in server._cities_index if c.id == 1])
+    storage.upsert_venues(1, [_make_venue("v1", "Studio", 52.5, 13.4)], time.time(), 1, 1)
+
+    home = {"lat": 52.5579489, "lng": 13.4856965, "label": "Home"}
+    seeded_client.put("/api/settings", json={"home": home})
+    assert fake.origin == (52.5579489, 13.4856965)
+    assert fake.warmed == [[("v1", 52.5, 13.4)]]
+
+    # Unchanged home (e.g. only the plan changed): no new warm.
+    seeded_client.put("/api/settings", json={"home": home, "plan": {"type": "corporate", "tier": "M"}})
+    assert len(fake.warmed) == 1
+
+    seeded_client.put("/api/settings", json={})
+    assert fake.origin is None

@@ -13,15 +13,23 @@ sequential and spaced (see `Pacer`).
 from __future__ import annotations
 
 import asyncio
+import itertools
+import logging
+import math
 import time
+from collections import Counter
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import httpx
+from fastapi.concurrency import run_in_threadpool
 
+import storage
 from models import GeocodeResult
+
+logger = logging.getLogger(__name__)
 
 USER_AGENT = "turnbeutel (+https://github.com/d4re/turnbeutel)"
 OSRM_TABLE_URL = "https://routing.openstreetmap.de/routed-bike/table/v1/driving/"
@@ -34,6 +42,7 @@ VBB_BBOX = (51.3, 53.6, 11.2, 14.8)
 BIKE_TTL = 30 * 24 * 3600
 PT_TTL = 7 * 24 * 3600
 PT_RETRY_AFTER = 3600
+BIKE_RETRY_AFTER = 600
 EXACT_TTL = 24 * 3600
 GEOCODE_TTL = 30 * 24 * 3600
 
@@ -217,3 +226,201 @@ async def geocode(q: str, viewbox: str | None, client: httpx.AsyncClient, pacer:
     resp = await client.get(NOMINATIM_SEARCH_URL, params=params, headers={"User-Agent": USER_AGENT})
     resp.raise_for_status()
     return [GeocodeResult(label=r["display_name"], lat=float(r["lat"]), lng=float(r["lon"])) for r in resp.json()]
+
+
+# ── Background worker ──────────────────────────────────────────────────────
+
+PRIORITY_EXACT = 0  # an expanded course is waiting on it
+PRIORITY_REQUEST = 1  # venues the app or planner asked about
+PRIORITY_WARM = 2  # background warm of the prefetch cities
+
+
+class TransitUnavailable(Exception):
+    """No exact journey could be found (VBB down, or nothing arrives in time)."""
+
+
+@dataclass(order=True)
+class _Job:
+    priority: int
+    seq: int
+    kind: str = field(compare=False)  # "bike" | "transit" | "exact"
+    origin: tuple[float, float] = field(compare=False)
+    dests: list[tuple[str, float, float]] = field(compare=False)  # bike: a batch; else one
+    key: tuple = field(compare=False)
+    arrive_by: datetime | None = field(default=None, compare=False)
+    future: asyncio.Future | None = field(default=None, compare=False)
+
+
+def _haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
+    lat1, lng1, lat2, lng2 = map(math.radians, (*a, *b))
+    h = math.sin((lat2 - lat1) / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin((lng2 - lng1) / 2) ** 2
+    return 6371 * 2 * math.asin(math.sqrt(h))
+
+
+class TravelWorker:
+    """Computes travel times one job at a time, most urgent first.
+
+    Bike distances go to OSRM in batches; every transit lookup is one paced VBB
+    request. Results land in the travel cache tables, which the endpoints read.
+    Warm jobs queued for an earlier home are dropped once the home changes.
+    """
+
+    def __init__(self, client: httpx.AsyncClient, vbb_pacer: Pacer, now: Callable[[], float] = time.time):
+        self._client = client
+        self._pacer = vbb_pacer
+        self._now = now
+        self._queue: asyncio.PriorityQueue[_Job] = asyncio.PriorityQueue()
+        self._seq = itertools.count()
+        self._queued: dict[tuple, _Job] = {}
+        self._pending: Counter[str] = Counter()
+        self._bike_failed_at: dict[str, float] = {}
+        self.origin: tuple[float, float] | None = None
+
+    def set_origin(self, origin: tuple[float, float] | None) -> None:
+        self.origin = origin
+
+    def is_pending(self, venue_id: str) -> bool:
+        return self._pending[venue_id] > 0
+
+    async def request(self, venue_ids: list[str], origin: tuple[float, float] | None = None) -> None:
+        """Queue whatever is missing or expired for these venues (looked up in the venues table)."""
+        origin = origin or self.origin
+        if origin is None:
+            return
+        points = await run_in_threadpool(storage.get_venue_points, venue_ids)
+        await self._enqueue(PRIORITY_REQUEST, origin, [(vid, *points[vid]) for vid in venue_ids if vid in points])
+
+    async def warm(self, points: list[tuple[str, float, float]]) -> None:
+        """Queue the background warm for `points`, nearest to the current home first."""
+        if self.origin is None:
+            return
+        origin = self.origin
+        ordered = sorted(points, key=lambda p: _haversine_km(origin, (p[1], p[2])))
+        await self._enqueue(PRIORITY_WARM, origin, ordered)
+
+    async def exact(self, venue_id: str, dest: tuple[float, float], arrive_by: datetime) -> dict:
+        """Journey arriving by `arrive_by`; raises TransitUnavailable."""
+        if self.origin is None:
+            raise TransitUnavailable("no home set")
+        key = ("exact", origin_key(*self.origin), venue_id, arrive_by.isoformat())
+        job = self._queued.get(key)
+        if job is None:
+            job = self._put(
+                PRIORITY_EXACT,
+                "exact",
+                self.origin,
+                [(venue_id, *dest)],
+                key,
+                arrive_by=arrive_by,
+                future=asyncio.get_running_loop().create_future(),
+            )
+        return await asyncio.shield(job.future)
+
+    async def _enqueue(
+        self, priority: int, origin: tuple[float, float], points: list[tuple[str, float, float]]
+    ) -> None:
+        okey = origin_key(*origin)
+        cached = await run_in_threadpool(storage.get_travel, okey, [p[0] for p in points])
+        now = self._now()
+        bike_ok = now - self._bike_failed_at.get(okey, 0) >= BIKE_RETRY_AFTER
+        need_bike, need_transit = [], []
+        for p in points:
+            entry = cached.get(p[0])
+            bike_stale = entry is None or entry.bike_at is None or now - entry.bike_at >= BIKE_TTL
+            if bike_ok and bike_stale and ("bike", okey, p[0]) not in self._queued:
+                need_bike.append(p)
+            if not (in_vbb_area(*origin) and in_vbb_area(p[1], p[2])):
+                continue
+            fresh = entry is not None and entry.pt_at is not None and now - entry.pt_at < PT_TTL
+            failed_recently = entry is not None and entry.pt_failed_at and now - entry.pt_failed_at < PT_RETRY_AFTER
+            if not fresh and not failed_recently and ("transit", okey, p[0]) not in self._queued:
+                need_transit.append(p)
+        # Bike for the whole set first (a city takes seconds), then the slow transit lookups.
+        for i in range(0, len(need_bike), OSRM_BATCH):
+            batch = need_bike[i : i + OSRM_BATCH]
+            self._put(priority, "bike", origin, batch, ("bike-batch", okey, next(self._seq)), batch_keys=True)
+        for p in need_transit:
+            self._put(priority, "transit", origin, [p], ("transit", okey, p[0]))
+
+    def _put(self, priority, kind, origin, dests, key, *, arrive_by=None, future=None, batch_keys=False) -> _Job:
+        job = _Job(priority, next(self._seq), kind, origin, dests, key, arrive_by, future)
+        keys = [("bike", origin_key(*origin), d[0]) for d in dests] if batch_keys else [key]
+        for k in keys:
+            self._queued[k] = job
+        for d in dests:
+            self._pending[d[0]] += 1
+        self._queue.put_nowait(job)
+        return job
+
+    def _done(self, job: _Job) -> None:
+        okey = origin_key(*job.origin)
+        keys = [("bike", okey, d[0]) for d in job.dests] if job.kind == "bike" else [job.key]
+        for k in keys:
+            if self._queued.get(k) is job:
+                del self._queued[k]
+        for d in job.dests:
+            self._pending[d[0]] -= 1
+            if self._pending[d[0]] <= 0:
+                del self._pending[d[0]]
+
+    async def run(self) -> None:
+        while True:
+            job = await self._queue.get()
+            try:
+                if job.priority == PRIORITY_WARM and job.origin != self.origin:
+                    continue  # home changed since this warm was queued
+                await self._process(job)
+            except Exception:
+                # Never log coordinates: the origin is the user's home.
+                logger.warning("Travel %s job failed", job.kind, exc_info=True)
+            finally:
+                self._done(job)
+
+    async def _process(self, job: _Job) -> None:
+        okey = origin_key(*job.origin)
+        if job.kind == "bike":
+            try:
+                km = await fetch_bike_km(job.origin, job.dests, self._client)
+            except Exception:
+                self._bike_failed_at[okey] = self._now()
+                raise
+            # Unroutable venues are stored as None so they aren't re-asked every time.
+            values = {vid: km.get(vid) for vid, _, _ in job.dests}
+            await run_in_threadpool(storage.set_bike_km, okey, values, self._now())
+        elif job.kind == "transit":
+            vid, lat, lng = job.dests[0]
+            try:
+                departure = next_reference_departure(datetime.fromtimestamp(self._now(), BERLIN))
+                journeys = await fetch_journeys(job.origin, (lat, lng), self._client, self._pacer, departure=departure)
+                best = pick_typical(journeys)
+            except Exception:
+                await run_in_threadpool(storage.mark_transit_failed, okey, vid, self._now())
+                raise
+            if best is None:
+                await run_in_threadpool(storage.mark_transit_failed, okey, vid, self._now())
+            else:
+                await run_in_threadpool(
+                    storage.set_transit, okey, vid, best.pt_min, best.lines, best.walk_m, self._now()
+                )
+        else:
+            vid, lat, lng = job.dests[0]
+            try:
+                journeys = await fetch_journeys(
+                    job.origin, (lat, lng), self._client, self._pacer, arrival=job.arrive_by
+                )
+                best = pick_exact(journeys, job.arrive_by)
+            except Exception as e:
+                job.future.set_exception(TransitUnavailable(str(e)))
+                raise
+            if best is None:
+                job.future.set_exception(TransitUnavailable("no journey arrives in time"))
+                return
+            result = {
+                "pt_min": best.pt_min,
+                "depart_at": best.depart_at.isoformat(),
+                "arrive_at": best.arrive_at.isoformat(),
+                "lines": best.lines,
+                "walk_m": best.walk_m,
+            }
+            await run_in_threadpool(storage.set_exact, okey, vid, job.arrive_by.isoformat(), result, self._now())
+            job.future.set_result(result)

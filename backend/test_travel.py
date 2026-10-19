@@ -1,16 +1,22 @@
 """Outcome-based tests for travel.py (OSRM/VBB helpers and the travel worker)."""
 
 import asyncio
+import contextlib
+import time
 from datetime import datetime, timedelta
 
 import httpx
 import pytest
 
+import storage
 import travel
+from models import City, Venue, VenueAddress
 from travel import (
     BERLIN,
     Pacer,
     Transit,
+    TransitUnavailable,
+    TravelWorker,
     fetch_bike_km,
     fetch_journeys,
     in_vbb_area,
@@ -251,3 +257,241 @@ def test_geocode_parses_nominatim():
     assert req.url.params["viewbox"] == "13.3,52.6,13.6,52.4"
     assert req.url.params["bounded"] == "0"
     assert req.url.params["limit"] == "5"
+
+
+# ── TravelWorker ───────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def db(tmp_path):
+    storage.close()
+    storage.init(tmp_path / "travel.db")
+    storage.upsert_cities([City(id=1, name="Berlin")], fetched_at=time.time())
+    yield storage
+    storage.close()
+
+
+def _seed_venues(points: dict[str, tuple[float, float]]) -> None:
+    venues = [
+        Venue(
+            name=vid,
+            slug=vid,
+            url="",
+            tiers_private=[],
+            tiers_corporate=[],
+            min_tier_private=None,
+            min_tier_corporate=None,
+            activities=[],
+            district="",
+            street="",
+            is_plus=False,
+            address_id=vid,
+            lat=lat,
+            lng=lng,
+            address=VenueAddress(),
+            rating=None,
+            review_count=None,
+            is_online=False,
+            has_coordinates=True,
+        )
+        for vid, (lat, lng) in points.items()
+    ]
+    storage.upsert_venues(1, venues, time.time(), len(venues), len(venues))
+
+
+class _Fakes:
+    """Records outgoing OSRM/VBB calls; journeys/bike results are configurable per destination."""
+
+    def __init__(self, monkeypatch):
+        self.calls: list[tuple] = []
+        self.fail_transit: set[tuple[float, float]] = set()
+        self.no_journeys: set[tuple[float, float]] = set()
+
+        async def fake_bike(origin, dests, client):
+            self.calls.append(("bike", origin, tuple(d[0] for d in dests)))
+            return {vid: 5.0 for vid, _, _ in dests}
+
+        async def fake_journeys(origin, dest, client, pacer, *, departure=None, arrival=None):
+            kind = "exact" if arrival else "transit"
+            self.calls.append((kind, origin, dest))
+            if dest in self.fail_transit:
+                raise httpx.ConnectError("down")
+            if dest in self.no_journeys:
+                return []
+            if arrival:
+                return [_journey("18:12", "18:50")]
+            return [_journey("17:31", "18:09")]
+
+        monkeypatch.setattr(travel, "fetch_bike_km", fake_bike)
+        monkeypatch.setattr(travel, "fetch_journeys", fake_journeys)
+
+    def of(self, kind):
+        return [c for c in self.calls if c[0] == kind]
+
+
+def _drive(worker: TravelWorker, until, setup=None, max_wait: float = 2.0) -> None:
+    """Run `setup`, start the worker, wait until `until()` holds (or `max_wait`), stop it."""
+
+    async def main():
+        if setup:
+            await setup()
+        task = asyncio.create_task(worker.run())
+        for _ in range(int(max_wait / 0.01)):
+            if until():
+                break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    asyncio.run(main())
+
+
+def _worker(origin=HOME) -> TravelWorker:
+    w = TravelWorker(client=None, vbb_pacer=_no_pacing())
+    w.set_origin(origin)
+    return w
+
+
+A, B, C = (52.53, 13.40), (52.50, 13.45), (52.48, 13.43)
+KEY = origin_key(*HOME)
+
+
+def test_worker_bike_then_transit_stored(db, monkeypatch):
+    fakes = _Fakes(monkeypatch)
+    _seed_venues({"a": A})
+    w = _worker()
+    _drive(
+        w,
+        lambda: "a" in storage.get_travel(KEY, ["a"]) and storage.get_travel(KEY, ["a"])["a"].pt_min,
+        lambda: w.request(["a"]),
+    )
+    entry = storage.get_travel(KEY, ["a"])["a"]
+    assert entry.bike_km == 5.0
+    assert (entry.pt_min, entry.pt_lines, entry.walk_m) == (38, ["M4", "U8"], 777)
+    assert [c[0] for c in fakes.calls] == ["bike", "transit"]
+    assert not w.is_pending("a")
+
+
+def test_worker_priority_order(db, monkeypatch):
+    fakes = _Fakes(monkeypatch)
+    _seed_venues({"a": A, "b": B, "c": C})
+    w = _worker()
+    results = {}
+
+    async def setup():
+        await w.warm([("a", *A)])
+        await w.request(["b"])
+        results["exact"] = asyncio.create_task(w.exact("c", C, datetime(2026, 10, 22, 18, 55, tzinfo=BERLIN)))
+        await asyncio.sleep(0)  # let exact() enqueue before the worker starts
+
+    _drive(w, lambda: len(fakes.of("transit")) == 2, setup)
+    order = [(c[0], c[2]) for c in fakes.calls if c[0] != "bike"]
+    assert order == [("exact", C), ("transit", B), ("transit", A)]
+
+
+def test_worker_exact_result_and_cache(db, monkeypatch):
+    _Fakes(monkeypatch)
+    w = _worker()
+    arrive_by = datetime(2026, 10, 22, 18, 55, tzinfo=BERLIN)
+    out = {}
+
+    async def setup():
+        out["task"] = asyncio.create_task(w.exact("c", C, arrive_by))
+
+    _drive(w, lambda: out["task"].done(), setup)
+    result = out["task"].result()
+    assert result["pt_min"] == 38
+    assert datetime.fromisoformat(result["depart_at"]).strftime("%H:%M") == "18:12"
+    assert result["lines"] == ["M4", "U8"]
+    assert storage.get_exact(KEY, "c", arrive_by.isoformat(), max_age=60) == result
+
+
+def test_worker_exact_failure_raises_transit_unavailable(db, monkeypatch):
+    fakes = _Fakes(monkeypatch)
+    fakes.no_journeys.add(C)
+    w = _worker()
+    out = {}
+
+    async def setup():
+        out["task"] = asyncio.create_task(w.exact("c", C, datetime(2026, 10, 22, 18, 55, tzinfo=BERLIN)))
+
+    _drive(w, lambda: out["task"].done(), setup)
+    assert isinstance(out["task"].exception(), TransitUnavailable)
+
+
+def test_worker_drops_jobs_for_stale_origin(db, monkeypatch):
+    fakes = _Fakes(monkeypatch)
+    _seed_venues({"a": A})
+    other = (52.40, 13.10)
+    w = _worker()
+
+    async def setup():
+        await w.warm([("a", *A)])
+        w.set_origin(other)
+
+    _drive(w, lambda: False, setup, max_wait=0.2)
+    assert all(c[1] != HOME for c in fakes.calls)
+    assert storage.get_travel(KEY, ["a"]) == {}
+
+
+def test_worker_transit_failure_marks_failed_and_continues(db, monkeypatch):
+    fakes = _Fakes(monkeypatch)
+    fakes.fail_transit.add(A)
+    _seed_venues({"a": A, "b": B})
+    w = _worker()
+    _drive(w, lambda: len(fakes.of("transit")) == 2 and not w.is_pending("b"), lambda: w.request(["a", "b"]))
+    got = storage.get_travel(KEY, ["a", "b"])
+    assert got["a"].pt_failed_at is not None
+    assert got["a"].pt_min is None
+    assert got["b"].pt_min == 38
+
+
+def test_worker_empty_journeys_marks_failed(db, monkeypatch):
+    fakes = _Fakes(monkeypatch)
+    fakes.no_journeys.add(A)
+    _seed_venues({"a": A})
+    w = _worker()
+    _drive(w, lambda: len(fakes.of("transit")) == 1 and not w.is_pending("a"), lambda: w.request(["a"]))
+    assert storage.get_travel(KEY, ["a"])["a"].pt_failed_at is not None
+
+
+def test_worker_failed_transit_not_retried_within_back_off(db, monkeypatch):
+    fakes = _Fakes(monkeypatch)
+    _seed_venues({"a": A})
+    storage.set_bike_km(KEY, {"a": 5.0}, at=time.time())
+    storage.mark_transit_failed(KEY, "a", at=time.time())
+    w = _worker()
+    _drive(w, lambda: False, lambda: w.request(["a"]), max_wait=0.2)
+    assert fakes.calls == []
+
+
+def test_worker_skips_outside_vbb_area(db, monkeypatch):
+    fakes = _Fakes(monkeypatch)
+    _seed_venues({"hh": (53.55, 9.99)})
+    w = _worker()
+    _drive(w, lambda: bool(fakes.of("bike")) and not w.is_pending("hh"), lambda: w.request(["hh"]))
+    assert fakes.of("transit") == []
+    assert storage.get_travel(KEY, ["hh"])["hh"].bike_km == 5.0
+
+
+def test_worker_request_skips_fresh_entries(db, monkeypatch):
+    fakes = _Fakes(monkeypatch)
+    _seed_venues({"a": A})
+    storage.set_bike_km(KEY, {"a": 5.0}, at=time.time())
+    storage.set_transit(KEY, "a", pt_min=20, lines=[], walk_m=0, at=time.time())
+    w = _worker()
+
+    async def setup():
+        await w.request(["a"])
+        assert not w.is_pending("a")
+
+    _drive(w, lambda: False, setup, max_wait=0.2)
+    assert fakes.calls == []
+
+
+def test_worker_unknown_venue_is_ignored(db, monkeypatch):
+    fakes = _Fakes(monkeypatch)
+    w = _worker()
+    _drive(w, lambda: False, lambda: w.request(["nope"]), max_wait=0.2)
+    assert fakes.calls == []

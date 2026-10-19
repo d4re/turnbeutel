@@ -91,6 +91,11 @@ PREFETCH_INTERVAL = float(os.environ.get("PREFETCH_INTERVAL_MINUTES", "60")) * 6
 # one — the map's default Berlin view pulls in ~20 small Brandenburg towns.
 PREFETCH_RADIUS_KM = float(os.environ.get("PREFETCH_RADIUS_KM", "0"))
 
+# Travel times (travel.py): the worker starts with the app; tests switch it off.
+TRAVEL_ENABLED = True
+travel_worker: travel.TravelWorker | None = None
+_prefetch_cities: list[City] = []
+
 # ── Tier mappings ──
 
 CORP_TO_PRIVATE = {"S": "Essential", "M": "Classic", "L": "Premium", "XL": "Max"}
@@ -131,7 +136,7 @@ def _invalidate_venues_cache(city_id: int) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize SQLite storage, sync /cities index, and purge stale courses."""
-    global _cities_index
+    global _cities_index, travel_worker, _prefetch_cities
 
     await run_in_threadpool(storage.init, DB_PATH)
 
@@ -148,14 +153,29 @@ async def lifespan(app: FastAPI):
     await run_in_threadpool(storage.purge_stale_courses, float(COURSES_STALE))
 
     prefetch_cities = resolve_prefetch_cities(PREFETCH_CITIES, _cities_index, PREFETCH_RADIUS_KM)
+    _prefetch_cities = prefetch_cities
+
+    travel_task = travel_client = None
+    if TRAVEL_ENABLED:
+        travel_client = httpx.AsyncClient(headers={"User-Agent": travel.USER_AGENT}, timeout=15)
+        travel_worker = travel.TravelWorker(travel_client, travel.Pacer(travel.VBB_SPACING))
+        settings = await run_in_threadpool(storage.get_settings)
+        if settings.home:
+            travel_worker.set_origin((settings.home.lat, settings.home.lng))
+        travel_task = asyncio.create_task(travel_worker.run())
+
     prefetch_task = asyncio.create_task(prefetch_loop(prefetch_cities)) if prefetch_cities else None
 
     yield
 
-    if prefetch_task is not None:
-        prefetch_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await prefetch_task
+    for task in (prefetch_task, travel_task):
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+    if travel_client is not None:
+        await travel_client.aclose()
+        travel_worker = None
     storage.close()
 
 
@@ -824,6 +844,16 @@ async def prefetch_cycle(cities: list[City], interval: float) -> None:
         if pairs:
             await _refresh_courses_in_background(pairs)
 
+    # Keep travel times from home warm too (only re-fetches what has expired).
+    await _warm_travel(cities)
+
+
+async def _warm_travel(cities: list[City]) -> None:
+    if travel_worker is None or travel_worker.origin is None or not cities:
+        return
+    points = await run_in_threadpool(storage.list_city_venue_points, [c.id for c in cities])
+    await travel_worker.warm(points)
+
 
 async def prefetch_loop(cities: list[City], interval: float | None = None) -> None:
     """Keep `cities` warm forever: one prefetch cycle every `interval` seconds."""
@@ -1001,8 +1031,14 @@ async def get_settings():
 
 @app.put("/api/settings", response_model=Settings)
 async def put_settings(settings: Settings):
-    """Replace the stored settings (single user, last write wins)."""
+    """Replace the stored settings (single user, last write wins). A new home re-warms travel times."""
+    previous = await run_in_threadpool(storage.get_settings)
     await run_in_threadpool(storage.put_settings, settings)
+    home = (settings.home.lat, settings.home.lng) if settings.home else None
+    old_home = (previous.home.lat, previous.home.lng) if previous.home else None
+    if travel_worker is not None and home != old_home:
+        travel_worker.set_origin(home)
+        await _warm_travel(_prefetch_cities)
     return settings
 
 
