@@ -230,7 +230,6 @@ async def geocode(q: str, viewbox: str | None, client: httpx.AsyncClient, pacer:
 
 # ── Background worker ──────────────────────────────────────────────────────
 
-PRIORITY_EXACT = 0  # an expanded course is waiting on it
 PRIORITY_REQUEST = 1  # venues the app or planner asked about
 PRIORITY_WARM = 2  # background warm of the prefetch cities
 
@@ -243,12 +242,10 @@ class TransitUnavailable(Exception):
 class _Job:
     priority: int
     seq: int
-    kind: str = field(compare=False)  # "bike" | "transit" | "exact"
+    kind: str = field(compare=False)  # "bike" | "transit"
     origin: tuple[float, float] = field(compare=False)
-    dests: list[tuple[str, float, float]] = field(compare=False)  # bike: a batch; else one
+    dests: list[tuple[str, float, float]] = field(compare=False)  # bike: a batch; transit: one
     key: tuple = field(compare=False)
-    arrive_by: datetime | None = field(default=None, compare=False)
-    future: asyncio.Future | None = field(default=None, compare=False)
 
 
 def _haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -263,6 +260,8 @@ class TravelWorker:
     Bike distances go to OSRM in batches; every transit lookup is one paced VBB
     request. Results land in the travel cache tables, which the endpoints read.
     Warm jobs queued for an earlier home are dropped once the home changes.
+    Exact lookups (someone is waiting on them) bypass the queue but share the
+    VBB pacer, so a slow background request never holds them up.
     """
 
     def __init__(self, client: httpx.AsyncClient, vbb_pacer: Pacer, now: Callable[[], float] = time.time):
@@ -274,6 +273,7 @@ class TravelWorker:
         self._queued: dict[tuple, _Job] = {}
         self._pending: Counter[str] = Counter()
         self._bike_failed_at: dict[str, float] = {}
+        self._exact_tasks: dict[tuple, asyncio.Task] = {}
         self.origin: tuple[float, float] | None = None
 
     def set_origin(self, origin: tuple[float, float] | None) -> None:
@@ -302,19 +302,45 @@ class TravelWorker:
         """Journey arriving by `arrive_by`; raises TransitUnavailable."""
         if self.origin is None:
             raise TransitUnavailable("no home set")
-        key = ("exact", origin_key(*self.origin), venue_id, arrive_by.isoformat())
-        job = self._queued.get(key)
-        if job is None:
-            job = self._put(
-                PRIORITY_EXACT,
-                "exact",
-                self.origin,
-                [(venue_id, *dest)],
-                key,
-                arrive_by=arrive_by,
-                future=asyncio.get_running_loop().create_future(),
-            )
-        return await asyncio.shield(job.future)
+        origin = self.origin
+        key = (origin_key(*origin), venue_id, arrive_by.isoformat())
+        task = self._exact_tasks.get(key)
+        if task is None:
+            task = asyncio.create_task(self._lookup_exact(origin, venue_id, dest, arrive_by))
+            self._exact_tasks[key] = task
+
+            def _forget(t: asyncio.Task) -> None:
+                self._exact_tasks.pop(key, None)
+                if not t.cancelled():
+                    t.exception()  # mark retrieved even if every caller timed out
+
+            task.add_done_callback(_forget)
+        # Shielded: a caller timing out must not cancel the lookup others share.
+        return await asyncio.shield(task)
+
+    async def _lookup_exact(
+        self, origin: tuple[float, float], venue_id: str, dest: tuple[float, float], arrive_by: datetime
+    ) -> dict:
+        try:
+            journeys = await fetch_journeys(origin, dest, self._client, self._pacer, arrival=arrive_by)
+            best = pick_exact(journeys, arrive_by)
+        except Exception as e:
+            # Only the type: httpx messages carry the URL, i.e. the home coordinates.
+            logger.warning("Exact transit lookup failed: %s", type(e).__name__)
+            raise TransitUnavailable("lookup failed") from e
+        if best is None:
+            raise TransitUnavailable("no journey arrives in time")
+        result = {
+            "pt_min": best.pt_min,
+            "depart_at": best.depart_at.isoformat(),
+            "arrive_at": best.arrive_at.isoformat(),
+            "lines": best.lines,
+            "walk_m": best.walk_m,
+        }
+        await run_in_threadpool(
+            storage.set_exact, origin_key(*origin), venue_id, arrive_by.isoformat(), result, self._now()
+        )
+        return result
 
     async def _enqueue(
         self, priority: int, origin: tuple[float, float], points: list[tuple[str, float, float]]
@@ -342,8 +368,8 @@ class TravelWorker:
         for p in need_transit:
             self._put(priority, "transit", origin, [p], ("transit", okey, p[0]))
 
-    def _put(self, priority, kind, origin, dests, key, *, arrive_by=None, future=None, batch_keys=False) -> _Job:
-        job = _Job(priority, next(self._seq), kind, origin, dests, key, arrive_by, future)
+    def _put(self, priority, kind, origin, dests, key, *, batch_keys=False) -> _Job:
+        job = _Job(priority, next(self._seq), kind, origin, dests, key)
         keys = [("bike", origin_key(*origin), d[0]) for d in dests] if batch_keys else [key]
         for k in keys:
             self._queued[k] = job
@@ -370,9 +396,9 @@ class TravelWorker:
                 if job.priority == PRIORITY_WARM and job.origin != self.origin:
                     continue  # home changed since this warm was queued
                 await self._process(job)
-            except Exception:
-                # Never log coordinates: the origin is the user's home.
-                logger.warning("Travel %s job failed", job.kind, exc_info=True)
+            except Exception as e:
+                # Only the type: httpx messages carry the URL, i.e. the home coordinates.
+                logger.warning("Travel %s job failed: %s", job.kind, type(e).__name__)
             finally:
                 self._done(job)
 
@@ -387,7 +413,7 @@ class TravelWorker:
             # Unroutable venues are stored as None so they aren't re-asked every time.
             values = {vid: km.get(vid) for vid, _, _ in job.dests}
             await run_in_threadpool(storage.set_bike_km, okey, values, self._now())
-        elif job.kind == "transit":
+        else:
             vid, lat, lng = job.dests[0]
             try:
                 departure = next_reference_departure(datetime.fromtimestamp(self._now(), BERLIN))
@@ -402,25 +428,3 @@ class TravelWorker:
                 await run_in_threadpool(
                     storage.set_transit, okey, vid, best.pt_min, best.lines, best.walk_m, self._now()
                 )
-        else:
-            vid, lat, lng = job.dests[0]
-            try:
-                journeys = await fetch_journeys(
-                    job.origin, (lat, lng), self._client, self._pacer, arrival=job.arrive_by
-                )
-                best = pick_exact(journeys, job.arrive_by)
-            except Exception as e:
-                job.future.set_exception(TransitUnavailable(str(e)))
-                raise
-            if best is None:
-                job.future.set_exception(TransitUnavailable("no journey arrives in time"))
-                return
-            result = {
-                "pt_min": best.pt_min,
-                "depart_at": best.depart_at.isoformat(),
-                "arrive_at": best.arrive_at.isoformat(),
-                "lines": best.lines,
-                "walk_m": best.walk_m,
-            }
-            await run_in_threadpool(storage.set_exact, okey, vid, job.arrive_by.isoformat(), result, self._now())
-            job.future.set_result(result)

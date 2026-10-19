@@ -375,19 +375,47 @@ def test_worker_bike_then_transit_stored(db, monkeypatch):
 
 def test_worker_priority_order(db, monkeypatch):
     fakes = _Fakes(monkeypatch)
-    _seed_venues({"a": A, "b": B, "c": C})
+    _seed_venues({"a": A, "b": B})
     w = _worker()
-    results = {}
 
     async def setup():
         await w.warm([("a", *A)])
         await w.request(["b"])
-        results["exact"] = asyncio.create_task(w.exact("c", C, datetime(2026, 10, 22, 18, 55, tzinfo=BERLIN)))
-        await asyncio.sleep(0)  # let exact() enqueue before the worker starts
 
     _drive(w, lambda: len(fakes.of("transit")) == 2, setup)
     order = [(c[0], c[2]) for c in fakes.calls if c[0] != "bike"]
-    assert order == [("exact", C), ("transit", B), ("transit", A)]
+    assert order == [("transit", B), ("transit", A)]
+
+
+def test_worker_exact_does_not_wait_behind_a_slow_job(db, monkeypatch):
+    fakes = _Fakes(monkeypatch)
+    _seed_venues({"a": A})
+    slow_journeys = travel.fetch_journeys
+
+    async def slow_for_a(origin, dest, client, pacer, *, departure=None, arrival=None):
+        if dest == A:
+            await asyncio.sleep(5)  # VBB hanging on a background lookup
+        return await slow_journeys(origin, dest, client, pacer, departure=departure, arrival=arrival)
+
+    monkeypatch.setattr(travel, "fetch_journeys", slow_for_a)
+    w = _worker()
+
+    async def main():
+        await w.request(["a"])
+        worker = asyncio.create_task(w.run())
+        await asyncio.sleep(0.05)  # the worker is now stuck in a's transit lookup
+        started = time.monotonic()
+        result = await asyncio.wait_for(w.exact("c", C, datetime(2026, 10, 22, 18, 55, tzinfo=BERLIN)), 2)
+        elapsed = time.monotonic() - started
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
+        return result, elapsed
+
+    result, elapsed = asyncio.run(main())
+    assert result["pt_min"] == 38
+    assert elapsed < 1
+    assert fakes.of("exact") == [("exact", HOME, C)]
 
 
 def test_worker_exact_result_and_cache(db, monkeypatch):
