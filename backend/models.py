@@ -220,3 +220,33 @@ class TravelEntry(BaseModel):
     walk_m: int | None = None
     pt_at: float | None = None
     pt_failed_at: float | None = None
+
+
+class LatLng(BaseModel):
+    lat: float = Field(ge=-90, le=90)
+    lng: float = Field(ge=-180, le=180)
+
+
+class TravelRequest(BaseModel):
+    venue_ids: list[str] = Field(max_length=500)
+    origin: LatLng | None = None  # default: the stored home
+
+
+class TravelResult(BaseModel):
+    bike_km: float | None
+    pt_min: int | None
+    pt_lines: list[str]
+    walk_m: int | None
+
+
+class TravelResponse(BaseModel):
+    results: dict[str, TravelResult]
+    pending: list[str]
+
+
+class ExactTransit(BaseModel):
+    pt_min: int
+    depart_at: str
+    arrive_at: str
+    lines: list[str]
+    walk_m: int

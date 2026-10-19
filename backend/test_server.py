@@ -1244,3 +1244,171 @@ def test_put_settings_home_change_triggers_warm(seeded_client, monkeypatch):
 
     seeded_client.put("/api/settings", json={})
     assert fake.origin is None
+
+
+# ── /api/travel ────────────────────────────────────────────────────────────
+
+HOME = {"lat": 52.5579489, "lng": 13.4856965, "label": "Home"}
+HOME_KEY = "52.5579,13.4857"
+
+
+class _QueueingWorker(_FakeWorker):
+    """Fake worker: reports `pending_ids` as pending, or (if None) everything it was asked for."""
+
+    def __init__(self):
+        super().__init__()
+        self.pending_ids: set[str] | None = None
+        self.exact_calls: list[tuple] = []
+        self.exact_result: dict | None = None
+        self.exact_error: Exception | None = None
+        self.exact_delay = 0.0
+
+    def is_pending(self, venue_id):
+        if self.pending_ids is not None:
+            return venue_id in self.pending_ids
+        return any(venue_id in ids for ids, _ in self.requested)
+
+    async def exact(self, venue_id, dest, arrive_by):
+        self.exact_calls.append((venue_id, dest, arrive_by))
+        await asyncio.sleep(self.exact_delay)
+        if self.exact_error:
+            raise self.exact_error
+        return self.exact_result
+
+
+@pytest.fixture
+def travel_client(seeded_client, monkeypatch):
+    fake = _QueueingWorker()
+    monkeypatch.setattr(server, "travel_worker", fake)
+    storage.upsert_venues(
+        1,
+        [
+            _make_venue("a", "A", 52.53, 13.40),
+            _make_venue("b", "B", 52.50, 13.45),
+            _make_venue("hh", "Hamburg", 53.55, 9.99),
+        ],
+        time.time(),
+        3,
+        3,
+    )
+    coordless = _make_venue("x", "No coords", 0, 0)
+    coordless.lat = coordless.lng = None
+    coordless.has_coordinates = False
+    storage.upsert_venues(2, [coordless], time.time(), 1, 0)
+    return seeded_client, fake
+
+
+def _set_home(client):
+    assert client.put("/api/settings", json={"home": HOME}).status_code == 200
+
+
+def test_travel_requires_home(travel_client):
+    client, _ = travel_client
+    assert client.post("/api/travel", json={"venue_ids": ["a"]}).status_code == 409
+
+
+def test_travel_returns_cached_and_pending(travel_client):
+    client, fake = travel_client
+    _set_home(client)
+    storage.set_bike_km(HOME_KEY, {"a": 7.93}, at=time.time())
+    storage.set_transit(HOME_KEY, "a", pt_min=38, lines=["M4", "M8"], walk_m=777, at=time.time())
+    fake.pending_ids = {"b"}  # the real worker skips fresh entries
+
+    resp = client.post("/api/travel", json={"venue_ids": ["a", "b"]})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["results"] == {"a": {"bike_km": 7.93, "pt_min": 38, "pt_lines": ["M4", "M8"], "walk_m": 777}}
+    assert body["pending"] == ["b"]
+    assert fake.requested == [(["a", "b"], (52.5579489, 13.4856965))]
+
+
+def test_travel_accepts_explicit_origin(travel_client):
+    client, fake = travel_client
+    resp = client.post("/api/travel", json={"venue_ids": ["a"], "origin": {"lat": 52.4, "lng": 13.1}})
+    assert resp.status_code == 200
+    assert fake.requested == [(["a"], (52.4, 13.1))]
+
+
+def test_travel_ignores_unknown_and_coordless_venues(travel_client):
+    client, fake = travel_client
+    _set_home(client)
+    body = client.post("/api/travel", json={"venue_ids": ["nope", "x", "a"]}).json()
+    assert body["pending"] == ["a"]
+    assert body["results"] == {}
+    assert fake.requested == [(["a"], (52.5579489, 13.4856965))]
+
+
+def test_travel_rejects_more_than_500_ids(travel_client):
+    client, _ = travel_client
+    _set_home(client)
+    ids = [str(i) for i in range(501)]
+    assert client.post("/api/travel", json={"venue_ids": ids}).status_code == 422
+
+
+# ── /api/travel/exact ──────────────────────────────────────────────────────
+
+
+def _exact(client, venue_id="a", date_="2026-10-22", start="19:00"):
+    return client.get("/api/travel/exact", params={"venue_id": venue_id, "date": date_, "start": start})
+
+
+def test_travel_exact_requires_home(travel_client):
+    client, _ = travel_client
+    assert _exact(client).status_code == 409
+
+
+def test_travel_exact_arrive_by_is_five_minutes_before_start(travel_client):
+    client, fake = travel_client
+    _set_home(client)
+    fake.exact_result = {"pt_min": 31, "depart_at": "x", "arrive_at": "y", "lines": ["M4"], "walk_m": 300}
+    resp = _exact(client)
+    assert resp.status_code == 200
+    assert resp.json()["pt_min"] == 31
+    [(venue_id, dest, arrive_by)] = fake.exact_calls
+    assert (venue_id, dest) == ("a", (52.53, 13.40))
+    assert arrive_by.isoformat() == "2026-10-22T18:55:00+02:00"
+
+
+def test_travel_exact_cached_hit_skips_worker(travel_client):
+    client, fake = travel_client
+    _set_home(client)
+    cached = {"pt_min": 25, "depart_at": "a", "arrive_at": "b", "lines": [], "walk_m": 0}
+    storage.set_exact(HOME_KEY, "a", "2026-10-22T18:55:00+02:00", cached, at=time.time())
+    assert _exact(client).json() == cached
+    assert fake.exact_calls == []
+
+
+def test_travel_exact_timeout_is_504(travel_client, monkeypatch):
+    client, fake = travel_client
+    _set_home(client)
+    monkeypatch.setattr(server, "EXACT_TIMEOUT", 0.05)
+    fake.exact_delay = 1
+    assert _exact(client).status_code == 504
+
+
+def test_travel_exact_unavailable_is_502(travel_client):
+    import travel
+
+    client, fake = travel_client
+    _set_home(client)
+    fake.exact_error = travel.TransitUnavailable("down")
+    assert _exact(client).status_code == 502
+
+
+def test_travel_exact_unknown_venue_is_404(travel_client):
+    client, _ = travel_client
+    _set_home(client)
+    assert _exact(client, venue_id="nope").status_code == 404
+    assert _exact(client, venue_id="x").status_code == 404
+
+
+def test_travel_exact_outside_vbb_area_is_404(travel_client):
+    client, _ = travel_client
+    _set_home(client)
+    assert _exact(client, venue_id="hh").status_code == 404
+
+
+def test_travel_exact_rejects_bad_date(travel_client):
+    client, _ = travel_client
+    _set_home(client)
+    assert _exact(client, date_="22.10.2026").status_code == 422

@@ -14,7 +14,7 @@ import os
 import re
 import time
 from contextlib import asynccontextmanager
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -36,11 +36,15 @@ from models import (
     Course,
     CourseDetail,
     CourseFetchError,
+    ExactTransit,
     GeocodeResult,
     MultiCityCoursesResponse,
     MultiCityVenuesPayload,
     Settings,
     TierConfig,
+    TravelRequest,
+    TravelResponse,
+    TravelResult,
     Venue,
     VenueAddress,
     VenueDetail,
@@ -94,6 +98,8 @@ PREFETCH_RADIUS_KM = float(os.environ.get("PREFETCH_RADIUS_KM", "0"))
 # Travel times (travel.py): the worker starts with the app; tests switch it off.
 TRAVEL_ENABLED = True
 travel_worker: travel.TravelWorker | None = None
+EXACT_TIMEOUT = 10.0  # s an expanded course waits for its exact journey
+EXACT_BUFFER = timedelta(minutes=5)  # arrive this long before the class starts
 _prefetch_cities: list[City] = []
 
 # ── Tier mappings ──
@@ -1060,6 +1066,64 @@ async def get_geocode(q: str, viewbox: str | None = None):
     payload = [r.model_dump() for r in results]
     await run_in_threadpool(storage.set_geocode, key, payload, time.time())
     return payload
+
+
+async def _stored_home() -> tuple[float, float] | None:
+    settings = await run_in_threadpool(storage.get_settings)
+    return (settings.home.lat, settings.home.lng) if settings.home else None
+
+
+@app.post("/api/travel", response_model=TravelResponse)
+async def post_travel(req: TravelRequest):
+    """Cached travel data per venue, plus the ids still being computed in the background."""
+    origin = (req.origin.lat, req.origin.lng) if req.origin else await _stored_home()
+    if origin is None:
+        raise HTTPException(status_code=409, detail="Set a home first")
+    points = await run_in_threadpool(storage.get_venue_points, list(dict.fromkeys(req.venue_ids)))
+    known = [vid for vid in dict.fromkeys(req.venue_ids) if vid in points]
+    cached = await run_in_threadpool(storage.get_travel, travel.origin_key(*origin), known)
+    if travel_worker is not None and known:
+        await travel_worker.request(known, origin=origin)
+    results = {
+        vid: TravelResult(bike_km=e.bike_km, pt_min=e.pt_min, pt_lines=e.pt_lines, walk_m=e.walk_m)
+        for vid, e in cached.items()
+        if e.bike_km is not None or e.pt_min is not None
+    }
+    pending = [vid for vid in known if travel_worker is not None and travel_worker.is_pending(vid)]
+    return TravelResponse(results=results, pending=pending)
+
+
+@app.get("/api/travel/exact", response_model=ExactTransit)
+async def get_travel_exact(venue_id: str, date: str, start: str):
+    """Transit journey from home arriving EXACT_BUFFER before a class starts (waits up to EXACT_TIMEOUT)."""
+    home = await _stored_home()
+    if home is None:
+        raise HTTPException(status_code=409, detail="Set a home first")
+    try:
+        starts_at = datetime.fromisoformat(f"{date}T{start}").replace(tzinfo=travel.BERLIN)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail="Expected date=YYYY-MM-DD and start=HH:MM") from e
+    points = await run_in_threadpool(storage.get_venue_points, [venue_id])
+    if venue_id not in points:
+        raise HTTPException(status_code=404, detail=f"Venue {venue_id} not found")
+    dest = points[venue_id]
+    if not (travel.in_vbb_area(*home) and travel.in_vbb_area(*dest)):
+        raise HTTPException(status_code=404, detail="No transit data for this area")
+
+    arrive_by = starts_at - EXACT_BUFFER
+    cached = await run_in_threadpool(
+        storage.get_exact, travel.origin_key(*home), venue_id, arrive_by.isoformat(), float(travel.EXACT_TTL)
+    )
+    if cached is not None:
+        return cached
+    if travel_worker is None:
+        raise HTTPException(status_code=502, detail="Transit lookup unavailable")
+    try:
+        return await asyncio.wait_for(travel_worker.exact(venue_id, dest, arrive_by), EXACT_TIMEOUT)
+    except TimeoutError as e:
+        raise HTTPException(status_code=504, detail="Transit lookup timed out") from e
+    except travel.TransitUnavailable as e:
+        raise HTTPException(status_code=502, detail="Transit lookup unavailable") from e
 
 
 @app.get("/api/cities", response_model=CitiesResponse)
