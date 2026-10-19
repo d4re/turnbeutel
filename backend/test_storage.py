@@ -505,3 +505,63 @@ def test_settings_roundtrip(db):
     s = Settings(plan=Plan(type="corporate", tier="L"))
     db.put_settings(s)
     assert db.get_settings() == s
+
+
+# ── Travel cache ───────────────────────────────────────────────────────────
+
+ORIGIN = "52.5579,13.4857"
+
+
+def test_travel_bike_then_transit_merge(db):
+    db.set_bike_km(ORIGIN, {"v1": 7.93}, at=100.0)
+    db.set_transit(ORIGIN, "v1", pt_min=38, lines=["M4", "M8"], walk_m=777, at=200.0)
+    entry = db.get_travel(ORIGIN, ["v1", "v2"])["v1"]
+    assert (entry.bike_km, entry.bike_at) == (7.93, 100.0)
+    assert (entry.pt_min, entry.pt_lines, entry.walk_m, entry.pt_at) == (38, ["M4", "M8"], 777, 200.0)
+    assert "v2" not in db.get_travel(ORIGIN, ["v1", "v2"])
+    # Re-setting bike keeps the transit columns.
+    db.set_bike_km(ORIGIN, {"v1": 8.0}, at=300.0)
+    assert db.get_travel(ORIGIN, ["v1"])["v1"].pt_min == 38
+
+
+def test_mark_transit_failed_then_success_clears_it(db):
+    db.mark_transit_failed(ORIGIN, "v1", at=50.0)
+    entry = db.get_travel(ORIGIN, ["v1"])["v1"]
+    assert entry.pt_failed_at == 50.0
+    assert entry.pt_min is None
+    db.set_transit(ORIGIN, "v1", pt_min=20, lines=[], walk_m=0, at=60.0)
+    assert db.get_travel(ORIGIN, ["v1"])["v1"].pt_failed_at is None
+
+
+def test_travel_is_keyed_by_origin(db):
+    db.set_bike_km(ORIGIN, {"v1": 7.93}, at=100.0)
+    assert db.get_travel("52.0000,13.0000", ["v1"]) == {}
+
+
+def test_exact_respects_max_age(db):
+    result = {
+        "pt_min": 31,
+        "depart_at": "2026-10-22T18:22:00+02:00",
+        "arrive_at": "2026-10-22T18:53:00+02:00",
+        "lines": ["M4"],
+        "walk_m": 300,
+    }
+    db.set_exact(ORIGIN, "v1", "2026-10-22T18:55:00+02:00", result, at=time.time() - 10)
+    assert db.get_exact(ORIGIN, "v1", "2026-10-22T18:55:00+02:00", max_age=60) == result
+    assert db.get_exact(ORIGIN, "v1", "2026-10-22T18:55:00+02:00", max_age=5) is None
+    assert db.get_exact(ORIGIN, "v1", "2026-10-23T18:55:00+02:00", max_age=60) is None
+
+
+def test_venue_points_skip_missing_coordinates(db):
+    db.upsert_cities([make_city(1), make_city(2, "Potsdam")], fetched_at=time.time())
+    db.upsert_venues(
+        1,
+        [make_venue("a", lat=52.5, lng=13.4), make_venue("b", lat=None, lng=None, has_coordinates=False)],
+        time.time(),
+        2,
+        1,
+    )
+    db.upsert_venues(2, [make_venue("c", lat=52.4, lng=13.06), make_venue("a", lat=52.5, lng=13.4)], time.time(), 2, 2)
+    assert db.get_venue_points(["a", "b", "zz"]) == {"a": (52.5, 13.4)}
+    assert sorted(db.list_city_venue_points([1, 2])) == [("a", 52.5, 13.4), ("c", 52.4, 13.06)]
+    assert db.list_city_venue_points([]) == []

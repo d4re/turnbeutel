@@ -193,3 +193,16 @@ class Settings(BaseModel):
     """Single-user settings stored server-side (see AGENTS.md: single-user assumption)."""
 
     plan: Plan | None = None
+
+
+class TravelEntry(BaseModel):
+    """Cached travel data from one origin to one venue (travel table row)."""
+
+    venue_id: str
+    bike_km: float | None = None
+    bike_at: float | None = None
+    pt_min: int | None = None
+    pt_lines: list[str] = []
+    walk_m: int | None = None
+    pt_at: float | None = None
+    pt_failed_at: float | None = None

@@ -12,9 +12,14 @@ sequential and spaced (see `Pacer`).
 
 from __future__ import annotations
 
+import asyncio
+import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+
+import httpx
 
 USER_AGENT = "turnbeutel (+https://github.com/d4re/turnbeutel)"
 OSRM_TABLE_URL = "https://routing.openstreetmap.de/routed-bike/table/v1/driving/"
@@ -29,6 +34,11 @@ PT_TTL = 7 * 24 * 3600
 PT_RETRY_AFTER = 3600
 EXACT_TTL = 24 * 3600
 GEOCODE_TTL = 30 * 24 * 3600
+
+OSRM_BATCH = 100
+VBB_SPACING = 0.7  # s between VBB requests: stays well under its 100 req/min
+VBB_TIMEOUT = 15
+RETRY_DELAY = 2.0
 
 REFERENCE_WEEKDAY = 1  # Tuesday
 REFERENCE_TIME = (17, 30)
@@ -93,3 +103,100 @@ def pick_exact(journeys: list[dict], arrive_by: datetime) -> Transit | None:
     """The latest-departing journey that still arrives by `arrive_by`."""
     in_time = [t for t in (parse_journey(j) for j in journeys) if t.arrive_at <= arrive_by]
     return max(in_time, key=lambda t: t.depart_at, default=None)
+
+
+class Pacer:
+    """Serialises callers and spaces their starts at least `min_interval` apart."""
+
+    def __init__(
+        self,
+        min_interval: float,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ):
+        self.min_interval = min_interval
+        self._clock = clock
+        self._sleep = sleep
+        self._lock = asyncio.Lock()
+        self._last: float | None = None
+
+    async def wait(self) -> None:
+        async with self._lock:
+            if self._last is not None:
+                delay = self._last + self.min_interval - self._clock()
+                if delay > 0:
+                    await self._sleep(delay)
+            self._last = self._clock()
+
+
+async def fetch_bike_km(
+    origin: tuple[float, float],
+    dests: list[tuple[str, float, float]],
+    client: httpx.AsyncClient,
+) -> dict[str, float]:
+    """Bike route distances (km) from `origin` to each `(venue_id, lat, lng)`.
+
+    One OSRM table request per OSRM_BATCH destinations, sent one after another.
+    Unroutable destinations (null distance) are left out.
+    """
+    out: dict[str, float] = {}
+    for i in range(0, len(dests), OSRM_BATCH):
+        batch = dests[i : i + OSRM_BATCH]
+        coords = ";".join([f"{origin[1]},{origin[0]}"] + [f"{lng},{lat}" for _, lat, lng in batch])
+        resp = await client.get(
+            OSRM_TABLE_URL + coords,
+            params={"sources": "0", "annotations": "distance"},
+            headers={"User-Agent": USER_AGENT},
+        )
+        resp.raise_for_status()
+        row = resp.json()["distances"][0]
+        for (venue_id, _, _), metres in zip(batch, row[1:], strict=True):
+            if metres is not None:
+                out[venue_id] = round(metres / 1000, 2)
+    return out
+
+
+async def fetch_journeys(
+    origin: tuple[float, float],
+    dest: tuple[float, float],
+    client: httpx.AsyncClient,
+    pacer: Pacer,
+    *,
+    departure: datetime | None = None,
+    arrival: datetime | None = None,
+) -> list[dict]:
+    """VBB journeys from `origin` to `dest`, leaving at `departure` or arriving by `arrival`.
+
+    Retries once on a network error or 5xx; raises if that fails too.
+    """
+    if (departure is None) == (arrival is None):
+        raise ValueError("pass exactly one of departure / arrival")
+    params = {
+        "from.latitude": origin[0],
+        "from.longitude": origin[1],
+        "from.address": "Home",
+        "to.latitude": dest[0],
+        "to.longitude": dest[1],
+        "to.address": "Venue",
+        "results": 3,
+        "stopovers": "false",
+    }
+    if departure is not None:
+        params["departure"] = departure.isoformat()
+    else:
+        params["arrival"] = arrival.isoformat()
+
+    for attempt in range(2):
+        await pacer.wait()
+        try:
+            resp = await client.get(
+                VBB_JOURNEYS_URL, params=params, headers={"User-Agent": USER_AGENT}, timeout=VBB_TIMEOUT
+            )
+            resp.raise_for_status()
+            return resp.json().get("journeys") or []
+        except httpx.HTTPError as e:
+            client_error = isinstance(e, httpx.HTTPStatusError) and e.response.status_code < 500
+            if client_error or attempt == 1:
+                raise
+        await asyncio.sleep(RETRY_DELAY)
+    raise AssertionError("unreachable")

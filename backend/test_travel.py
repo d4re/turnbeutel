@@ -1,11 +1,18 @@
 """Outcome-based tests for travel.py (OSRM/VBB helpers and the travel worker)."""
 
+import asyncio
 from datetime import datetime, timedelta
+
+import httpx
+import pytest
 
 import travel
 from travel import (
     BERLIN,
+    Pacer,
     Transit,
+    fetch_bike_km,
+    fetch_journeys,
     in_vbb_area,
     next_reference_departure,
     origin_key,
@@ -96,3 +103,118 @@ def test_pick_returns_none_for_no_journeys():
 
 def test_user_agent_names_the_project():
     assert "turnbeutel" in travel.USER_AGENT
+
+
+# ── OSRM ───────────────────────────────────────────────────────────────────
+
+HOME = (52.5579489, 13.4856965)
+
+
+def _osrm_handler(paths: list[str]):
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        n_dests = request.url.path.count(";")
+        assert request.url.params["sources"] == "0"
+        assert request.url.params["annotations"] == "distance"
+        return httpx.Response(200, json={"distances": [[0.0] + [1234.0 + i for i in range(n_dests)]]})
+
+    return handler
+
+
+def test_fetch_bike_km_batches_of_100():
+    paths: list[str] = []
+    dests = [(f"v{i}", 52.5 + i / 10000, 13.4) for i in range(230)]
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_osrm_handler(paths))) as client:
+            return await fetch_bike_km(HOME, dests, client)
+
+    result = asyncio.run(run())
+    assert [p.count(";") for p in paths] == [100, 100, 30]
+    # Origin first (lng,lat order), then the batch's destinations in order.
+    assert paths[0].split("/")[-1].startswith(f"{HOME[1]},{HOME[0]};13.4,52.5;13.4,52.5001;")
+    assert len(result) == 230
+    assert result["v0"] == 1.23
+    assert result["v101"] == 1.24  # second batch restarts at index 1 → 1235 m
+
+
+def test_fetch_bike_km_skips_null_distances():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"distances": [[0.0, 2000.0, None]]})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await fetch_bike_km(HOME, [("a", 52.5, 13.4), ("b", 52.6, 13.4)], client)
+
+    assert asyncio.run(run()) == {"a": 2.0}
+
+
+# ── Pacer ──────────────────────────────────────────────────────────────────
+
+
+def test_pacer_spaces_calls():
+    now = [0.0]
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+        now[0] += seconds
+
+    pacer = Pacer(0.7, clock=lambda: now[0], sleep=fake_sleep)
+
+    async def run():
+        await asyncio.gather(pacer.wait(), pacer.wait(), pacer.wait())
+
+    asyncio.run(run())
+    assert sum(slept) == pytest.approx(1.4)
+
+
+# ── VBB ────────────────────────────────────────────────────────────────────
+
+
+def _no_pacing() -> Pacer:
+    async def no_sleep(seconds: float) -> None:
+        return None
+
+    return Pacer(0, sleep=no_sleep)
+
+
+def test_fetch_journeys_retries_once_then_raises(monkeypatch):
+    monkeypatch.setattr(travel, "RETRY_DELAY", 0)
+    responses = [503, 503]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(responses.pop(0), json={"journeys": [_journey("17:31", "18:09")]})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await fetch_journeys(HOME, (52.5, 13.4), client, _no_pacing(), departure=datetime.now(BERLIN))
+
+    with pytest.raises(httpx.HTTPError):
+        asyncio.run(run())
+
+    responses[:] = [503, 200]
+    assert len(asyncio.run(run())) == 1
+    assert responses == []
+
+
+def test_fetch_journeys_sends_arrival_param():
+    seen: list[httpx.URL] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url)
+        return httpx.Response(200, json={"journeys": []})
+
+    arrive_by = datetime(2026, 10, 22, 18, 55, tzinfo=BERLIN)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await fetch_journeys(HOME, (52.5, 13.4), client, _no_pacing(), arrival=arrive_by)
+
+    assert asyncio.run(run()) == []
+    params = seen[0].params
+    assert datetime.fromisoformat(params["arrival"]) == arrive_by
+    assert "departure" not in params
+    assert params["from.latitude"] == str(HOME[0])
+    assert params["to.longitude"] == "13.4"
+    assert params["results"] == "3"
